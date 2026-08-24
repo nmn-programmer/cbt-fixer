@@ -1,3 +1,5 @@
+import { executeGeminiClientSide } from './aiDirectEngine';
+
 export type ApiKeyStatus = 'Ready' | 'Active' | 'Quota Exhausted' | 'Invalid';
 
 export interface FallbackKeyItem {
@@ -367,8 +369,12 @@ export async function fetchWithGeminiFallback(
   });
 
   if (candidates.length === 0) {
-    // No client keys configured - fall back to server default or prompt
-    return fetch(url, options);
+    // No client keys configured - try server
+    const res = await fetch(url, options);
+    if (res.status === 404 || res.status === 405) {
+      throw new Error('Server returned 404 (Endpoint Not Found). Please configure a Gemini API Key in Settings to run AI extraction directly on client side.');
+    }
+    return res;
   }
 
   const now = Date.now();
@@ -430,6 +436,28 @@ export async function fetchWithGeminiFallback(
         continue;
       }
       throw lastError || new Error('Network request failed after retries');
+    }
+
+    // Intercept 404 / 405 (missing server route, e.g. Vercel static) and execute client-side AI processing
+    if (res.status === 404 || res.status === 405) {
+      console.info(`[GeminiKeyManager] Server route ${url} returned ${res.status}. Executing Gemini AI directly on client side...`);
+      try {
+        let reqBody: any = {};
+        if (options.body && typeof options.body === 'string') {
+          try { reqBody = JSON.parse(options.body); } catch (e) {}
+        }
+        const clientResult = await executeGeminiClientSide(url, reqBody, candidate.key);
+        return new Response(JSON.stringify(clientResult), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (clientErr: any) {
+        console.error('[GeminiKeyManager] Client-side AI execution failed:', clientErr);
+        if (!isLastCandidate) {
+          continue;
+        }
+        throw new Error(clientErr.message || `Client-side AI extraction failed (${res.status})`);
+      }
     }
 
     // Inspect HTTP status code

@@ -1,14 +1,12 @@
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type, Schema } from '@google/genai';
 
-async function startServer() {
-  const app = express();
-  const PORT = 3000;
+export const app = express();
+const PORT = 3000;
 
-  app.use(express.json({ limit: '200mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '200mb' }));
+app.use(express.json({ limit: '200mb' }));
+app.use(express.urlencoded({ extended: true, limit: '200mb' }));
 
   // API Route to extract test paper instructions blueprint & question ranges from Cover / Instructions page
   app.post('/api/extract-test-blueprint', async (req, res) => {
@@ -918,8 +916,9 @@ Verify that NO question numbers are missing, fix OCR typos, and return the audit
     }
   });
 
-  // Vite middleware for development
+async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -938,4 +937,8 @@ Verify that NO question numbers are missing, fix OCR typos, and return the audit
   });
 }
 
-startServer();
+if (process.env.VERCEL !== '1') {
+  startServer();
+}
+
+export default app;
