@@ -1,0 +1,934 @@
+import { MarksScheme, QuestionData, QuestionPaperArchive, QuestionType, SubjectData } from '../types/cbt';
+import { generateId } from './constants';
+
+/**
+ * Standard Answer Key Entry representing a single question's answer in the official format.
+ */
+export interface OfficialAnswerEntry {
+  correctOption?: string;      // e.g. "D", "A", "B", "C", "4", "1"
+  correctOptions?: string;     // e.g. "A,C", "A,B,D", "1,3"
+  correctAnswer?: string;      // e.g. "40", "5", "36", "4.50"
+  [key: string]: any;
+}
+
+export interface OfficialAnswerKeySchema {
+  sections: Record<string, Record<string, OfficialAnswerEntry>>;
+}
+
+export interface NormalizedAnswerItem {
+  sectionName: string;
+  questionNumber: number;
+  questionKey: string;
+  rawAnswer: string;
+  normalizedAnswer: string; // standard CBT format (e.g. "4" for D, "1,3" for A,C, "40" for NAT)
+  letterAnswer: string;     // standard Letter format (e.g. "D" for 4, "A,C" for 1,3, "40" for NAT)
+  inferredType: QuestionType;
+  rawEntry: OfficialAnswerEntry | string | any;
+}
+
+export interface AnswerKeyParseResult {
+  isValid: boolean;
+  format: 'official_sections' | 'flat_sections' | 'flat_questions' | 'csv' | 'unknown';
+  items: NormalizedAnswerItem[];
+  sectionsMap: Record<string, NormalizedAnswerItem[]>;
+  totalQuestions: number;
+  error?: string;
+  warnings: string[];
+}
+
+export interface LoadedAnswerKeyFile {
+  id: string;
+  name: string;
+  size: number;
+  content: string;
+  parseResult: AnswerKeyParseResult;
+  enabled: boolean;
+  uploadedAt: number;
+}
+
+export type MatchConfidence = 'exact' | 'section_fuzzy' | 'global_qnum' | 'sequential' | 'unmatched';
+
+export interface QuestionMatchResult {
+  id: string;
+  questionId: string;
+  questionNumber: number;
+  subjectName: string;
+  sectionName: string;
+  currentType: QuestionType;
+  proposedType: QuestionType;
+  currentAnswer: string;
+  proposedAnswer: string;
+  proposedLetterAnswer: string;
+  confidence: MatchConfidence;
+  matchScore: number; // 0 - 100
+  matchReason: string;
+  status: 'matched' | 'type_changed' | 'answer_updated' | 'already_matches' | 'unmatched_key' | 'unmatched_paper';
+  isIncluded: boolean;
+}
+
+export interface ClassificationReport {
+  matches: QuestionMatchResult[];
+  unmatchedKeyEntries: NormalizedAnswerItem[];
+  unmatchedPaperQuestions: { subjectName: string; sectionName: string; question: QuestionData }[];
+  totalPaperQuestions: number;
+  totalKeyEntries: number;
+  matchedCount: number;
+  typeChangedCount: number;
+  answerUpdatedCount: number;
+  unmatchedCount: number;
+}
+
+/**
+ * Converts a Letter option (A, B, C, D) to standard 1-based index ('1', '2', '3', '4').
+ */
+export function letterToOptionIndex(letter: string): string {
+  if (!letter) return '';
+  const trimmed = letter.trim().toUpperCase();
+  if (['1', '2', '3', '4', '5', '6'].includes(trimmed)) return trimmed;
+  if (trimmed === 'A') return '1';
+  if (trimmed === 'B') return '2';
+  if (trimmed === 'C') return '3';
+  if (trimmed === 'D') return '4';
+  if (trimmed === 'E') return '5';
+  if (trimmed === 'F') return '6';
+  return trimmed;
+}
+
+/**
+ * Converts a standard 1-based index ('1', '2', '3', '4') to Letter ('A', 'B', 'C', 'D').
+ */
+export function optionIndexToLetter(opt: string): string {
+  if (!opt) return '';
+  const trimmed = opt.trim();
+  if (trimmed === '1') return 'A';
+  if (trimmed === '2') return 'B';
+  if (trimmed === '3') return 'C';
+  if (trimmed === '4') return 'D';
+  if (trimmed === '5') return 'E';
+  if (trimmed === '6') return 'F';
+  if (/^[A-Z]$/i.test(trimmed)) return trimmed.toUpperCase();
+  return trimmed;
+}
+
+/**
+ * Converts comma-separated letters to option indices e.g. "A,C" -> "1,3"
+ */
+export function letterListToOptionIndices(listStr: string): string {
+  if (!listStr) return '';
+  const parts = listStr.split(',').map((p) => p.trim());
+  return parts.map((p) => letterToOptionIndex(p)).filter(Boolean).join(',');
+}
+
+/**
+ * Converts comma-separated option indices to letters e.g. "1,3" -> "A,C"
+ */
+export function optionIndicesToLetters(listStr: string): string {
+  if (!listStr) return '';
+  const parts = listStr.split(',').map((p) => p.trim());
+  return parts.map((p) => optionIndexToLetter(p)).filter(Boolean).join(',');
+}
+
+/**
+ * Parses any Answer Key payload (JSON string, JS Object, CSV text) into normalized items.
+ */
+export function parseAnswerKeyPayload(input: string | object): AnswerKeyParseResult {
+  const warnings: string[] = [];
+  const items: NormalizedAnswerItem[] = [];
+  const sectionsMap: Record<string, NormalizedAnswerItem[]> = {};
+
+  if (!input) {
+    return {
+      isValid: false,
+      format: 'unknown',
+      items: [],
+      sectionsMap: {},
+      totalQuestions: 0,
+      error: 'Empty answer key payload provided.',
+      warnings: [],
+    };
+  }
+
+  let parsedObj: any = input;
+  let isJson = false;
+
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        parsedObj = JSON.parse(trimmed);
+        isJson = true;
+      } catch (err: any) {
+        // Not valid JSON, attempt CSV/TSV parsing
+        return parseCsvAnswerKey(trimmed);
+      }
+    } else {
+      return parseCsvAnswerKey(trimmed);
+    }
+  } else {
+    isJson = true;
+  }
+
+  // Detect Schema Format
+  // 1. Official Format: { "sections": { "P1 · Physics": { "1": { "correctOption": "D" } } } }
+  if (parsedObj && typeof parsedObj === 'object' && parsedObj.sections && typeof parsedObj.sections === 'object') {
+    for (const [secName, qMap] of Object.entries<any>(parsedObj.sections)) {
+      if (!qMap || typeof qMap !== 'object') continue;
+      sectionsMap[secName] = [];
+
+      for (const [qKey, qVal] of Object.entries<any>(qMap)) {
+        const qNum = parseInt(qKey.replace(/\D/g, ''), 10) || parseInt(qKey, 10) || 1;
+        const normalized = extractAnswerFromVal(secName, qNum, qKey, qVal);
+        items.push(normalized);
+        sectionsMap[secName].push(normalized);
+      }
+    }
+
+    return {
+      isValid: items.length > 0,
+      format: 'official_sections',
+      items,
+      sectionsMap,
+      totalQuestions: items.length,
+      warnings,
+    };
+  }
+
+  // 2. Direct Sections Dictionary: { "Physics": { "1": "D" }, "Chemistry": { "18": "B" } }
+  if (parsedObj && typeof parsedObj === 'object' && !Array.isArray(parsedObj)) {
+    const firstVal = Object.values(parsedObj)[0] as any;
+    if (firstVal && typeof firstVal === 'object' && !firstVal.correctOption && !firstVal.correctOptions && !firstVal.correctAnswer) {
+      for (const [secName, qMap] of Object.entries<any>(parsedObj)) {
+        if (!qMap || typeof qMap !== 'object') continue;
+        sectionsMap[secName] = [];
+
+        for (const [qKey, qVal] of Object.entries<any>(qMap)) {
+          const qNum = parseInt(qKey.replace(/\D/g, ''), 10) || parseInt(qKey, 10) || 1;
+          const normalized = extractAnswerFromVal(secName, qNum, qKey, qVal);
+          items.push(normalized);
+          sectionsMap[secName].push(normalized);
+        }
+      }
+
+      return {
+        isValid: items.length > 0,
+        format: 'flat_sections',
+        items,
+        sectionsMap,
+        totalQuestions: items.length,
+        warnings,
+      };
+    }
+
+    // 3. Flat Question Dictionary: { "1": "D", "5": "A,C", "8": "40" }
+    const defaultSection = 'General Section';
+    sectionsMap[defaultSection] = [];
+
+    for (const [qKey, qVal] of Object.entries<any>(parsedObj)) {
+      const qNum = parseInt(qKey.replace(/\D/g, ''), 10) || parseInt(qKey, 10) || 1;
+      const normalized = extractAnswerFromVal(defaultSection, qNum, qKey, qVal);
+      items.push(normalized);
+      sectionsMap[defaultSection].push(normalized);
+    }
+
+    return {
+      isValid: items.length > 0,
+      format: 'flat_questions',
+      items,
+      sectionsMap,
+      totalQuestions: items.length,
+      warnings,
+    };
+  }
+
+  // 4. Array Format: [ { q: 1, answer: "D", section: "Physics" } ]
+  if (Array.isArray(parsedObj)) {
+    for (const entry of parsedObj) {
+      if (!entry || typeof entry !== 'object') continue;
+      const secName = entry.section || entry.sectionName || entry.subject || 'General Section';
+      const qNum = entry.q ?? entry.que ?? entry.questionNumber ?? entry.question ?? 1;
+      const qKey = String(qNum);
+      const normalized = extractAnswerFromVal(secName, qNum, qKey, entry.answer ?? entry);
+      items.push(normalized);
+      if (!sectionsMap[secName]) sectionsMap[secName] = [];
+      sectionsMap[secName].push(normalized);
+    }
+
+    return {
+      isValid: items.length > 0,
+      format: 'flat_sections',
+      items,
+      sectionsMap,
+      totalQuestions: items.length,
+      warnings,
+    };
+  }
+
+  return {
+    isValid: false,
+    format: 'unknown',
+    items: [],
+    sectionsMap: {},
+    totalQuestions: 0,
+    error: 'Unrecognized answer key structure. Please check JSON syntax or format.',
+    warnings,
+  };
+}
+
+/**
+ * Parses raw CSV or TSV string into normalized answer key items.
+ */
+function parseCsvAnswerKey(csvText: string): AnswerKeyParseResult {
+  const lines = csvText.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const items: NormalizedAnswerItem[] = [];
+  const sectionsMap: Record<string, NormalizedAnswerItem[]> = {};
+  const warnings: string[] = [];
+
+  let currentSection = 'General Section';
+
+  for (const line of lines) {
+    // Check if line is a section header like "# Physics" or "[Section 1]"
+    if (line.startsWith('#') || (line.startsWith('[') && line.endsWith(']'))) {
+      currentSection = line.replace(/^[#\[\s]+|[\]\s]+$/g, '').trim();
+      continue;
+    }
+
+    // Split by comma, tab, or semicolon
+    const parts = line.split(/[\t,;]+/).map((p) => p.trim().replace(/^["']|["']$/g, ''));
+    if (parts.length < 2) continue;
+
+    // Detect if first column is section name e.g. "Physics, 1, D"
+    let qNum = 1;
+    let rawAns = '';
+    let secName = currentSection;
+
+    if (parts.length >= 3 && isNaN(parseInt(parts[0], 10))) {
+      secName = parts[0];
+      qNum = parseInt(parts[1], 10) || 1;
+      rawAns = parts[2];
+    } else {
+      qNum = parseInt(parts[0], 10) || 1;
+      rawAns = parts[1];
+    }
+
+    if (!rawAns) continue;
+
+    const normalized = extractAnswerFromVal(secName, qNum, String(qNum), rawAns);
+    items.push(normalized);
+    if (!sectionsMap[secName]) sectionsMap[secName] = [];
+    sectionsMap[secName].push(normalized);
+  }
+
+  return {
+    isValid: items.length > 0,
+    format: 'csv',
+    items,
+    sectionsMap,
+    totalQuestions: items.length,
+    warnings,
+  };
+}
+
+/**
+ * Extracts and normalizes question answer, letters, and inferred question type from raw object/string.
+ */
+function extractAnswerFromVal(
+  sectionName: string,
+  questionNumber: number,
+  questionKey: string,
+  val: any
+): NormalizedAnswerItem {
+  let rawAnswer = '';
+  let normalizedAnswer = '';
+  let letterAnswer = '';
+  let inferredType: QuestionType = 'mcq';
+
+  if (typeof val === 'string' || typeof val === 'number') {
+    rawAnswer = String(val).trim();
+  } else if (val && typeof val === 'object') {
+    if (val.correctOption !== undefined) {
+      rawAnswer = String(val.correctOption).trim();
+      inferredType = 'mcq';
+    } else if (val.correctOptions !== undefined) {
+      rawAnswer = Array.isArray(val.correctOptions)
+        ? val.correctOptions.join(',')
+        : String(val.correctOptions).trim();
+      inferredType = 'msq';
+    } else if (val.correctAnswer !== undefined) {
+      rawAnswer = String(val.correctAnswer).trim();
+      inferredType = 'nat';
+    } else if (val.answer !== undefined) {
+      rawAnswer = String(val.answer).trim();
+    } else if (val.opt !== undefined) {
+      rawAnswer = String(val.opt).trim();
+    }
+  }
+
+  // Determine Inferred Type if not explicitly tagged
+  if (inferredType === 'mcq' && val && typeof val === 'object' && val.correctOption === undefined) {
+    if (rawAnswer.includes(',') || rawAnswer.includes(';') || rawAnswer.length > 1 && /^[A-D]{2,}$/i.test(rawAnswer)) {
+      inferredType = 'msq';
+    } else if (/^-?\d+(\.\d+)?$/.test(rawAnswer) && parseInt(rawAnswer, 10) > 4) {
+      inferredType = 'nat';
+    } else if (rawAnswer.includes('->') || rawAnswer.includes('=')) {
+      inferredType = 'msm';
+    }
+  }
+
+  // Format Letter vs Index
+  if (inferredType === 'mcq') {
+    letterAnswer = optionIndexToLetter(rawAnswer);
+    normalizedAnswer = letterToOptionIndex(rawAnswer);
+  } else if (inferredType === 'msq') {
+    letterAnswer = optionIndicesToLetters(rawAnswer);
+    normalizedAnswer = letterListToOptionIndices(rawAnswer);
+  } else {
+    letterAnswer = rawAnswer;
+    normalizedAnswer = rawAnswer;
+  }
+
+  return {
+    sectionName,
+    questionNumber,
+    questionKey,
+    rawAnswer,
+    normalizedAnswer,
+    letterAnswer,
+    inferredType,
+    rawEntry: val,
+  };
+}
+
+/**
+ * Intelligent Question Classifier & Auto-Matcher
+ * Matches parsed Answer Key entries with Questions in the active QuestionPaperArchive.
+ */
+export function classifyAndMatchAnswerKey(
+  archive: QuestionPaperArchive,
+  answerKeyResult: AnswerKeyParseResult
+): ClassificationReport {
+  const matches: QuestionMatchResult[] = [];
+  const matchedKeyIndices = new Set<number>();
+  const matchedQuestionIds = new Set<string>();
+
+  // Flatten all questions in the paper with location info
+  const allPaperQuestions: {
+    subject: SubjectData;
+    section: { id: string; name: string };
+    question: QuestionData;
+  }[] = [];
+
+  for (const sub of archive.subjects) {
+    for (const sec of sub.sections) {
+      for (const q of sec.questions) {
+        allPaperQuestions.push({
+          subject: sub,
+          section: sec,
+          question: q,
+        });
+      }
+    }
+  }
+
+  // Phase 1: Exact Section Name & Question Number Match
+  answerKeyResult.items.forEach((item, keyIdx) => {
+    const exactMatch = allPaperQuestions.find(
+      (pq) =>
+        !matchedQuestionIds.has(pq.question.id) &&
+        pq.question.que === item.questionNumber &&
+        (pq.section.name.trim().toLowerCase() === item.sectionName.trim().toLowerCase() ||
+          pq.subject.name.trim().toLowerCase() === item.sectionName.trim().toLowerCase())
+    );
+
+    if (exactMatch) {
+      matchedKeyIndices.add(keyIdx);
+      matchedQuestionIds.add(exactMatch.question.id);
+
+      const isTypeChanged = exactMatch.question.type !== item.inferredType;
+      const isAnswerChanged =
+        exactMatch.question.answerOptions !== item.normalizedAnswer &&
+        exactMatch.question.answerOptions !== item.letterAnswer;
+
+      let status: QuestionMatchResult['status'] = 'already_matches';
+      if (isTypeChanged) status = 'type_changed';
+      else if (isAnswerChanged) status = 'answer_updated';
+
+      matches.push({
+        id: generateId(),
+        questionId: exactMatch.question.id,
+        questionNumber: exactMatch.question.que,
+        subjectName: exactMatch.subject.name,
+        sectionName: exactMatch.section.name,
+        currentType: exactMatch.question.type,
+        proposedType: item.inferredType,
+        currentAnswer: exactMatch.question.answerOptions,
+        proposedAnswer: item.normalizedAnswer,
+        proposedLetterAnswer: item.letterAnswer,
+        confidence: 'exact',
+        matchScore: 100,
+        matchReason: `Exact match on Section "${item.sectionName}" and Question #${item.questionNumber}`,
+        status,
+        isIncluded: true,
+      });
+    }
+  });
+
+  // Phase 2: Section Fuzzy Match (e.g. "P1 · Chemistry" -> "Chemistry Section 1" or "Chemistry")
+  answerKeyResult.items.forEach((item, keyIdx) => {
+    if (matchedKeyIndices.has(keyIdx)) return;
+
+    const fuzzyMatch = allPaperQuestions.find((pq) => {
+      if (matchedQuestionIds.has(pq.question.id)) return false;
+      if (pq.question.que !== item.questionNumber) return false;
+
+      const normKeySec = item.sectionName.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const normPaperSec = pq.section.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const normPaperSub = pq.subject.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+      return (
+        normKeySec.includes(normPaperSub) ||
+        normPaperSub.includes(normKeySec) ||
+        normKeySec.includes(normPaperSec) ||
+        normPaperSec.includes(normKeySec)
+      );
+    });
+
+    if (fuzzyMatch) {
+      matchedKeyIndices.add(keyIdx);
+      matchedQuestionIds.add(fuzzyMatch.question.id);
+
+      const isTypeChanged = fuzzyMatch.question.type !== item.inferredType;
+      const isAnswerChanged =
+        fuzzyMatch.question.answerOptions !== item.normalizedAnswer &&
+        fuzzyMatch.question.answerOptions !== item.letterAnswer;
+
+      let status: QuestionMatchResult['status'] = 'already_matches';
+      if (isTypeChanged) status = 'type_changed';
+      else if (isAnswerChanged) status = 'answer_updated';
+
+      matches.push({
+        id: generateId(),
+        questionId: fuzzyMatch.question.id,
+        questionNumber: fuzzyMatch.question.que,
+        subjectName: fuzzyMatch.subject.name,
+        sectionName: fuzzyMatch.section.name,
+        currentType: fuzzyMatch.question.type,
+        proposedType: item.inferredType,
+        currentAnswer: fuzzyMatch.question.answerOptions,
+        proposedAnswer: item.normalizedAnswer,
+        proposedLetterAnswer: item.letterAnswer,
+        confidence: 'section_fuzzy',
+        matchScore: 92,
+        matchReason: `Fuzzy section match ("${item.sectionName}" ~ "${fuzzyMatch.section.name}") for Q#${item.questionNumber}`,
+        status,
+        isIncluded: true,
+      });
+    }
+  });
+
+  // Phase 3: Global Unique Question Number Match
+  answerKeyResult.items.forEach((item, keyIdx) => {
+    if (matchedKeyIndices.has(keyIdx)) return;
+
+    const globalQMatches = allPaperQuestions.filter(
+      (pq) => !matchedQuestionIds.has(pq.question.id) && pq.question.que === item.questionNumber
+    );
+
+    if (globalQMatches.length === 1) {
+      const qMatch = globalQMatches[0];
+      matchedKeyIndices.add(keyIdx);
+      matchedQuestionIds.add(qMatch.question.id);
+
+      const isTypeChanged = qMatch.question.type !== item.inferredType;
+      const isAnswerChanged =
+        qMatch.question.answerOptions !== item.normalizedAnswer &&
+        qMatch.question.answerOptions !== item.letterAnswer;
+
+      let status: QuestionMatchResult['status'] = 'already_matches';
+      if (isTypeChanged) status = 'type_changed';
+      else if (isAnswerChanged) status = 'answer_updated';
+
+      matches.push({
+        id: generateId(),
+        questionId: qMatch.question.id,
+        questionNumber: qMatch.question.que,
+        subjectName: qMatch.subject.name,
+        sectionName: qMatch.section.name,
+        currentType: qMatch.question.type,
+        proposedType: item.inferredType,
+        currentAnswer: qMatch.question.answerOptions,
+        proposedAnswer: item.normalizedAnswer,
+        proposedLetterAnswer: item.letterAnswer,
+        confidence: 'global_qnum',
+        matchScore: 85,
+        matchReason: `Global Question #${item.questionNumber} unique index match`,
+        status,
+        isIncluded: true,
+      });
+    }
+  });
+
+  // Collect unmatched
+  const unmatchedKeyEntries = answerKeyResult.items.filter((_, idx) => !matchedKeyIndices.has(idx));
+  const unmatchedPaperQuestions = allPaperQuestions
+    .filter((pq) => !matchedQuestionIds.has(pq.question.id))
+    .map((pq) => ({
+      subjectName: pq.subject.name,
+      sectionName: pq.section.name,
+      question: pq.question,
+    }));
+
+  // Sort matches by question number
+  matches.sort((a, b) => a.questionNumber - b.questionNumber);
+
+  return {
+    matches,
+    unmatchedKeyEntries,
+    unmatchedPaperQuestions,
+    totalPaperQuestions: allPaperQuestions.length,
+    totalKeyEntries: answerKeyResult.items.length,
+    matchedCount: matches.length,
+    typeChangedCount: matches.filter((m) => m.status === 'type_changed').length,
+    answerUpdatedCount: matches.filter((m) => m.status === 'answer_updated').length,
+    unmatchedCount: unmatchedPaperQuestions.length + unmatchedKeyEntries.length,
+  };
+}
+
+/**
+ * Applies verified Answer Key classifications to the active QuestionPaperArchive.
+ */
+export function applyClassificationToArchive(
+  archive: QuestionPaperArchive,
+  report: ClassificationReport,
+  updateMarksSchemes: boolean = true
+): QuestionPaperArchive {
+  const matchMap = new Map<string, QuestionMatchResult>();
+  report.matches.forEach((m) => {
+    if (m.isIncluded) {
+      matchMap.set(m.questionId, m);
+    }
+  });
+
+  const updatedSubjects = archive.subjects.map((sub) => ({
+    ...sub,
+    sections: sub.sections.map((sec) => ({
+      ...sec,
+      questions: sec.questions.map((q) => {
+        const match = matchMap.get(q.id);
+        if (!match) return q;
+
+        let updatedMarks: MarksScheme = { ...q.marks };
+        if (updateMarksSchemes && q.type !== match.proposedType) {
+          if (match.proposedType === 'msq') {
+            updatedMarks = { cm: 4, im: -2, pm: 1, max: 4 };
+          } else if (match.proposedType === 'nat') {
+            updatedMarks = { cm: 4, im: 0, pm: 0, max: 4 };
+          } else if (match.proposedType === 'msm') {
+            updatedMarks = { cm: 3, im: -1, pm: 1, max: 12 };
+          } else {
+            updatedMarks = { cm: 3, im: -1, pm: 0, max: 3 };
+          }
+        }
+
+        return {
+          ...q,
+          type: match.proposedType,
+          answerOptions: match.proposedAnswer,
+          marks: updatedMarks,
+        };
+      }),
+    })),
+  }));
+
+  return {
+    ...archive,
+    subjects: updatedSubjects,
+    isDirty: true,
+    lastModified: Date.now(),
+  };
+}
+
+/**
+ * Generates the Official Answer Key JSON string from an active QuestionPaperArchive
+ * strictly adhering to the schema:
+ * {
+ *   "sections": {
+ *     "P1 · Chemistry": {
+ *       "18": { "correctOption": "B" },
+ *       "22": { "correctOptions": "A,B,D" },
+ *       "25": { "correctAnswer": "3" }
+ *     }
+ *   }
+ * }
+ */
+export function generateOfficialAnswerKeyJson(
+  archive: QuestionPaperArchive,
+  sectionPrefix: string = ''
+): string {
+  const output: OfficialAnswerKeySchema = {
+    sections: {},
+  };
+
+  for (const subject of archive.subjects) {
+    for (const section of subject.sections) {
+      // Build standard section display name (e.g. "P1 · Physics" or "Chemistry Section 1")
+      let sectionKey = section.name;
+      if (sectionPrefix) {
+        sectionKey = `${sectionPrefix} · ${subject.name}`;
+      }
+
+      if (!output.sections[sectionKey]) {
+        output.sections[sectionKey] = {};
+      }
+
+      for (const q of section.questions) {
+        const qKey = String(q.que);
+        const ans = q.answerOptions ? q.answerOptions.trim() : '';
+
+        if (q.type === 'mcq') {
+          const letter = optionIndexToLetter(ans) || ans || 'A';
+          output.sections[sectionKey][qKey] = { correctOption: letter };
+        } else if (q.type === 'msq') {
+          const letters = optionIndicesToLetters(ans) || ans || 'A,B';
+          output.sections[sectionKey][qKey] = { correctOptions: letters };
+        } else if (q.type === 'nat') {
+          output.sections[sectionKey][qKey] = { correctAnswer: ans || '0' };
+        } else {
+          output.sections[sectionKey][qKey] = { correctOption: ans || 'A' };
+        }
+      }
+    }
+  }
+
+  return JSON.stringify(output, null, 2);
+}
+
+/**
+ * Generates CSV representation of the active paper's answer key.
+ */
+export function generateAnswerKeyCsv(archive: QuestionPaperArchive): string {
+  const rows: string[] = ['Subject,Section,Question Number,Type,Answer (Letter),Answer (Index),Marks (+cm/-im)'];
+
+  for (const subject of archive.subjects) {
+    for (const section of subject.sections) {
+      for (const q of section.questions) {
+        const letterAns = q.type === 'mcq'
+          ? optionIndexToLetter(q.answerOptions)
+          : q.type === 'msq'
+          ? optionIndicesToLetters(q.answerOptions)
+          : q.answerOptions;
+
+        rows.push(
+          `"${subject.name}","${section.name}",${q.que},"${q.type.toUpperCase()}","${letterAns}","${q.answerOptions}","+${q.marks.cm}/${q.marks.im}"`
+        );
+      }
+    }
+  }
+
+  return rows.join('\n');
+}
+
+/**
+ * Merges multiple LoadedAnswerKeyFile objects into a single cohesive AnswerKeyParseResult and official JSON.
+ */
+export function mergeMultipleAnswerKeys(
+  files: LoadedAnswerKeyFile[]
+): { parseResult: AnswerKeyParseResult; mergedJson: string } {
+  const activeFiles = files.filter((f) => f.enabled);
+
+  if (activeFiles.length === 0) {
+    return {
+      parseResult: {
+        isValid: false,
+        format: 'unknown',
+        items: [],
+        sectionsMap: {},
+        totalQuestions: 0,
+        warnings: ['No active answer key files selected.'],
+      },
+      mergedJson: '',
+    };
+  }
+
+  // Combined official sections structure
+  const mergedSections: Record<string, Record<string, OfficialAnswerEntry>> = {};
+  const warnings: string[] = [];
+  const allItems: NormalizedAnswerItem[] = [];
+  const sectionsMap: Record<string, NormalizedAnswerItem[]> = {};
+
+  // Process each file in order (later files can augment or update earlier files)
+  for (const file of activeFiles) {
+    if (!file.parseResult.isValid) continue;
+
+    for (const item of file.parseResult.items) {
+      const secName = item.sectionName || 'General Section';
+      const qKey = String(item.questionNumber);
+
+      if (!mergedSections[secName]) {
+        mergedSections[secName] = {};
+      }
+
+      if (!sectionsMap[secName]) {
+        sectionsMap[secName] = [];
+      }
+
+      // Build official entry
+      let entry: OfficialAnswerEntry = {};
+      if (item.inferredType === 'mcq') {
+        entry = { correctOption: item.letterAnswer || 'A' };
+      } else if (item.inferredType === 'msq') {
+        entry = { correctOptions: item.letterAnswer || 'A,B' };
+      } else if (item.inferredType === 'nat') {
+        entry = { correctAnswer: item.rawAnswer || '0' };
+      } else {
+        entry = { correctOption: item.letterAnswer || 'A' };
+      }
+
+      mergedSections[secName][qKey] = entry;
+
+      // Remove previous duplicate if existing in allItems / sectionsMap
+      const existingItemIdx = allItems.findIndex(
+        (i) => i.sectionName.toLowerCase() === secName.toLowerCase() && i.questionNumber === item.questionNumber
+      );
+      if (existingItemIdx >= 0) {
+        allItems[existingItemIdx] = item;
+      } else {
+        allItems.push(item);
+      }
+
+      const existingSecIdx = sectionsMap[secName].findIndex((i) => i.questionNumber === item.questionNumber);
+      if (existingSecIdx >= 0) {
+        sectionsMap[secName][existingSecIdx] = item;
+      } else {
+        sectionsMap[secName].push(item);
+      }
+    }
+  }
+
+  // Sort items by question number
+  allItems.sort((a, b) => a.questionNumber - b.questionNumber);
+  for (const secKey of Object.keys(sectionsMap)) {
+    sectionsMap[secKey].sort((a, b) => a.questionNumber - b.questionNumber);
+  }
+
+  const mergedJson = JSON.stringify({ sections: mergedSections }, null, 2);
+
+  return {
+    parseResult: {
+      isValid: allItems.length > 0,
+      format: 'official_sections',
+      items: allItems,
+      sectionsMap,
+      totalQuestions: allItems.length,
+      warnings,
+    },
+    mergedJson,
+  };
+}
+
+/**
+ * Official JEE Sample Answer Key matching the exact JSON attached by the user.
+ */
+export const SAMPLE_OFFICIAL_ANSWER_KEY: OfficialAnswerKeySchema = {
+  sections: {
+    "P1 · Physics": {
+      "1": { "correctOption": "D" },
+      "2": { "correctOption": "D" },
+      "3": { "correctOption": "A" },
+      "4": { "correctOption": "C" },
+      "5": { "correctOptions": "A,C" },
+      "6": { "correctOptions": "A,B,D" },
+      "7": { "correctOptions": "A,B,C" },
+      "8": { "correctAnswer": "40" },
+      "9": { "correctAnswer": "5" },
+      "10": { "correctAnswer": "36" },
+      "11": { "correctAnswer": "15" },
+      "12": { "correctAnswer": "5" },
+      "13": { "correctAnswer": "5" },
+      "14": { "correctOption": "D" },
+      "15": { "correctOption": "A" },
+      "16": { "correctOption": "A" },
+      "17": { "correctOption": "A" }
+    },
+    "P1 · Chemistry": {
+      "18": { "correctOption": "B" },
+      "19": { "correctOption": "C" },
+      "20": { "correctOption": "B" },
+      "21": { "correctOption": "D" },
+      "22": { "correctOptions": "A,B,D" },
+      "23": { "correctOptions": "A,D" },
+      "24": { "correctOptions": "C,D" },
+      "25": { "correctAnswer": "3" },
+      "26": { "correctAnswer": "15" },
+      "27": { "correctAnswer": "64" },
+      "28": { "correctAnswer": "6" },
+      "29": { "correctAnswer": "18" },
+      "30": { "correctAnswer": "0" },
+      "31": { "correctOption": "A" },
+      "32": { "correctOption": "A" },
+      "33": { "correctOption": "A" },
+      "34": { "correctOption": "D" }
+    },
+    "P1 · Mathematics": {
+      "35": { "correctOption": "D" },
+      "36": { "correctOption": "A" },
+      "37": { "correctOption": "A" },
+      "38": { "correctOption": "B" },
+      "39": { "correctOptions": "A,C" },
+      "40": { "correctOptions": "A,B,C,D" },
+      "41": { "correctOptions": "A,B,C" },
+      "42": { "correctAnswer": "5" },
+      "43": { "correctAnswer": "400" },
+      "44": { "correctAnswer": "0" },
+      "45": { "correctAnswer": "5" },
+      "46": { "correctAnswer": "20" },
+      "47": { "correctAnswer": "1" },
+      "48": { "correctOption": "A" },
+      "49": { "correctOption": "A" },
+      "50": { "correctOption": "C" },
+      "51": { "correctOption": "C" }
+    }
+  }
+};
+
+/**
+ * Subject-specific sample answer keys (for multi-file demonstration).
+ */
+export const SAMPLE_MULTI_SUBJECT_KEYS: { name: string; content: string }[] = [
+  {
+    name: 'Physics_AnswerKey_P1.json',
+    content: JSON.stringify(
+      {
+        sections: {
+          'P1 · Physics': SAMPLE_OFFICIAL_ANSWER_KEY.sections['P1 · Physics'],
+        },
+      },
+      null,
+      2
+    ),
+  },
+  {
+    name: 'Chemistry_AnswerKey_P1.json',
+    content: JSON.stringify(
+      {
+        sections: {
+          'P1 · Chemistry': SAMPLE_OFFICIAL_ANSWER_KEY.sections['P1 · Chemistry'],
+        },
+      },
+      null,
+      2
+    ),
+  },
+  {
+    name: 'Mathematics_AnswerKey_P1.json',
+    content: JSON.stringify(
+      {
+        sections: {
+          'P1 · Mathematics': SAMPLE_OFFICIAL_ANSWER_KEY.sections['P1 · Mathematics'],
+        },
+      },
+      null,
+      2
+    ),
+  },
+];
+

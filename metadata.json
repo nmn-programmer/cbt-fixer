@@ -1,0 +1,6 @@
+{
+  "name": "CBT Question Paper Studio & ZIP Inspector",
+  "description": "IDE workbench to inspect, validate, debug, edit, restructure, and export JEE CBT Question Paper ZIP archives.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

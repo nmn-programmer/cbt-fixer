@@ -1,0 +1,117 @@
+export type QuestionType = 'mcq' | 'msq' | 'nat' | 'msm';
+
+export interface MarksScheme {
+  cm: number;      // Correct Marks (e.g. 3 or 4)
+  im: number;      // Incorrect Marks (e.g. -1 or -2)
+  pm?: number;     // Partial Marks per option (e.g. 1 for MSQ)
+  max?: number;    // Maximum question marks (e.g. 4 or 12 for matrix)
+}
+
+export interface PdfDataPart {
+  page: number;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  filename?: string; // e.g. "Chemistry Section 2__--__6__--__1.png"
+}
+
+export interface ImageAttachment {
+  id: string;
+  partIndex: number; // 1-based (1, 2, ...)
+  fileName: string;
+  blobUrl: string;
+  rawBlob?: Blob;
+  mimeType: string;
+  width?: number;
+  height?: number;
+  sizeBytes?: number;
+  isOrphaned?: boolean;
+}
+
+export interface QuestionData {
+  id: string;            // unique internal identifier
+  key: string;           // key in data.json (e.g. "1", "q1", "2_dup")
+  que: number;           // question sequence number (e.g. 1, 2, ...)
+  type: QuestionType;
+  marks: MarksScheme;
+  answerOptions: string; // e.g. "4", "1,2,3", "5.25", "A->P,Q; B->R"
+  pdfData: PdfDataPart[];
+  images: ImageAttachment[];
+  notes?: string;
+  isFlagged?: boolean;
+}
+
+export interface SectionData {
+  id: string;
+  name: string;          // e.g. "Section 1", "DPP 1", "Physics Section 1"
+  questions: QuestionData[];
+}
+
+export interface SubjectData {
+  id: string;
+  name: string;          // e.g. "Physics", "Chemistry", "Mathematics", "Biology"
+  sections: SectionData[];
+}
+
+export type ArchiveFormat = 'pdfCropper' | 'ultimate' | 'dpp' | 'quessbank' | 'custom';
+
+export interface ArchiveMetadata {
+  pdfFileHash?: string;
+  additionalData?: Record<string, unknown>;
+  appVersion?: string;
+  generatedBy?: string;
+  testTitle?: string;
+  createdAt?: string;
+}
+
+export interface QuestionPaperArchive {
+  id: string;
+  fileName: string;
+  title: string;
+  format: ArchiveFormat;
+  metadata: ArchiveMetadata;
+  subjects: SubjectData[];
+  rawFiles: Map<string, { blob: Blob; url: string; size: number }>;
+  isDirty?: boolean;
+  lastModified: number;
+}
+
+export type DiagnosticSeverity = 'error' | 'warning' | 'info';
+
+export type DiagnosticCode =
+  | 'MISSING_IMAGE_PART'
+  | 'ORPHANED_IMAGE'
+  | 'MALFORMED_FILENAME'
+  | 'DUPLICATE_QUESTION_INDEX'
+  | 'NON_SEQUENTIAL_NUMBERING'
+  | 'MARKING_ANOMALY'
+  | 'INVALID_ANSWER_KEY'
+  | 'EMPTY_SECTION'
+  | 'NO_IMAGE_PARTS';
+
+export interface DiagnosticLocation {
+  archiveId: string;
+  archiveName: string;
+  subjectId?: string;
+  subjectName?: string;
+  sectionId?: string;
+  sectionName?: string;
+  questionId?: string;
+  questionKey?: string;
+  questionNumber?: number;
+  partIndex?: number;
+  expectedFileName?: string;
+  actualFileName?: string;
+}
+
+export interface DiagnosticIssue {
+  id: string;
+  code: DiagnosticCode;
+  severity: DiagnosticSeverity;
+  title: string;
+  message: string;
+  location: DiagnosticLocation;
+  autoFixable: boolean;
+  autoFixAction?: string;
+}

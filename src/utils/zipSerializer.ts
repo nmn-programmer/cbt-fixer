@@ -1,0 +1,301 @@
+import JSZip from 'jszip';
+import {
+  ArchiveFormat,
+  QuestionData,
+  QuestionPaperArchive,
+  SectionData,
+  SubjectData,
+} from '../types/cbt';
+import { buildImageFileName } from './constants';
+
+export interface ExportOptions {
+  format?: 'pdfCropper' | 'ultimate' | 'dataJsonOnly' | 'imageBundleOnly';
+  sanitizeFilenames?: boolean;
+  stripOrphanedImages?: boolean;
+  autoRenumberSequentially?: boolean;
+  compressionLevel?: number; // 0-9
+}
+
+/**
+ * Serializes the in-memory QuestionPaperArchive into a strictly validated ZIP file.
+ */
+export async function serializeZipArchive(
+  archive: QuestionPaperArchive,
+  options: ExportOptions = {}
+): Promise<{ blob: Blob; fileName: string; stats: { totalQuestions: number; totalImages: number; byteSize: number } }> {
+  const {
+    format = archive.format === 'ultimate' ? 'ultimate' : 'pdfCropper',
+    sanitizeFilenames = true,
+    stripOrphanedImages = true,
+    autoRenumberSequentially = false,
+  } = options;
+
+  const zip = new JSZip();
+  let totalQuestions = 0;
+  let totalImages = 0;
+
+  // Build sanitized subjects tree
+  const sanitizedSubjects = prepareSubjectsForExport(archive.subjects, autoRenumberSequentially);
+
+  if (format === 'ultimate') {
+    // Ultimate ZIP: Nested subject folders (e.g. Physics/data.json + images)
+    for (const subject of sanitizedSubjects) {
+      const subjectFolder = zip.folder(subject.name) || zip;
+      const subjectPdfCropperData: Record<string, Record<string, any>> = {};
+      subjectPdfCropperData[subject.name] = {};
+
+      for (const section of subject.sections) {
+        subjectPdfCropperData[subject.name][section.name] = {};
+
+        for (const q of section.questions) {
+          totalQuestions++;
+          const qObj = serializeQuestion(q, section.name, sanitizeFilenames);
+          subjectPdfCropperData[subject.name][section.name][q.key] = qObj;
+
+          // Add images for this question
+          for (let i = 0; i < q.images.length; i++) {
+            const img = q.images[i];
+            const partIdx = i + 1;
+            const ext = getFileExtension(img.fileName) || 'png';
+            const targetFileName = sanitizeFilenames
+              ? buildImageFileName(section.name, q.que, partIdx, ext)
+              : img.fileName;
+
+            const binaryData = await getImageBinary(img, archive);
+            if (binaryData) {
+              subjectFolder.file(targetFileName, binaryData);
+              totalImages++;
+            }
+          }
+        }
+      }
+
+      const subjectJson = {
+        testConfig: {
+          title: `${archive.title} - ${subject.name}`,
+          pdfFileHash: archive.metadata.pdfFileHash || '',
+          additionalData: archive.metadata.additionalData || {},
+        },
+        pdfCropperData: subjectPdfCropperData,
+        appVersion: archive.metadata.appVersion || '2.6.0',
+        generatedBy: 'CBTQuestionPaperStudio',
+      };
+
+      subjectFolder.file('data.json', JSON.stringify(subjectJson, null, 2));
+    }
+  } else {
+    // Standard pdfCropper format: root data.json + root images
+    const pdfCropperData: Record<string, Record<string, Record<string, any>>> = {};
+
+    for (const subject of sanitizedSubjects) {
+      pdfCropperData[subject.name] = {};
+
+      for (const section of subject.sections) {
+        pdfCropperData[subject.name][section.name] = {};
+
+        for (const q of section.questions) {
+          totalQuestions++;
+          const qObj = serializeQuestion(q, section.name, sanitizeFilenames);
+          pdfCropperData[subject.name][section.name][q.key] = qObj;
+
+          // Add images for this question
+          for (let i = 0; i < q.images.length; i++) {
+            const img = q.images[i];
+            const partIdx = i + 1;
+            const ext = getFileExtension(img.fileName) || 'png';
+            const targetFileName = sanitizeFilenames
+              ? buildImageFileName(section.name, q.que, partIdx, ext)
+              : img.fileName;
+
+            const binaryData = await getImageBinary(img, archive);
+            if (binaryData) {
+              zip.file(targetFileName, binaryData);
+              totalImages++;
+            }
+          }
+        }
+      }
+    }
+
+    // Include orphaned images only if not stripped
+    if (!stripOrphanedImages) {
+      const referencedNames = new Set<string>();
+      for (const sub of sanitizedSubjects) {
+        for (const sec of sub.sections) {
+          for (const q of sec.questions) {
+            q.images.forEach((img) => referencedNames.add(img.fileName));
+          }
+        }
+      }
+
+      for (const [path, entry] of archive.rawFiles.entries()) {
+        const baseName = path.split('/').pop() || path;
+        if (!referencedNames.has(baseName) && !path.endsWith('.json')) {
+          zip.file(path, entry.blob);
+          totalImages++;
+        }
+      }
+    }
+
+    const rootJson = {
+      testConfig: {
+        title: archive.title,
+        pdfFileHash: archive.metadata.pdfFileHash || '',
+        additionalData: archive.metadata.additionalData || {},
+      },
+      pdfCropperData,
+      appVersion: archive.metadata.appVersion || '2.6.0',
+      generatedBy: 'CBTQuestionPaperStudio',
+    };
+
+    zip.file('data.json', JSON.stringify(rootJson, null, 2));
+  }
+
+  // Generate binary ZIP Blob
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    compression: 'DEFLATE',
+    compressionOptions: { level: options.compressionLevel || 6 },
+  });
+
+  const exportBaseName = archive.fileName.replace(/\.zip$/i, '');
+  const outFileName = `${exportBaseName}_sanitized.zip`;
+
+  return {
+    blob,
+    fileName: outFileName,
+    stats: {
+      totalQuestions,
+      totalImages,
+      byteSize: blob.size,
+    },
+  };
+}
+
+/**
+ * Exports strictly formatted standalone data.json
+ */
+export function serializeDataJson(
+  archive: QuestionPaperArchive,
+  autoRenumber: boolean = false
+): { jsonString: string; blob: Blob; fileName: string } {
+  const sanitizedSubjects = prepareSubjectsForExport(archive.subjects, autoRenumber);
+  const pdfCropperData: Record<string, Record<string, Record<string, any>>> = {};
+
+  for (const subject of sanitizedSubjects) {
+    pdfCropperData[subject.name] = {};
+    for (const section of subject.sections) {
+      pdfCropperData[subject.name][section.name] = {};
+      for (const q of section.questions) {
+        pdfCropperData[subject.name][section.name][q.key] = serializeQuestion(
+          q,
+          section.name,
+          true
+        );
+      }
+    }
+  }
+
+  const rootJson = {
+    testConfig: {
+      title: archive.title,
+      pdfFileHash: archive.metadata.pdfFileHash || '',
+      additionalData: archive.metadata.additionalData || {},
+    },
+    pdfCropperData,
+    appVersion: archive.metadata.appVersion || '2.6.0',
+    generatedBy: 'CBTQuestionPaperStudio',
+  };
+
+  const jsonString = JSON.stringify(rootJson, null, 2);
+  const blob = new Blob([jsonString], { type: 'application/json' });
+  const fileName = `${archive.title || 'cbt_paper'}_data.json`;
+
+  return { jsonString, blob, fileName };
+}
+
+function serializeQuestion(
+  q: QuestionData,
+  sectionName: string,
+  sanitizeFilenames: boolean
+): any {
+  // Build pdfData
+  const pdfData = q.pdfData.map((part, idx) => {
+    const ext = part.filename ? getFileExtension(part.filename) : 'png';
+    const filename = sanitizeFilenames
+      ? buildImageFileName(sectionName, q.que, idx + 1, ext)
+      : part.filename || buildImageFileName(sectionName, q.que, idx + 1, ext);
+
+    return {
+      page: part.page ?? 1,
+      x1: part.x1 ?? 0,
+      y1: part.y1 ?? 0,
+      x2: part.x2 ?? 100,
+      y2: part.y2 ?? 100,
+      filename,
+    };
+  });
+
+  return {
+    que: q.que,
+    type: q.type,
+    marks: {
+      cm: q.marks.cm,
+      im: q.marks.im,
+      ...(q.marks.pm !== undefined && q.marks.pm !== 0 ? { pm: q.marks.pm } : {}),
+      ...(q.marks.max !== undefined ? { max: q.marks.max } : {}),
+    },
+    answerOptions: q.answerOptions || '',
+    pdfData,
+  };
+}
+
+async function getImageBinary(
+  img: any,
+  archive: QuestionPaperArchive
+): Promise<Blob | ArrayBuffer | null> {
+  if (img.rawBlob) {
+    return img.rawBlob;
+  }
+  if (archive.rawFiles.has(img.fileName)) {
+    return archive.rawFiles.get(img.fileName)!.blob;
+  }
+  // Try fetching blobUrl
+  if (img.blobUrl && img.blobUrl.startsWith('blob:')) {
+    try {
+      const resp = await fetch(img.blobUrl);
+      return await resp.blob();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function getFileExtension(filename: string): string {
+  const parts = filename.split('.');
+  return parts.length > 1 ? parts.pop()!.toLowerCase() : 'png';
+}
+
+function prepareSubjectsForExport(
+  subjects: SubjectData[],
+  autoRenumber: boolean
+): SubjectData[] {
+  return subjects.map((sub) => ({
+    ...sub,
+    sections: sub.sections.map((sec) => {
+      let qNumCounter = 1;
+      return {
+        ...sec,
+        questions: sec.questions.map((q) => {
+          const effectiveQNum = autoRenumber ? qNumCounter++ : q.que;
+          return {
+            ...q,
+            que: effectiveQNum,
+            key: String(effectiveQNum),
+          };
+        }),
+      };
+    }),
+  }));
+}
