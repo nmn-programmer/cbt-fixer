@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Code,
   Copy,
+  Crop,
   ExternalLink,
   Eye,
   FileImage,
@@ -24,10 +25,12 @@ import {
   Plus,
   RefreshCw,
   RotateCw,
+  Scissors,
   Sparkles,
   Tag,
   Trash2,
   Upload,
+  Wand2,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
@@ -58,6 +61,8 @@ export const QuestionEditor: React.FC = () => {
     fixMarkingSchemes,
     jumpToDiagnostic,
     setAnswerKeyModalOpen,
+    openPdfRecrop,
+    openAiRepair,
   } = useCbtStore();
 
   const [activeTab, setActiveTab] = useState<'editor' | 'json'>('editor');
@@ -233,6 +238,26 @@ export const QuestionEditor: React.FC = () => {
 
         {/* Action buttons & Prev/Next */}
         <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            onClick={() => openPdfRecrop({ questionId: currentQuestion!.id, partIndex: activePartIndex, mode: 'replace_part' })}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-md border border-indigo-500/40 transition-colors font-medium"
+            title="Re-crop this question directly from original PDF"
+          >
+            <Crop className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="hidden md:inline">Re-Crop from PDF</span>
+          </button>
+
+          <button
+            onClick={() => openAiRepair(currentQuestion!.id)}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 rounded-md border border-purple-500/40 transition-colors font-medium"
+            title="Launch AI Doctor to diagnose & repair question defects"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+            <span className="hidden md:inline">AI Doctor</span>
+          </button>
+
+          <div className="h-4 w-px bg-slate-800 mx-1" />
+
           <button
             onClick={() =>
               updateQuestion(
@@ -837,14 +862,46 @@ export const QuestionEditor: React.FC = () => {
                   )}
                 </div>
 
-                {/* Add Image Part Button */}
-                <button
-                  onClick={() => fileAddRef.current?.click()}
-                  className="flex items-center gap-1 px-2.5 py-1 text-xs bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded-md border border-slate-700 transition-colors"
-                >
-                  <Plus className="w-3.5 h-3.5" />
-                  <span>Add Image Part</span>
-                </button>
+                {/* Image Part Action Buttons */}
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={() =>
+                      openPdfRecrop({
+                        questionId: currentQuestion!.id,
+                        partIndex: activePartIndex,
+                        mode: 'replace_part'
+                      })
+                    }
+                    className="flex items-center gap-1 px-2.5 py-1 text-xs bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-md border border-indigo-500/40 transition-colors font-medium"
+                    title="Open PDF Visual Cropper to re-crop slice"
+                  >
+                    <Crop className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Re-Crop from PDF</span>
+                  </button>
+
+                  <button
+                    onClick={() =>
+                      openPdfRecrop({
+                        questionId: currentQuestion!.id,
+                        mode: 'add_part'
+                      })
+                    }
+                    className="flex items-center gap-1 px-2 py-1 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-md border border-slate-700 transition-colors"
+                    title="Crop a new slice from PDF and append as Part 2+"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Crop New Part</span>
+                  </button>
+
+                  <button
+                    onClick={() => fileAddRef.current?.click()}
+                    className="flex items-center gap-1 px-2 py-1 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-md border border-slate-700 transition-colors"
+                    title="Upload image from computer file"
+                  >
+                    <Upload className="w-3.5 h-3.5 text-slate-400" />
+                    <span className="hidden sm:inline">Upload Image</span>
+                  </button>
+                </div>
               </div>
 
               {/* Part Tabs Strip & Ordering Controls */}
@@ -875,6 +932,20 @@ export const QuestionEditor: React.FC = () => {
 
                         {/* Part Actions */}
                         <div className="flex items-center gap-0.5 ml-1">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openPdfRecrop({
+                                questionId: currentQuestion!.id,
+                                partIndex: img.partIndex,
+                                mode: 'replace_part'
+                              });
+                            }}
+                            className="p-0.5 hover:text-indigo-300 rounded"
+                            title="Re-Crop this Part from PDF"
+                          >
+                            <Crop className="w-2.5 h-2.5" />
+                          </button>
                           {idx > 0 && (
                             <button
                               onClick={(e) => {
@@ -905,7 +976,7 @@ export const QuestionEditor: React.FC = () => {
                               triggerReplace(img.partIndex);
                             }}
                             className="p-0.5 hover:text-cyan-300 rounded"
-                            title="Replace Image File"
+                            title="Replace with Local File"
                           >
                             <RefreshCw className="w-2.5 h-2.5" />
                           </button>
@@ -1058,66 +1129,88 @@ export const QuestionEditor: React.FC = () => {
 
                     {viewMode === 'stacked' ? (
                       <div className="space-y-4 flex flex-col items-center">
-                        {currentQuestion.images.map((img) => (
-                          <div
-                            key={img.id}
-                            className="w-full max-w-2xl bg-slate-900/60 rounded-lg p-2 border border-slate-800/80 space-y-1.5"
-                          >
-                            <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
-                              <span className="font-semibold text-indigo-400">
-                                Part {img.partIndex} of {currentQuestion!.images.length}
-                              </span>
-                              <span className="font-mono text-slate-500 text-[10px]">
-                                {img.fileName}
-                              </span>
-                            </div>
+                        {currentQuestion.images.map((img) => {
+                          const resolvedBlobUrl = img.blobUrl?.trim() || activeArchive.rawFiles.get(img.fileName)?.url || '';
+                          return (
                             <div
-                              className={`flex justify-center p-3 rounded-lg transition-colors ${
+                              key={img.id}
+                              className="w-full max-w-2xl bg-slate-900/60 rounded-lg p-2 border border-slate-800/80 space-y-1.5"
+                            >
+                              <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
+                                <span className="font-semibold text-indigo-400">
+                                  Part {img.partIndex} of {currentQuestion!.images.length}
+                                </span>
+                                <span className="font-mono text-slate-500 text-[10px]">
+                                  {img.fileName}
+                                </span>
+                              </div>
+                              <div
+                                className={`flex justify-center p-3 rounded-lg transition-colors ${
+                                  invertDarkMode
+                                    ? 'bg-slate-950 border border-slate-800'
+                                    : 'bg-white border border-slate-200 shadow-sm'
+                                }`}
+                              >
+                                {resolvedBlobUrl && resolvedBlobUrl.trim() !== '' ? (
+                                  <img
+                                    src={resolvedBlobUrl}
+                                    alt={img.fileName}
+                                    referrerPolicy="no-referrer"
+                                    style={{
+                                      transform: `scale(${zoomLevel / 100})`,
+                                      filter: invertDarkMode ? 'invert(0.9) hue-rotate(180deg)' : 'none',
+                                      transition: 'transform 0.15s ease-out, filter 0.15s ease-out',
+                                    }}
+                                    className="max-w-full h-auto rounded select-none"
+                                  />
+                                ) : (
+                                  <div className="py-6 text-center text-xs text-amber-400 flex flex-col items-center gap-1.5">
+                                    <AlertTriangle className="w-5 h-5 text-amber-400/80" />
+                                    <span>Image binary data not loaded for {img.fileName}</span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-center min-h-[220px]">
+                        {(() => {
+                          if (!activeImage) return null;
+                          const resolvedBlobUrl = activeImage.blobUrl?.trim() || activeArchive.rawFiles.get(activeImage.fileName)?.url || '';
+                          if (!resolvedBlobUrl) {
+                            return (
+                              <div className="p-6 text-center text-xs text-amber-400 flex flex-col items-center gap-1.5 bg-slate-950/60 rounded-lg border border-slate-800">
+                                <AlertTriangle className="w-5 h-5 text-amber-400/80" />
+                                <span>Image binary data not loaded for {activeImage.fileName}</span>
+                              </div>
+                            );
+                          }
+                          return (
+                            <div
+                              className={`p-3 sm:p-4 rounded-lg transition-colors flex items-center justify-center max-w-full ${
                                 invertDarkMode
                                   ? 'bg-slate-950 border border-slate-800'
                                   : 'bg-white border border-slate-200 shadow-sm'
                               }`}
                             >
                               <img
-                                src={img.blobUrl}
-                                alt={img.fileName}
+                                src={resolvedBlobUrl}
+                                alt={activeImage.fileName}
                                 referrerPolicy="no-referrer"
                                 style={{
-                                  transform: `scale(${zoomLevel / 100})`,
+                                  transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg) scaleX(${
+                                    flipH ? -1 : 1
+                                  }) scaleY(${flipV ? -1 : 1})`,
                                   filter: invertDarkMode ? 'invert(0.9) hue-rotate(180deg)' : 'none',
                                   transition: 'transform 0.15s ease-out, filter 0.15s ease-out',
                                 }}
-                                className="max-w-full h-auto rounded select-none"
+                                className="max-w-full h-auto rounded select-none pointer-events-none"
                               />
                             </div>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="flex items-center justify-center min-h-[220px]">
-                        {activeImage && (
-                          <div
-                            className={`p-3 sm:p-4 rounded-lg transition-colors flex items-center justify-center max-w-full ${
-                              invertDarkMode
-                                ? 'bg-slate-950 border border-slate-800'
-                                : 'bg-white border border-slate-200 shadow-sm'
-                            }`}
-                          >
-                            <img
-                              src={activeImage.blobUrl}
-                              alt={activeImage.fileName}
-                              referrerPolicy="no-referrer"
-                              style={{
-                                transform: `scale(${zoomLevel / 100}) rotate(${rotation}deg) scaleX(${
-                                  flipH ? -1 : 1
-                                }) scaleY(${flipV ? -1 : 1})`,
-                                filter: invertDarkMode ? 'invert(0.9) hue-rotate(180deg)' : 'none',
-                                transition: 'transform 0.15s ease-out, filter 0.15s ease-out',
-                              }}
-                              className="max-w-full h-auto rounded select-none pointer-events-none"
-                            />
-                          </div>
-                        )}
+                          );
+                        })()}
                       </div>
                     )}
                   </div>

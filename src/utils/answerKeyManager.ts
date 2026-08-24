@@ -1,5 +1,6 @@
 import { MarksScheme, QuestionData, QuestionPaperArchive, QuestionType, SubjectData } from '../types/cbt';
 import { generateId } from './constants';
+import { fetchWithGeminiFallback } from './geminiKeyManager';
 
 /**
  * Standard Answer Key Entry representing a single question's answer in the official format.
@@ -889,6 +890,139 @@ export const SAMPLE_OFFICIAL_ANSWER_KEY: OfficialAnswerKeySchema = {
     }
   }
 };
+
+/**
+ * Calls AI endpoint to extract and verify Answer Key from base64 page images of an Answer Key PDF.
+ */
+export async function extractAnswerKeyFromPdfImages(
+  images: string[],
+  geminiApiKey?: string,
+  context?: { totalQuestions?: number; subjects?: string[] },
+  enableDoublePass: boolean = true
+): Promise<{ parseResult: AnswerKeyParseResult; rawResponse: any }> {
+  if (!images || images.length === 0) {
+    throw new Error('No images provided for Answer Key extraction.');
+  }
+
+  const res = await fetchWithGeminiFallback('/api/extract-answer-key-pdf', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ images, context, options: { enableDoublePass } }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to extract answer key' }));
+    throw new Error(err.error || 'Failed to extract answer key from PDF');
+  }
+
+  const data = await res.json();
+  const rawAnswers = data.answers || [];
+
+  const items: NormalizedAnswerItem[] = [];
+  const sectionsMap: Record<string, NormalizedAnswerItem[]> = {};
+
+  rawAnswers.forEach((ans: any) => {
+    const qNum = typeof ans.qNo === 'number' ? ans.qNo : parseInt(ans.qNo, 10) || 1;
+    const secName = ans.subject ? ans.subject : 'General Key';
+    const rawVal = ans.answer || '';
+    const normVal = ans.normalizedAnswer || (ans.inferredType === 'mcq' ? letterToOptionIndex(rawVal) : rawVal);
+    const letterVal = ans.letterAnswer || (ans.inferredType === 'mcq' ? optionIndexToLetter(normVal) : rawVal);
+    const type: QuestionType = ['mcq', 'msq', 'nat', 'msm'].includes(ans.inferredType)
+      ? ans.inferredType
+      : inferTypeFromAnswerString(rawVal);
+
+    const item: NormalizedAnswerItem = {
+      sectionName: secName,
+      questionNumber: qNum,
+      questionKey: String(qNum),
+      rawAnswer: rawVal,
+      normalizedAnswer: normVal,
+      letterAnswer: letterVal,
+      inferredType: type,
+      rawEntry: ans,
+    };
+
+    items.push(item);
+    if (!sectionsMap[secName]) sectionsMap[secName] = [];
+    sectionsMap[secName].push(item);
+  });
+
+  items.sort((a, b) => a.questionNumber - b.questionNumber);
+  Object.keys(sectionsMap).forEach((k) => sectionsMap[k].sort((a, b) => a.questionNumber - b.questionNumber));
+
+  const parseResult: AnswerKeyParseResult = {
+    isValid: items.length > 0,
+    format: 'flat_sections',
+    items,
+    sectionsMap,
+    totalQuestions: items.length,
+    warnings: [],
+  };
+
+  return { parseResult, rawResponse: data };
+}
+
+/**
+ * Infers standard QuestionType from an answer string.
+ */
+export function inferTypeFromAnswerString(ansStr: string): QuestionType {
+  if (!ansStr) return 'mcq';
+  const trimmed = ansStr.trim();
+  if (trimmed.includes('->') || trimmed.includes('→') || /[A-D]\s*[-:]\s*[P-T]/i.test(trimmed)) {
+    return 'msm';
+  }
+  if (trimmed.includes(',') || /[A-D]{2,}/i.test(trimmed)) {
+    return 'msq';
+  }
+  if (/^-?\d+(\.\d+)?$/.test(trimmed) && !['1', '2', '3', '4'].includes(trimmed)) {
+    return 'nat';
+  }
+  return 'mcq';
+}
+
+/**
+ * Renders an Answer Key PDF File and extracts answer keys via AI.
+ */
+export async function extractAnswerKeyFromPdfFile(
+  file: File,
+  geminiApiKey?: string,
+  onProgress?: (msg: string, percent: number) => void,
+  context?: { totalQuestions?: number; subjects?: string[] }
+): Promise<{ parseResult: AnswerKeyParseResult; rawResponse: any; pageImages: string[] }> {
+  onProgress?.('Rendering Answer Key PDF pages...', 20);
+
+  const arrayBuffer = await file.arrayBuffer();
+  const pdfjsLib = await import('pdfjs-dist');
+  const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const numPages = Math.min(pdfDoc.numPages, 10); // Process up to 10 pages of answer key
+
+  const pageImages: string[] = [];
+  for (let i = 1; i <= numPages; i++) {
+    onProgress?.(`Rendering Answer Key page ${i} of ${numPages}...`, 20 + Math.round((i / numPages) * 30));
+    const page = await pdfDoc.getPage(i);
+    const viewport = page.getViewport({ scale: 2.0 });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport } as any).promise;
+      pageImages.push(canvas.toDataURL('image/jpeg', 0.85));
+    }
+  }
+
+  onProgress?.('AI analyzing answer tables and question types...', 65);
+  const result = await extractAnswerKeyFromPdfImages(pageImages, geminiApiKey, context);
+  onProgress?.(`Extracted ${result.parseResult.items.length} answer keys!`, 100);
+
+  return {
+    parseResult: result.parseResult,
+    rawResponse: result.rawResponse,
+    pageImages,
+  };
+}
 
 /**
  * Subject-specific sample answer keys (for multi-file demonstration).

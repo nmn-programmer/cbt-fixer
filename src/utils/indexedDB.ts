@@ -114,7 +114,9 @@ export async function loadAllArchivesFromDB(): Promise<QuestionPaperArchive[]> {
           questions: sec.questions.map((q: any) => ({
             ...q,
             images: q.images.map((img: any) => {
-              const fileEntry = rawFiles.get(img.fileName);
+              const fileEntry =
+                rawFiles.get(img.fileName) ||
+                Array.from(rawFiles.entries()).find(([k]) => k.endsWith(img.fileName) || img.fileName?.endsWith(k))?.[1];
               return {
                 ...img,
                 blobUrl: fileEntry ? fileEntry.url : '',

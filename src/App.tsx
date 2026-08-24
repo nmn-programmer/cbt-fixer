@@ -11,8 +11,23 @@ import { ExportModal } from './components/ExportModal';
 import { CbtPreviewModal } from './components/CbtPreviewModal';
 import { AnswerKeyStudioModal } from './components/AnswerKeyStudioModal';
 import { FloatingQuestionPreview } from './components/FloatingQuestionPreview';
+import { AutoPdfConverterModal } from './components/AutoPdfConverterModal';
+import { BlueprintRangeStudioModal } from './components/BlueprintRangeStudioModal';
+import { PdfRecropModal } from './components/PdfRecropModal';
+import { AiQuestionRepairModal } from './components/AiQuestionRepairModal';
+import { SettingsModal } from './components/SettingsModal';
+import { ToastContainer } from './components/ToastContainer';
+import { FloatingBgTaskWidget } from './components/FloatingBgTaskWidget';
 
 export default function App() {
+  const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    const handleOpen = () => setIsSettingsOpen(true);
+    window.addEventListener("open-settings", handleOpen);
+    return () => window.removeEventListener("open-settings", handleOpen);
+  }, []);
+
   const {
     archives,
     activeArchiveId,
@@ -94,9 +109,20 @@ export default function App() {
       <ExportModal />
       <CbtPreviewModal />
       <AnswerKeyStudioModal />
+      <AutoPdfConverterModal />
+      <BlueprintRangeStudioModal />
+      <PdfRecropModal />
+      <AiQuestionRepairModal />
+      <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
 
       {/* Draggable & Pinned Floating Question Image Previewer */}
       <FloatingQuestionPreview />
+
+      {/* Global Toast Notifications */}
+      <ToastContainer />
+
+      {/* Floating Circular Progress Background Widget */}
+      <FloatingBgTaskWidget />
     </div>
   );
 }

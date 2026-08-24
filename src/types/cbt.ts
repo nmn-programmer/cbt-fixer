@@ -9,6 +9,7 @@ export interface MarksScheme {
 
 export interface PdfDataPart {
   page: number;
+  pageNumber?: number;
   x1: number;
   y1: number;
   x2: number;
@@ -36,6 +37,7 @@ export interface QuestionData {
   type: QuestionType;
   marks: MarksScheme;
   answerOptions: string; // e.g. "4", "1,2,3", "5.25", "A->P,Q; B->R"
+  isSplitQuestion?: boolean;
   pdfData: PdfDataPart[];
   images: ImageAttachment[];
   notes?: string;
@@ -56,12 +58,51 @@ export interface SubjectData {
 
 export type ArchiveFormat = 'pdfCropper' | 'ultimate' | 'dpp' | 'quessbank' | 'custom';
 
+export interface BlueprintSectionRange {
+  id: string;
+  subjectName: string;         // e.g. "Physics", "Chemistry", "Mathematics", "Biology"
+  sectionName: string;         // e.g. "Section 1", "Section 1 (MCQ)", "Section 2 (NAT)"
+  fromQNo: number;             // e.g. 1
+  toQNo: number;               // e.g. 8
+  type: QuestionType;          // 'mcq' | 'msq' | 'nat' | 'msm'
+  marks: MarksScheme;          // { cm: 4, im: -1, pm?: 1, max?: 4 }
+}
+
+export interface TestPaperBlueprint {
+  testTitle?: string;
+  durationMinutes?: number;
+  totalMarks?: number;
+  instructionPageNum?: number;
+  instructionSummary?: string;
+  rawInstructionText?: string;
+  markingSchemeSummary?: string;
+  hasInstructedMarkingScheme?: boolean;
+  defaultMarkingScheme?: { cm: number; im: number; pm?: number; max?: number };
+  sections: BlueprintSectionRange[];
+}
+
 export interface ArchiveMetadata {
   pdfFileHash?: string;
+  sourcePdfName?: string;
   additionalData?: Record<string, unknown>;
   appVersion?: string;
   generatedBy?: string;
+  schemaVersion?: string;
   testTitle?: string;
+  durationMinutes?: number;
+  totalMarks?: number;
+  markingScheme?: {
+    correct?: number;
+    incorrect?: number;
+    partial?: number;
+    blank?: number;
+    correctMarks?: number;
+    negativeMarks?: number;
+    partialMarks?: number;
+    type?: string;
+  };
+  hasInstructedMarkingScheme?: boolean;
+  instructionMarkingSummary?: string;
   createdAt?: string;
 }
 
@@ -87,6 +128,11 @@ export type DiagnosticCode =
   | 'NON_SEQUENTIAL_NUMBERING'
   | 'MARKING_ANOMALY'
   | 'INVALID_ANSWER_KEY'
+  | 'ANSWER_TYPE_MISMATCH'
+  | 'INSTRUCTED_MARKING_MISMATCH'
+  | 'SPLIT_PART_INCOMPLETE'
+  | 'UNANSWERED_QUESTION_IN_KEY'
+  | 'LEGACY_FORMAT_DETECTED'
   | 'EMPTY_SECTION'
   | 'NO_IMAGE_PARTS';
 

@@ -19,6 +19,8 @@ import {
   Trash2,
   X,
   FileQuestion,
+  Crop,
+  Sparkles,
 } from 'lucide-react';
 import { useCbtStore } from '../store/useCbtStore';
 import { QuestionType, SubjectData, SectionData, QuestionData } from '../types/cbt';
@@ -51,6 +53,8 @@ export const SidebarTree: React.FC = () => {
     deleteQuestion,
     duplicateQuestion,
     moveQuestion,
+    openPdfRecrop,
+    openAiRepair,
   } = useCbtStore();
 
   const [expandedSubjects, setExpandedSubjects] = useState<Record<string, boolean>>({});
@@ -488,6 +492,32 @@ export const SidebarTree: React.FC = () => {
                                       )}
 
                                       <div className="opacity-0 group-hover:opacity-100 flex items-center gap-0.5">
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            selectQuestion(subject.id, section.id, q.id);
+                                            openPdfRecrop({ questionId: q.id, mode: 'replace_part', partIndex: 1 });
+                                          }}
+                                          className={`p-0.5 rounded ${
+                                            isSelected ? 'hover:bg-white/20 text-white' : 'hover:bg-slate-700 text-indigo-300'
+                                          }`}
+                                          title="Re-Crop from Source PDF"
+                                        >
+                                          <Crop className="w-2.5 h-2.5" />
+                                        </button>
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            selectQuestion(subject.id, section.id, q.id);
+                                            openAiRepair(q.id);
+                                          }}
+                                          className={`p-0.5 rounded ${
+                                            isSelected ? 'hover:bg-white/20 text-white' : 'hover:bg-slate-700 text-purple-300'
+                                          }`}
+                                          title="AI Doctor & Repair"
+                                        >
+                                          <Sparkles className="w-2.5 h-2.5" />
+                                        </button>
                                         <button
                                           onClick={(e) => {
                                             e.stopPropagation();

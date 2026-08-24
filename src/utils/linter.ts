@@ -210,7 +210,7 @@ export function runDiagnostics(archive: QuestionPaperArchive): DiagnosticIssue[]
           }
         }
 
-        // Check Answer Options Validity
+        // Check Answer Options Validity & Type Mismatch
         if (!q.answerOptions || q.answerOptions.trim() === '') {
           issues.push({
             id: generateId(),
@@ -218,6 +218,133 @@ export function runDiagnostics(archive: QuestionPaperArchive): DiagnosticIssue[]
             severity: 'warning',
             title: 'Empty Answer Key',
             message: `Question Q${q.que} has no answer key defined.`,
+            location: {
+              archiveId: archive.id,
+              archiveName: archive.fileName,
+              subjectId: subject.id,
+              subjectName: subject.name,
+              sectionId: section.id,
+              sectionName: section.name,
+              questionId: q.id,
+              questionKey: q.key,
+              questionNumber: q.que,
+            },
+            autoFixable: false,
+          });
+        } else {
+          const ans = q.answerOptions.trim();
+          
+          // MCQ vs Multi-Option Mismatch
+          if (q.type === 'mcq' && (ans.includes(',') || /^[A-D]{2,}$/i.test(ans))) {
+            issues.push({
+              id: generateId(),
+              code: 'ANSWER_TYPE_MISMATCH',
+              severity: 'error',
+              title: 'MCQ Type Mismatch (Multiple Options)',
+              message: `Question Q${q.que} is set as Single Correct Choice (MCQ), but Answer Key contains multiple options ("${ans}"). Should be MSQ.`,
+              location: {
+                archiveId: archive.id,
+                archiveName: archive.fileName,
+                subjectId: subject.id,
+                subjectName: subject.name,
+                sectionId: section.id,
+                sectionName: section.name,
+                questionId: q.id,
+                questionKey: q.key,
+                questionNumber: q.que,
+              },
+              autoFixable: true,
+              autoFixAction: 'Change question type to MSQ and update marking scheme',
+            });
+          }
+
+          // NAT vs Alphabet Option Mismatch
+          if (q.type === 'nat' && /^[A-Fa-f]$/.test(ans)) {
+            issues.push({
+              id: generateId(),
+              code: 'ANSWER_TYPE_MISMATCH',
+              severity: 'error',
+              title: 'NAT Type Mismatch (Letter Option)',
+              message: `Question Q${q.que} is set as Numerical Answer Type (NAT), but Answer Key contains option letter "${ans}". Should be MCQ.`,
+              location: {
+                archiveId: archive.id,
+                archiveName: archive.fileName,
+                subjectId: subject.id,
+                subjectName: subject.name,
+                sectionId: section.id,
+                sectionName: section.name,
+                questionId: q.id,
+                questionKey: q.key,
+                questionNumber: q.que,
+              },
+              autoFixable: true,
+              autoFixAction: 'Convert question type to MCQ (1-choice)',
+            });
+          }
+
+          // MSQ vs Numerical Mismatch
+          if (q.type === 'msq' && /^-?\d+(\.\d+)?$/.test(ans) && !['1', '2', '3', '4'].includes(ans)) {
+            issues.push({
+              id: generateId(),
+              code: 'ANSWER_TYPE_MISMATCH',
+              severity: 'warning',
+              title: 'MSQ Type Mismatch (Numerical Value)',
+              message: `Question Q${q.que} is set as MSQ, but Answer Key is numeric "${ans}". Should be NAT.`,
+              location: {
+                archiveId: archive.id,
+                archiveName: archive.fileName,
+                subjectId: subject.id,
+                subjectName: subject.name,
+                sectionId: section.id,
+                sectionName: section.name,
+                questionId: q.id,
+                questionKey: q.key,
+                questionNumber: q.que,
+              },
+              autoFixable: true,
+              autoFixAction: 'Convert question type to Numerical (NAT)',
+            });
+          }
+        }
+
+        // Check Instructed Marking Scheme Discrepancy
+        if (archive.metadata.hasInstructedMarkingScheme && archive.metadata.markingScheme) {
+          const instScheme = archive.metadata.markingScheme;
+          const instCorrect = instScheme.correctMarks ?? instScheme.correct ?? 4;
+          const instIncorrect = instScheme.negativeMarks ?? instScheme.incorrect ?? -1;
+
+          if (q.type === 'mcq' && (q.marks.cm !== instCorrect || q.marks.im !== instIncorrect)) {
+            issues.push({
+              id: generateId(),
+              code: 'INSTRUCTED_MARKING_MISMATCH',
+              severity: 'warning',
+              title: 'Instructed Marking Scheme Discrepancy',
+              message: `Question Q${q.que} has marks (+${q.marks.cm}, ${q.marks.im}) differing from the booklet's instructed scheme (+${instCorrect}, ${instIncorrect}).`,
+              location: {
+                archiveId: archive.id,
+                archiveName: archive.fileName,
+                subjectId: subject.id,
+                subjectName: subject.name,
+                sectionId: section.id,
+                sectionName: section.name,
+                questionId: q.id,
+                questionKey: q.key,
+                questionNumber: q.que,
+              },
+              autoFixable: true,
+              autoFixAction: 'Synchronize marks with instructed booklet scheme',
+            });
+          }
+        }
+
+        // Check Split Question Completeness
+        if (q.isSplitQuestion && q.images.length < 2) {
+          issues.push({
+            id: generateId(),
+            code: 'SPLIT_PART_INCOMPLETE',
+            severity: 'warning',
+            title: 'Split Question Incomplete',
+            message: `Question Q${q.que} is marked as a multi-part split question, but has fewer than 2 image parts attached.`,
             location: {
               archiveId: archive.id,
               archiveName: archive.fileName,
@@ -489,3 +616,131 @@ export function autoFixMarkingSchemes(archive: QuestionPaperArchive): QuestionPa
     lastModified: Date.now(),
   };
 }
+
+/**
+ * 1-Click Auto-Fixer: Auto-align question types based on answer key format.
+ * (e.g. multiple options -> msq, numeric -> nat, single option -> mcq)
+ */
+export function autoFixAnswerTypeMismatches(archive: QuestionPaperArchive): QuestionPaperArchive {
+  const updatedSubjects = archive.subjects.map((sub) => ({
+    ...sub,
+    sections: sub.sections.map((sec) => ({
+      ...sec,
+      questions: sec.questions.map((q) => {
+        const ans = (q.answerOptions || '').trim();
+        if (!ans) return q;
+
+        // If multiple options e.g. "1,3" or "A,C" or "ACD" -> MSQ
+        if (ans.includes(',') || /^[A-D]{2,}$/i.test(ans)) {
+          if (q.type !== 'msq') {
+            return {
+              ...q,
+              type: 'msq' as const,
+              marks: {
+                cm: 4,
+                im: -2,
+                pm: 1,
+                max: 4,
+              },
+            };
+          }
+        }
+
+        // If purely numeric decimal / non-option integer e.g. "24.5" or "40" -> NAT
+        if (/^-?\d+(\.\d+)?$/.test(ans) && !['1', '2', '3', '4'].includes(ans)) {
+          if (q.type !== 'nat') {
+            return {
+              ...q,
+              type: 'nat' as const,
+              marks: {
+                cm: 4,
+                im: 0,
+                pm: 0,
+                max: 4,
+              },
+            };
+          }
+        }
+
+        // If single letter option A, B, C, D in NAT question -> MCQ
+        if (/^[A-Da-d]$/.test(ans) && q.type === 'nat') {
+          return {
+            ...q,
+            type: 'mcq' as const,
+            marks: {
+              cm: 4,
+              im: -1,
+              pm: 0,
+              max: 4,
+            },
+          };
+        }
+
+        return q;
+      }),
+    })),
+  }));
+
+  return {
+    ...archive,
+    subjects: updatedSubjects,
+    isDirty: true,
+    lastModified: Date.now(),
+  };
+}
+
+/**
+ * 1-Click Auto-Fixer: Reapply instructed marking scheme across all questions.
+ */
+export function autoFixInstructedMarkings(archive: QuestionPaperArchive): QuestionPaperArchive {
+  if (!archive.metadata.markingScheme) return archive;
+
+  const instScheme = archive.metadata.markingScheme;
+  const cm = instScheme.correctMarks ?? instScheme.correct ?? 4;
+  const im = instScheme.negativeMarks ?? instScheme.incorrect ?? -1;
+  const pm = instScheme.partialMarks ?? instScheme.partial ?? 1;
+
+  const updatedSubjects = archive.subjects.map((sub) => ({
+    ...sub,
+    sections: sub.sections.map((sec) => ({
+      ...sec,
+      questions: sec.questions.map((q) => {
+        if (q.type === 'mcq') {
+          return { ...q, marks: { cm, im, pm: 0, max: cm } };
+        }
+        if (q.type === 'nat') {
+          return { ...q, marks: { cm, im: 0, pm: 0, max: cm } };
+        }
+        if (q.type === 'msq') {
+          return { ...q, marks: { cm, im: im > 0 ? -im : im, pm: pm || 1, max: cm } };
+        }
+        return q;
+      }),
+    })),
+  }));
+
+  return {
+    ...archive,
+    subjects: updatedSubjects,
+    isDirty: true,
+    lastModified: Date.now(),
+  };
+}
+
+/**
+ * 1-Click Auto-Fixer: Modernizes archive structure to AI-standard format.
+ */
+export function autoFixModernizeToAiFormat(archive: QuestionPaperArchive): QuestionPaperArchive {
+  const standardized = autoFixStandardizeFilenames(archive);
+  return {
+    ...standardized,
+    metadata: {
+      ...standardized.metadata,
+      schemaVersion: '2.0-ai',
+      hasInstructedMarkingScheme: true,
+    },
+    isDirty: true,
+    lastModified: Date.now(),
+  };
+}
+

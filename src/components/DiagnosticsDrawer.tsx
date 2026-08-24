@@ -26,6 +26,9 @@ export const DiagnosticsDrawer: React.FC = () => {
     fixPruneOrphaned,
     fixStandardizeFilenames,
     fixMarkingSchemes,
+    fixAnswerTypeMismatches,
+    fixInstructedMarkings,
+    fixModernizeFormat,
     archives,
     activeArchiveId,
   } = useCbtStore();
@@ -296,6 +299,9 @@ export const DiagnosticsDrawer: React.FC = () => {
                           else if (issue.code === 'NON_SEQUENTIAL_NUMBERING' || issue.code === 'DUPLICATE_QUESTION_INDEX')
                             fixRenumberSection(loc.sectionId);
                           else if (issue.code === 'MARKING_ANOMALY') fixMarkingSchemes();
+                          else if (issue.code === 'ANSWER_TYPE_MISMATCH') fixAnswerTypeMismatches();
+                          else if (issue.code === 'INSTRUCTED_MARKING_MISMATCH') fixInstructedMarkings();
+                          else if (issue.code === 'LEGACY_FORMAT_DETECTED') fixModernizeFormat();
                         }}
                         className="flex items-center gap-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 rounded font-semibold text-[11px] border border-slate-700 transition-colors"
                       >

@@ -227,21 +227,31 @@ export const CbtPreviewModal: React.FC = () => {
               {/* Question Image Slice Display */}
               <div className="space-y-3">
                 {currentQuestion.images.length > 0 ? (
-                  currentQuestion.images.map((img) => (
-                    <div
-                      key={img.id}
-                      className="rounded-lg border border-slate-800 bg-white p-3 shadow-md overflow-hidden"
-                    >
-                      <img
-                        src={img.blobUrl}
-                        alt={`Q${currentQuestion.que} Part ${img.partIndex}`}
-                        style={{
-                          filter: darkModeSim ? 'invert(0.9) hue-rotate(180deg)' : 'none',
-                        }}
-                        className="max-w-full h-auto mx-auto select-none"
-                      />
-                    </div>
-                  ))
+                  currentQuestion.images.map((img) => {
+                    const resolvedBlobUrl = img.blobUrl?.trim() || activeArchive.rawFiles.get(img.fileName)?.url || '';
+                    return (
+                      <div
+                        key={img.id}
+                        className="rounded-lg border border-slate-800 bg-white p-3 shadow-md overflow-hidden"
+                      >
+                        {resolvedBlobUrl && resolvedBlobUrl.trim() !== '' ? (
+                          <img
+                            src={resolvedBlobUrl}
+                            alt={`Q${currentQuestion.que} Part ${img.partIndex}`}
+                            referrerPolicy="no-referrer"
+                            style={{
+                              filter: darkModeSim ? 'invert(0.9) hue-rotate(180deg)' : 'none',
+                            }}
+                            className="max-w-full h-auto mx-auto select-none"
+                          />
+                        ) : (
+                          <div className="p-4 text-center text-xs text-amber-500 bg-amber-500/10 rounded">
+                            Image binary not loaded ({img.fileName})
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
                 ) : (
                   <div className="p-8 text-center bg-slate-900 border border-slate-800 rounded-lg text-slate-400 text-xs">
                     No image slice available for this question item.

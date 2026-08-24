@@ -415,10 +415,11 @@ export const FloatingQuestionPreview: React.FC = () => {
 
                   {/* Render Image with Zoom Transform */}
                   <div className="w-full flex items-center justify-center overflow-auto">
-                    {img.resolvedUrl ? (
+                    {img.resolvedUrl && img.resolvedUrl.trim() !== '' ? (
                       <img
                         src={img.resolvedUrl}
                         alt={`Question ${question.que} - Part ${img.partIndex}`}
+                        referrerPolicy="no-referrer"
                         style={{
                           transform: `scale(${zoom / 100})`,
                           transformOrigin: 'top center',

@@ -179,6 +179,7 @@ export async function parseZipArchive(
           type: qType,
           marks,
           answerOptions,
+          isSplitQuestion: Boolean(qVal.isSplitQuestion || images.length > 1),
           pdfData: pdfDataParts,
           images,
           notes: qVal.notes || '',
@@ -206,15 +207,22 @@ export async function parseZipArchive(
   const archive: QuestionPaperArchive = {
     id: generateId(),
     fileName,
-    title: parsedJson.testConfig?.title || fileName.replace(/\.[^/.]+$/, ''),
+    title: parsedJson.testConfig?.title || parsedJson.metadata?.testTitle || fileName.replace(/\.[^/.]+$/, ''),
     format,
     metadata: {
-      pdfFileHash: parsedJson.testConfig?.pdfFileHash || '',
-      additionalData: parsedJson.testConfig?.additionalData || {},
+      pdfFileHash: parsedJson.testConfig?.pdfFileHash || parsedJson.metadata?.pdfFileHash || '',
+      additionalData: parsedJson.testConfig?.additionalData || parsedJson.metadata?.additionalData || {},
       appVersion: parsedJson.appVersion || '2.6.0',
       generatedBy: parsedJson.generatedBy || 'pdfCropperPage',
-      testTitle: parsedJson.testConfig?.title || '',
-      createdAt: new Date().toISOString(),
+      testTitle: parsedJson.testConfig?.title || parsedJson.metadata?.testTitle || '',
+      durationMinutes: parsedJson.metadata?.durationMinutes || parsedJson.durationMinutes,
+      totalMarks: parsedJson.metadata?.totalMarks || parsedJson.totalMarks,
+      markingScheme: parsedJson.metadata?.markingScheme || parsedJson.markingScheme,
+      instructionMarkingSummary: parsedJson.metadata?.instructionMarkingSummary || parsedJson.instructionMarkingSummary,
+      hasInstructedMarkingScheme: Boolean(
+        parsedJson.metadata?.hasInstructedMarkingScheme || parsedJson.hasInstructedMarkingScheme || parsedJson.metadata?.markingScheme
+      ),
+      createdAt: parsedJson.metadata?.createdAt || new Date().toISOString(),
     },
     subjects,
     rawFiles: rawFilesMap,
@@ -507,7 +515,21 @@ function findMatchingImageInArchive(
     }
   }
 
-  // Strategy 3: Check for part in filename if standard not matched
+  // Strategy 3: Check for AI-generated naming patterns (e.g. Physics_mcq_Q1.png, Chemistry_nat_Q25_p2.png, Q1.png)
+  const aiPattern1 = new RegExp(`_Q?${questionNumber}(_p?${partNumber})?\\.(${SUPPORTED_IMAGE_EXTENSIONS.join('|')})$`, 'i');
+  const aiPattern2 = new RegExp(`(^|[^0-9a-zA-Z])Q?${questionNumber}(_|-|p)(${partNumber})?\\.(${SUPPORTED_IMAGE_EXTENSIONS.join('|')})$`, 'i');
+
+  for (const [path, item] of rawFilesMap.entries()) {
+    const baseName = path.split('/').pop() || path;
+    if (aiPattern1.test(baseName) || aiPattern2.test(baseName)) {
+      // If subject name is specified, prefer files containing the subject name
+      if (!subjectName || baseName.toLowerCase().includes(subjectName.toLowerCase()) || rawFilesMap.size <= 100) {
+        return { fileName: baseName, ...item };
+      }
+    }
+  }
+
+  // Strategy 4: Generic partial pattern if standard not matched
   const partialPattern = new RegExp(`(^|[^0-9])${questionNumber}(_|-)(${partNumber})\\.(${SUPPORTED_IMAGE_EXTENSIONS.join('|')})$`, 'i');
   for (const [path, item] of rawFilesMap.entries()) {
     const baseName = path.split('/').pop() || path;

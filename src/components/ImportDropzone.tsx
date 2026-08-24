@@ -165,10 +165,21 @@ export const ImportDropzone: React.FC = () => {
                 e.stopPropagation();
                 fileInputRef.current?.click();
               }}
-              className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-md transition-colors flex items-center gap-2"
+              className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition-colors flex items-center gap-2"
             >
               <FolderOpen className="w-4 h-4" />
-              <span>Browse Files (.zip, .json, .csv)</span>
+              <span>Browse ZIPs</span>
+            </button>
+
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                useCbtStore.getState().setPdfConverterModalOpen(true);
+              }}
+              className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-md transition-colors flex items-center gap-2"
+            >
+              <Wand2 className="w-4 h-4" />
+              <span>Auto PDF → ZIP (AI)</span>
             </button>
 
             <button

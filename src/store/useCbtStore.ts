@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import {
+  ArchiveMetadata,
+  BlueprintSectionRange,
   DiagnosticIssue,
   ImageAttachment,
   MarksScheme,
@@ -9,6 +11,7 @@ import {
   QuestionType,
   SectionData,
   SubjectData,
+  TestPaperBlueprint,
 } from '../types/cbt';
 import {
   buildImageFileName,
@@ -16,7 +19,10 @@ import {
   MARKING_PRESETS,
 } from '../utils/constants';
 import {
+  autoFixAnswerTypeMismatches,
+  autoFixInstructedMarkings,
   autoFixMarkingSchemes,
+  autoFixModernizeToAiFormat,
   autoFixPruneOrphanedImages,
   autoFixRenumberSection,
   autoFixStandardizeFilenames,
@@ -32,11 +38,36 @@ import {
   applyClassificationToArchive,
   ClassificationReport,
 } from '../utils/answerKeyManager';
+import {
+  ApiKeyStatus,
+  FallbackKeyItem,
+  getKeyUsageSnapshot,
+  getStoredFallbackKeys,
+  getStoredPrimaryApiKey,
+  getStoredPrimaryStatus,
+  recordRequestUsage,
+  setStoredFallbackKeys,
+  setStoredPrimaryApiKey,
+  setStoredPrimaryStatus,
+  ToastNotification,
+} from '../utils/geminiKeyManager';
 
 interface HistoryEntry {
   archive: QuestionPaperArchive;
   actionLabel: string;
   timestamp: number;
+}
+
+export interface BackgroundTaskState {
+  id: string;
+  title: string;
+  statusText: string;
+  percent: number;
+  isMinimized: boolean;
+  isComplete: boolean;
+  modalType: 'pdf_converter' | 'answer_key_studio' | 'blueprint_studio';
+  startTime: number;
+  resultSummary?: string;
 }
 
 interface CbtStoreState {
@@ -56,12 +87,53 @@ interface CbtStoreState {
   filterType: string; // 'all' | 'errors' | 'warnings' | 'mcq' | 'msq' | 'nat' | 'msm' | 'flagged'
 
   // Modals & Panels
+  isPdfConverterModalOpen: boolean;
+  isPdfRecropModalOpen: boolean;
+  recropTarget: {
+    questionId?: string;
+    partIndex?: number;
+    mode: 'replace_part' | 'add_part' | 'new_question' | 'stitch';
+    sectionId?: string;
+    subjectId?: string;
+    defaultQNo?: number;
+    pageNumber?: number;
+  } | null;
+  isAiRepairModalOpen: boolean;
+  aiRepairQuestionId: string | null;
   isAnswerKeyModalOpen: boolean;
   isBulkModalOpen: boolean;
   isExportModalOpen: boolean;
   isCbtSimulatorOpen: boolean;
   isMobileSidebarOpen: boolean;
   theme: 'dark' | 'light' | 'cbt-high-contrast';
+  geminiApiKey: string;
+  fallbackApiKeys: FallbackKeyItem[];
+  activeKeyId: string;
+  primaryRpm: number;
+  primaryRpd: number;
+  primaryStatus: ApiKeyStatus;
+  primaryExhaustedUntil?: number;
+  toasts: ToastNotification[];
+
+  activeBackgroundTask: BackgroundTaskState | null;
+  enableDoublePassRescan: boolean;
+  setEnableDoublePassRescan: (enable: boolean) => void;
+  startBackgroundTask: (task: Omit<BackgroundTaskState, 'isMinimized' | 'isComplete' | 'startTime'>) => void;
+  updateBackgroundTask: (updates: Partial<BackgroundTaskState>) => void;
+  minimizeBackgroundTask: () => void;
+  restoreBackgroundTask: () => void;
+  completeBackgroundTask: (resultSummary?: string) => void;
+  clearBackgroundTask: () => void;
+
+  setGeminiApiKey: (key: string) => void;
+  setFallbackApiKeys: (keys: FallbackKeyItem[]) => void;
+  addFallbackApiKey: (key: string, label?: string) => void;
+  updateFallbackApiKey: (id: string, updates: Partial<FallbackKeyItem>) => void;
+  deleteFallbackApiKey: (id: string) => void;
+  reorderFallbackApiKeys: (fromIndex: number, toIndex: number) => void;
+  refreshUsageMetrics: () => void;
+  addToast: (title: string, description?: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
+  removeToast: (id: string) => void;
 
   // History / Undo / Redo
   past: HistoryEntry[];
@@ -78,7 +150,33 @@ interface CbtStoreState {
   createNewPaper: (title?: string) => void;
   loadSample: (type: 'flawed' | 'clean' | 'chemistry_adv') => void;
 
+  // PDF Re-Cropping & Repair
+  openPdfRecrop: (target?: {
+    questionId?: string;
+    partIndex?: number;
+    mode?: 'replace_part' | 'add_part' | 'new_question' | 'stitch';
+    sectionId?: string;
+    subjectId?: string;
+    defaultQNo?: number;
+    pageNumber?: number;
+  }) => void;
+  closePdfRecrop: () => void;
+  openAiRepair: (questionId: string) => void;
+  closeAiRepair: () => void;
+  attachSourcePdfToArchive: (archiveId: string, file: File) => void;
+  applyCroppedImage: (payload: {
+    questionId?: string;
+    partIndex?: number;
+    mode: 'replace_part' | 'add_part' | 'new_question' | 'stitch';
+    blob: Blob;
+    sectionId?: string;
+    subjectId?: string;
+    newQuestionProps?: Partial<QuestionData>;
+    pdfCoords?: PdfDataPart;
+  }) => Promise<void>;
+
   // Answer Key & Classification
+  setPdfConverterModalOpen: (open: boolean) => void;
   setAnswerKeyModalOpen: (open: boolean) => void;
   applyAnswerKeyClassification: (report: ClassificationReport, updateMarks?: boolean) => void;
   clearAllAnswersInActiveArchive: () => void;
@@ -129,6 +227,9 @@ interface CbtStoreState {
   fixPruneOrphaned: () => void;
   fixStandardizeFilenames: () => void;
   fixMarkingSchemes: () => void;
+  fixAnswerTypeMismatches: () => void;
+  fixInstructedMarkings: () => void;
+  fixModernizeFormat: () => void;
   bulkApplyMarkingScheme: (sectionIds: string[], presetId: string) => void;
   bulkRenumberPaper: () => void;
 
@@ -137,6 +238,12 @@ interface CbtStoreState {
   redo: () => void;
 
   // Modals & UI Toggles
+  isBlueprintModalOpen: boolean;
+  setBlueprintModalOpen: (open: boolean) => void;
+  applyBlueprintRangesToActiveArchive: (
+    ranges: BlueprintSectionRange[],
+    testMetadata?: Partial<ArchiveMetadata>
+  ) => void;
   setDiagnosticsOpen: (open: boolean) => void;
   setBulkModalOpen: (open: boolean) => void;
   setExportModalOpen: (open: boolean) => void;
@@ -197,6 +304,179 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
     searchTerm: '',
     filterType: 'all',
 
+    geminiApiKey: getStoredPrimaryApiKey(),
+    fallbackApiKeys: getStoredFallbackKeys(),
+    activeKeyId: 'primary',
+    primaryRpm: 0,
+    primaryRpd: 0,
+    primaryStatus: 'Ready',
+    toasts: [],
+
+    activeBackgroundTask: null,
+    enableDoublePassRescan: true,
+
+    setEnableDoublePassRescan: (enable: boolean) => {
+      set({ enableDoublePassRescan: enable });
+    },
+
+    startBackgroundTask: (task) => {
+      set({
+        activeBackgroundTask: {
+          ...task,
+          isMinimized: false,
+          isComplete: false,
+          startTime: Date.now(),
+        },
+      });
+    },
+
+    updateBackgroundTask: (updates) => {
+      set((state) => {
+        if (!state.activeBackgroundTask) return state;
+        return {
+          activeBackgroundTask: {
+            ...state.activeBackgroundTask,
+            ...updates,
+          },
+        };
+      });
+    },
+
+    minimizeBackgroundTask: () => {
+      set((state) => {
+        if (!state.activeBackgroundTask) return state;
+        // Close the respective modal when minimizing to floating widget
+        const modalType = state.activeBackgroundTask.modalType;
+        return {
+          activeBackgroundTask: {
+            ...state.activeBackgroundTask,
+            isMinimized: true,
+          },
+          ...(modalType === 'pdf_converter' ? { isPdfConverterModalOpen: false } : {}),
+          ...(modalType === 'answer_key_studio' ? { isAnswerKeyModalOpen: false } : {}),
+          ...(modalType === 'blueprint_studio' ? { isBlueprintModalOpen: false } : {}),
+        };
+      });
+    },
+
+    restoreBackgroundTask: () => {
+      set((state) => {
+        if (!state.activeBackgroundTask) return state;
+        const modalType = state.activeBackgroundTask.modalType;
+        return {
+          activeBackgroundTask: {
+            ...state.activeBackgroundTask,
+            isMinimized: false,
+          },
+          ...(modalType === 'pdf_converter' ? { isPdfConverterModalOpen: true } : {}),
+          ...(modalType === 'answer_key_studio' ? { isAnswerKeyModalOpen: true } : {}),
+          ...(modalType === 'blueprint_studio' ? { isBlueprintModalOpen: true } : {}),
+        };
+      });
+    },
+
+    completeBackgroundTask: (resultSummary?: string) => {
+      set((state) => {
+        if (!state.activeBackgroundTask) return state;
+        return {
+          activeBackgroundTask: {
+            ...state.activeBackgroundTask,
+            percent: 100,
+            isComplete: true,
+            statusText: resultSummary || 'AI Processing Completed Successfully!',
+          },
+        };
+      });
+    },
+
+    clearBackgroundTask: () => {
+      set({ activeBackgroundTask: null });
+    },
+
+    setGeminiApiKey: (key: string) => {
+      setStoredPrimaryApiKey(key);
+      setStoredPrimaryStatus('Ready');
+      get().refreshUsageMetrics();
+    },
+
+    setFallbackApiKeys: (keys: FallbackKeyItem[]) => {
+      setStoredFallbackKeys(keys);
+      get().refreshUsageMetrics();
+    },
+
+    addFallbackApiKey: (key: string, label?: string) => {
+      const current = getStoredFallbackKeys();
+      const newItem: FallbackKeyItem = {
+        id: generateId(),
+        key: key.trim(),
+        label: label || `Fallback Key ${current.length + 1}`,
+        status: 'Ready',
+        rpmCount: 0,
+        rpdCount: 0,
+        requestTimestamps: [],
+      };
+      const updated = [...current, newItem];
+      setStoredFallbackKeys(updated);
+      get().refreshUsageMetrics();
+    },
+
+    updateFallbackApiKey: (id: string, updates: Partial<FallbackKeyItem>) => {
+      const current = getStoredFallbackKeys();
+      const updated = current.map((f) => (f.id === id ? { ...f, ...updates } : f));
+      setStoredFallbackKeys(updated);
+      get().refreshUsageMetrics();
+    },
+
+    deleteFallbackApiKey: (id: string) => {
+      const current = getStoredFallbackKeys();
+      const updated = current.filter((f) => f.id !== id);
+      setStoredFallbackKeys(updated);
+      get().refreshUsageMetrics();
+    },
+
+    reorderFallbackApiKeys: (fromIndex: number, toIndex: number) => {
+      const current = getStoredFallbackKeys();
+      if (fromIndex < 0 || fromIndex >= current.length || toIndex < 0 || toIndex >= current.length) return;
+      const updated = [...current];
+      const [moved] = updated.splice(fromIndex, 1);
+      updated.splice(toIndex, 0, moved);
+      setStoredFallbackKeys(updated);
+      get().refreshUsageMetrics();
+    },
+
+    refreshUsageMetrics: () => {
+      const snapshot = getKeyUsageSnapshot();
+      set({
+        geminiApiKey: snapshot.primaryKey,
+        primaryStatus: snapshot.primaryKeyStatus,
+        primaryRpm: snapshot.primaryRpm,
+        primaryRpd: snapshot.primaryRpd,
+        primaryExhaustedUntil: snapshot.primaryExhaustedUntil,
+        fallbackApiKeys: snapshot.fallbackKeys,
+        activeKeyId: snapshot.activeKeyId,
+      });
+    },
+
+    addToast: (title: string, description?: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
+      const newToast: ToastNotification = {
+        id: generateId(),
+        title,
+        description,
+        type,
+        timestamp: Date.now(),
+      };
+      set((state) => ({ toasts: [...state.toasts.slice(-4), newToast] }));
+    },
+
+    removeToast: (id: string) => {
+      set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) }));
+    },
+    isPdfConverterModalOpen: false,
+    isBlueprintModalOpen: false,
+    isPdfRecropModalOpen: false,
+    recropTarget: null,
+    isAiRepairModalOpen: false,
+    aiRepairQuestionId: null,
     isAnswerKeyModalOpen: false,
     isBulkModalOpen: false,
     isExportModalOpen: false,
@@ -207,7 +487,440 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
     past: [],
     future: [],
 
+    setPdfConverterModalOpen: (open: boolean) => set({ isPdfConverterModalOpen: open }),
+    setBlueprintModalOpen: (open: boolean) => set({ isBlueprintModalOpen: open }),
     setAnswerKeyModalOpen: (open: boolean) => set({ isAnswerKeyModalOpen: open }),
+
+    applyBlueprintRangesToActiveArchive: (
+      ranges: BlueprintSectionRange[],
+      testMetadata?: Partial<ArchiveMetadata>
+    ) => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active) return;
+
+      // Flatten all questions currently in the active archive in sequence
+      const allQuestions: QuestionData[] = [];
+      active.subjects.forEach((sub) => {
+        sub.sections.forEach((sec) => {
+          sec.questions.forEach((q) => {
+            allQuestions.push(q);
+          });
+        });
+      });
+
+      // Sort questions by their sequence number `que`
+      allQuestions.sort((a, b) => (a.que || 0) - (b.que || 0));
+
+      // Build new subjects and sections structure based strictly on ranges
+      const subjectMap = new Map<string, SubjectData>();
+      const allocatedQuestionIds = new Set<string>();
+
+      ranges.forEach((range) => {
+        const subjName = range.subjectName.trim() || 'General';
+        let subject = subjectMap.get(subjName);
+        if (!subject) {
+          subject = {
+            id: generateId(),
+            name: subjName,
+            sections: [],
+          };
+          subjectMap.set(subjName, subject);
+        }
+
+        // Find or create section
+        let section = subject.sections.find((s) => s.name === range.sectionName);
+        if (!section) {
+          section = {
+            id: generateId(),
+            name: range.sectionName,
+            questions: [],
+          };
+          subject.sections.push(section);
+        }
+
+        // Find questions matching range [fromQNo, toQNo]
+        const matchedQs = allQuestions.filter(
+          (q) => (q.que || 0) >= range.fromQNo && (q.que || 0) <= range.toQNo
+        );
+
+        matchedQs.forEach((q) => {
+          allocatedQuestionIds.add(q.id);
+          const updatedQ: QuestionData = {
+            ...q,
+            type: range.type || q.type,
+            marks: {
+              cm: range.marks?.cm ?? q.marks.cm,
+              im: range.marks?.im ?? q.marks.im,
+              pm: range.marks?.pm ?? q.marks.pm ?? 0,
+              max: range.marks?.max ?? q.marks.max ?? 4,
+            },
+          };
+          section!.questions.push(updatedQ);
+        });
+      });
+
+      // Handle any remaining unallocated questions
+      const unallocatedQs = allQuestions.filter((q) => !allocatedQuestionIds.has(q.id));
+      if (unallocatedQs.length > 0) {
+        let unallocatedSub = subjectMap.get('General');
+        if (!unallocatedSub) {
+          unallocatedSub = {
+            id: generateId(),
+            name: 'General',
+            sections: [],
+          };
+          subjectMap.set('General', unallocatedSub);
+        }
+        const unallocatedSec: SectionData = {
+          id: generateId(),
+          name: 'Unallocated Questions',
+          questions: unallocatedQs,
+        };
+        unallocatedSub.sections.push(unallocatedSec);
+      }
+
+      const updatedSubjects = Array.from(subjectMap.values());
+
+      const updatedArchive: QuestionPaperArchive = {
+        ...active,
+        title: testMetadata?.testTitle || active.title,
+        metadata: {
+          ...active.metadata,
+          ...testMetadata,
+        },
+        subjects: updatedSubjects,
+      };
+
+      commitArchiveUpdate(
+        updatedArchive,
+        `Apply Blueprint Ranges (${ranges.length} ranges)`
+      );
+    },
+
+    openPdfRecrop: (target) => {
+      const state = get();
+      const currentActive = state.archives.find((a) => a.id === state.activeArchiveId);
+      const activeQ = state.selectedQuestionId;
+      const targetQId = target?.questionId || activeQ;
+
+      let extractedPageNumber: number | undefined = target?.pageNumber;
+
+      if (!extractedPageNumber && currentActive && targetQId) {
+        for (const sub of currentActive.subjects) {
+          for (const sec of sub.sections) {
+            const q = sec.questions.find((item) => item.id === targetQId);
+            if (q) {
+              if (q.pdfData && q.pdfData.length > 0 && q.pdfData[0].pageNumber) {
+                extractedPageNumber = q.pdfData[0].pageNumber;
+              } else if (q.images && q.images.length > 0) {
+                const partIdx = target?.partIndex ? target.partIndex - 1 : 0;
+                const img = q.images[partIdx] || q.images[0];
+                if (img && (img as any).pageNumber) {
+                  extractedPageNumber = (img as any).pageNumber;
+                }
+              }
+              break;
+            }
+          }
+        }
+      }
+      
+      const recropData = target ? {
+        mode: target.mode || ('replace_part' as const),
+        pageNumber: extractedPageNumber,
+        ...target,
+      } : (activeQ ? {
+        questionId: activeQ,
+        partIndex: 1,
+        pageNumber: extractedPageNumber,
+        mode: 'replace_part' as const,
+        sectionId: state.selectedSectionId || undefined,
+        subjectId: state.selectedSubjectId || undefined
+      } : {
+        mode: 'new_question' as const,
+        pageNumber: extractedPageNumber,
+        sectionId: state.selectedSectionId || undefined,
+        subjectId: state.selectedSubjectId || undefined
+      });
+
+      set({ isPdfRecropModalOpen: true, recropTarget: recropData });
+    },
+
+    closePdfRecrop: () => {
+      set({ isPdfRecropModalOpen: false, recropTarget: null });
+    },
+
+    openAiRepair: (questionId: string) => {
+      set({ isAiRepairModalOpen: true, aiRepairQuestionId: questionId });
+    },
+
+    closeAiRepair: () => {
+      set({ isAiRepairModalOpen: false, aiRepairQuestionId: null });
+    },
+
+    attachSourcePdfToArchive: (archiveId: string, file: File) => {
+      const state = get();
+      const targetArchive = state.archives.find((a) => a.id === archiveId);
+      if (!targetArchive) return;
+
+      const updatedRawFiles = new Map(targetArchive.rawFiles);
+      const url = URL.createObjectURL(file);
+      updatedRawFiles.set('source_document.pdf', {
+        blob: file,
+        url,
+        size: file.size,
+      });
+
+      const updatedArchive: QuestionPaperArchive = {
+        ...targetArchive,
+        metadata: {
+          ...targetArchive.metadata,
+          sourcePdfName: file.name,
+        },
+        rawFiles: updatedRawFiles,
+        lastModified: Date.now(),
+      };
+
+      commitArchiveUpdate(updatedArchive, `Attach Source PDF: ${file.name}`);
+    },
+
+    applyCroppedImage: async (payload) => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active) return;
+
+      const blobUrl = URL.createObjectURL(payload.blob);
+      const updatedRawFiles = new Map(active.rawFiles);
+
+      if (payload.mode === 'new_question') {
+        let targetSubj = active.subjects.find((s) => s.id === payload.subjectId) || active.subjects[0];
+        if (!targetSubj) {
+          targetSubj = { id: generateId(), name: 'General', sections: [] };
+          active.subjects.push(targetSubj);
+        }
+        let targetSec = targetSubj.sections.find((s) => s.id === payload.sectionId) || targetSubj.sections[0];
+        if (!targetSec) {
+          targetSec = { id: generateId(), name: 'Section 1', questions: [] };
+          targetSubj.sections.push(targetSec);
+        }
+
+        const nextQueNum =
+          payload.newQuestionProps?.que ||
+          (targetSec.questions.length > 0
+            ? Math.max(...targetSec.questions.map((q) => q.que)) + 1
+            : 1);
+        const imageName = buildImageFileName(targetSec.name, nextQueNum, 1, 'png');
+
+        updatedRawFiles.set(imageName, { blob: payload.blob, url: blobUrl, size: payload.blob.size });
+
+        const newQuestion: QuestionData = {
+          id: generateId(),
+          key: nextQueNum.toString(),
+          que: nextQueNum,
+          type: payload.newQuestionProps?.type || 'mcq',
+          marks: payload.newQuestionProps?.marks || { cm: 4, im: -1, pm: 0, max: 4 },
+          answerOptions: payload.newQuestionProps?.answerOptions || '',
+          pdfData: payload.pdfCoords ? [{ ...payload.pdfCoords, filename: imageName }] : [],
+          images: [
+            {
+              id: generateId(),
+              partIndex: 1,
+              fileName: imageName,
+              blobUrl,
+              rawBlob: payload.blob,
+              mimeType: 'image/png',
+              sizeBytes: payload.blob.size,
+            },
+          ],
+          notes: payload.newQuestionProps?.notes || '',
+        };
+
+        const updatedSubjects = active.subjects.map((sub) => {
+          if (sub.id !== targetSubj.id) return sub;
+          return {
+            ...sub,
+            sections: sub.sections.map((sec) => {
+              if (sec.id !== targetSec.id) return sec;
+              return {
+                ...sec,
+                questions: [...sec.questions, newQuestion].sort((a, b) => a.que - b.que),
+              };
+            }),
+          };
+        });
+
+        commitArchiveUpdate(
+          { ...active, subjects: updatedSubjects, rawFiles: updatedRawFiles },
+          `Add Cropped Question Q${nextQueNum}`
+        );
+
+        set({
+          selectedSubjectId: targetSubj.id,
+          selectedSectionId: targetSec.id,
+          selectedQuestionId: newQuestion.id,
+        });
+        return;
+      }
+
+      if (!payload.questionId) return;
+      const qId = payload.questionId;
+
+      let secName = 'Section 1';
+      let qNum = 1;
+      active.subjects.forEach((sub) => {
+        sub.sections.forEach((sec) => {
+          const q = sec.questions.find((item) => item.id === qId);
+          if (q) {
+            secName = sec.name;
+            qNum = q.que;
+          }
+        });
+      });
+
+      if (payload.mode === 'replace_part') {
+        const targetPartIdx = payload.partIndex || 1;
+        const targetFileName = buildImageFileName(secName, qNum, targetPartIdx, 'png');
+        updatedRawFiles.set(targetFileName, { blob: payload.blob, url: blobUrl, size: payload.blob.size });
+
+        const updatedSubjects = active.subjects.map((sub) => ({
+          ...sub,
+          sections: sub.sections.map((sec) => ({
+            ...sec,
+            questions: sec.questions.map((q) => {
+              if (q.id === qId) {
+                const updatedImages = q.images.map((img) =>
+                  img.partIndex === targetPartIdx
+                    ? {
+                        ...img,
+                        fileName: targetFileName,
+                        blobUrl,
+                        rawBlob: payload.blob,
+                        mimeType: 'image/png',
+                        sizeBytes: payload.blob.size,
+                      }
+                    : img
+                );
+                if (!updatedImages.some((img) => img.partIndex === targetPartIdx)) {
+                  updatedImages.push({
+                    id: generateId(),
+                    partIndex: targetPartIdx,
+                    fileName: targetFileName,
+                    blobUrl,
+                    rawBlob: payload.blob,
+                    mimeType: 'image/png',
+                    sizeBytes: payload.blob.size,
+                  });
+                }
+
+                const updatedPdfData = q.pdfData.map((part, idx) =>
+                  idx === targetPartIdx - 1 && payload.pdfCoords
+                    ? { ...payload.pdfCoords, filename: targetFileName }
+                    : part
+                );
+
+                return {
+                  ...q,
+                  images: updatedImages,
+                  pdfData:
+                    updatedPdfData.length > 0
+                      ? updatedPdfData
+                      : payload.pdfCoords
+                      ? [{ ...payload.pdfCoords, filename: targetFileName }]
+                      : q.pdfData,
+                };
+              }
+              return q;
+            }),
+          })),
+        }));
+
+        commitArchiveUpdate(
+          { ...active, subjects: updatedSubjects, rawFiles: updatedRawFiles },
+          `Re-cropped Question Q${qNum} Part ${targetPartIdx}`
+        );
+      } else if (payload.mode === 'stitch') {
+        const targetFileName = buildImageFileName(secName, qNum, 1, 'png');
+        updatedRawFiles.set(targetFileName, { blob: payload.blob, url: blobUrl, size: payload.blob.size });
+
+        const updatedSubjects = active.subjects.map((sub) => ({
+          ...sub,
+          sections: sub.sections.map((sec) => ({
+            ...sec,
+            questions: sec.questions.map((q) => {
+              if (q.id === qId) {
+                const newImage: ImageAttachment = {
+                  id: generateId(),
+                  partIndex: 1,
+                  fileName: targetFileName,
+                  blobUrl,
+                  rawBlob: payload.blob,
+                  mimeType: 'image/png',
+                  sizeBytes: payload.blob.size,
+                };
+                return {
+                  ...q,
+                  images: [newImage],
+                  pdfData: payload.pdfCoords
+                    ? [{ ...payload.pdfCoords, filename: targetFileName }]
+                    : [],
+                };
+              }
+              return q;
+            }),
+          })),
+        }));
+
+        commitArchiveUpdate(
+          { ...active, subjects: updatedSubjects, rawFiles: updatedRawFiles },
+          `Stitched & Replaced Q${qNum} Image`
+        );
+      } else if (payload.mode === 'add_part') {
+        let newPartIdx = 1;
+        active.subjects.forEach((sub) => {
+          sub.sections.forEach((sec) => {
+            const q = sec.questions.find((item) => item.id === qId);
+            if (q) newPartIdx = q.images.length + 1;
+          });
+        });
+
+        const targetFileName = buildImageFileName(secName, qNum, newPartIdx, 'png');
+        updatedRawFiles.set(targetFileName, { blob: payload.blob, url: blobUrl, size: payload.blob.size });
+
+        const updatedSubjects = active.subjects.map((sub) => ({
+          ...sub,
+          sections: sub.sections.map((sec) => ({
+            ...sec,
+            questions: sec.questions.map((q) => {
+              if (q.id === qId) {
+                const newImage: ImageAttachment = {
+                  id: generateId(),
+                  partIndex: newPartIdx,
+                  fileName: targetFileName,
+                  blobUrl,
+                  rawBlob: payload.blob,
+                  mimeType: 'image/png',
+                  sizeBytes: payload.blob.size,
+                };
+                return {
+                  ...q,
+                  images: [...q.images, newImage],
+                  pdfData: payload.pdfCoords
+                    ? [...q.pdfData, { ...payload.pdfCoords, filename: targetFileName }]
+                    : q.pdfData,
+                };
+              }
+              return q;
+            }),
+          })),
+        }));
+
+        commitArchiveUpdate(
+          { ...active, subjects: updatedSubjects, rawFiles: updatedRawFiles },
+          `Add Image Part ${newPartIdx} to Q${qNum}`
+        );
+      }
+    },
 
     applyAnswerKeyClassification: (report: ClassificationReport, updateMarks: boolean = true) => {
       const state = get();
@@ -1320,6 +2033,30 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       if (!active) return;
       const fixed = autoFixMarkingSchemes(active);
       commitArchiveUpdate(fixed, 'Auto-Fix: Fix Marking Schemes');
+    },
+
+    fixAnswerTypeMismatches: () => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active) return;
+      const fixed = autoFixAnswerTypeMismatches(active);
+      commitArchiveUpdate(fixed, 'Auto-Fix: Reconcile Question Types with Answer Keys');
+    },
+
+    fixInstructedMarkings: () => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active) return;
+      const fixed = autoFixInstructedMarkings(active);
+      commitArchiveUpdate(fixed, 'Auto-Fix: Apply Instructed Booklet Marking Scheme');
+    },
+
+    fixModernizeFormat: () => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active) return;
+      const fixed = autoFixModernizeToAiFormat(active);
+      commitArchiveUpdate(fixed, 'Auto-Fix: Modernize to AI Standard Format');
     },
 
     bulkApplyMarkingScheme: (sectionIds: string[], presetId: string) => {

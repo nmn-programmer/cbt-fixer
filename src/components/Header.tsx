@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
-import {
+import { Settings,
   AlertTriangle,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   Download,
@@ -43,6 +44,7 @@ export const Header: React.FC = () => {
     setDiagnosticsOpen,
     setBulkModalOpen,
     setExportModalOpen,
+    setBlueprintModalOpen,
     setAnswerKeyModalOpen,
     setCbtSimulatorOpen,
     setMobileSidebarOpen,
@@ -215,7 +217,7 @@ export const Header: React.FC = () => {
                   ZIP Inspector
                 </span>
                 <span className="text-[10px] font-mono font-medium px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                  v2.4.0
+                  v2.5.0
                 </span>
               </h1>
               <p className="text-[10px] text-slate-400 hidden xl:block">
@@ -288,6 +290,19 @@ export const Header: React.FC = () => {
               <Redo2 className="w-3.5 h-3.5" />
             </button>
           </div>
+
+          {/* Blueprint & Subject Range Studio Trigger */}
+          {activeArchive && (
+            <button
+              id="blueprint-studio-btn"
+              onClick={() => setBlueprintModalOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 active:bg-slate-600 rounded-md border border-slate-700 transition-colors shrink-0 shadow-sm text-indigo-300 hover:text-indigo-200"
+              title="Test Instructions & Subject Ranges Blueprint"
+            >
+              <BookOpen className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="hidden md:inline font-semibold">Instructions & Ranges</span>
+            </button>
+          )}
 
           {/* Answer Key Studio Trigger */}
           {activeArchive && (
@@ -374,6 +389,9 @@ export const Header: React.FC = () => {
               <span>Export ZIP</span>
             </button>
           )}
+          <button onClick={() => window.dispatchEvent(new CustomEvent("open-settings"))} className="flex items-center justify-center p-1.5 ml-2 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-md transition-colors" title="Settings">
+            <Settings className="w-4 h-4" />
+          </button>
         </div>
       </div>
 

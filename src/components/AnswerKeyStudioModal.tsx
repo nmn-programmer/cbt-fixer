@@ -22,6 +22,7 @@ import {
   Key,
   Layers,
   ListFilter,
+  Loader2,
   Minus,
   Plus,
   RefreshCw,
@@ -33,8 +34,11 @@ import {
   Upload,
   Wand2,
   X,
+  Minimize2,
+  ShieldCheck,
 } from 'lucide-react';
 import { useCbtStore } from '../store/useCbtStore';
+import { fetchWithGeminiFallback } from '../utils/geminiKeyManager';
 import {
   AnswerKeyParseResult,
   ClassificationReport,
@@ -63,6 +67,14 @@ export const AnswerKeyStudioModal: React.FC = () => {
     applyAnswerKeyClassification,
     clearAllAnswersInActiveArchive,
     updateQuestion,
+    addToast,
+    refreshUsageMetrics,
+    startBackgroundTask,
+    updateBackgroundTask,
+    minimizeBackgroundTask,
+    completeBackgroundTask,
+    enableDoublePassRescan,
+    setEnableDoublePassRescan,
   } = useCbtStore();
 
   const activeArchive = archives.find((a) => a.id === activeArchiveId);
@@ -80,8 +92,10 @@ export const AnswerKeyStudioModal: React.FC = () => {
   const [copied, setCopied] = useState<boolean>(false);
   const [updateMarksOnApply, setUpdateMarksOnApply] = useState<boolean>(true);
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
+  const [isExtractingAiKey, setIsExtractingAiKey] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const aiKeyFileInputRef = useRef<HTMLInputElement>(null);
 
   // Compute merged result from all active uploaded files and manual text if present
   const { mergedParseResult, mergedJsonText } = useMemo(() => {
@@ -269,6 +283,128 @@ export const AnswerKeyStudioModal: React.FC = () => {
     } else {
       // If user edits while in 'merged' view, convert it to manual scratchpad
       setManualInputText(newText);
+    }
+  };
+
+  const handleExtractAiKeyFromFile = async (file: File) => {
+    try {
+      setIsExtractingAiKey(true);
+      startBackgroundTask({
+        id: 'answer_key_studio',
+        title: `Scanning Key: ${file.name}`,
+        statusText: enableDoublePassRescan
+          ? 'Pass 1/2: Gemini AI Vision scanning answer key table...'
+          : 'Gemini AI Vision scanning answer key table...',
+        percent: 20,
+        modalType: 'answer_key_studio',
+      });
+
+      let base64Image = '';
+
+      if (file.type.includes('pdf') || file.name.endsWith('.pdf')) {
+        // Render PDF first page or prompt
+        const pdfjsLib = await import('pdfjs-dist');
+        const pdfWorkerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+
+        const arrayBuffer = await file.arrayBuffer();
+        const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        const page = await pdfDoc.getPage(1);
+        const viewport = page.getViewport({ scale: 2.0 });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('Could not get canvas 2d context');
+
+        await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
+        base64Image = canvas.toDataURL('image/jpeg', 0.9);
+      } else {
+        // Image file
+        base64Image = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+      }
+
+      updateBackgroundTask({
+        percent: 45,
+        statusText: enableDoublePassRescan
+          ? 'Pass 2/2: Verification rescan auditing question sequence & option types...'
+          : 'Gemini AI Vision analyzing table layout...',
+      });
+
+      const response = await fetchWithGeminiFallback(
+        '/api/extract-answer-key-page',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image: base64Image,
+            options: { enableDoublePass: enableDoublePassRescan },
+          }),
+        },
+        addToast,
+        refreshUsageMetrics
+      );
+
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error || `Server responded with ${response.status}`);
+      }
+
+      const data = await response.json();
+      if (!data.answers || data.answers.length === 0) {
+        throw new Error('No question answers were detected in this image/page.');
+      }
+
+      // Group answers by subject if available, otherwise flat mapping
+      const hasSubjects = data.answers.some((a: any) => a.subject && a.subject.trim().length > 0);
+      let formattedKeyJson: any = {};
+
+      if (hasSubjects) {
+        data.answers.forEach((item: any) => {
+          const sub = (item.subject || 'General').trim();
+          if (!formattedKeyJson[sub]) formattedKeyJson[sub] = {};
+          formattedKeyJson[sub][String(item.qNo)] = String(item.answer);
+        });
+      } else {
+        data.answers.forEach((item: any) => {
+          formattedKeyJson[String(item.qNo)] = String(item.answer);
+        });
+      }
+
+      const jsonString = JSON.stringify(formattedKeyJson, null, 2);
+      const parsedRes = parseAnswerKeyPayload(jsonString);
+
+      const newFile: LoadedAnswerKeyFile = {
+        id: generateId(),
+        name: `AI_Key_${file.name.replace(/\.[^/.]+$/, '')}.json`,
+        size: jsonString.length,
+        content: jsonString,
+        parseResult: parsedRes,
+        enabled: true,
+        uploadedAt: Date.now(),
+      };
+
+      setUploadedFiles((prev) => [...prev, newFile]);
+      setSelectedFileId(newFile.id);
+      setEditorText(jsonString);
+
+      completeBackgroundTask(`AI extracted & verified ${parsedRes.totalQuestions} answers from "${file.name}"!`);
+      addToast(
+        'Answer Key Extracted',
+        `AI successfully parsed ${parsedRes.totalQuestions} questions with High Accuracy verification!`,
+        'success'
+      );
+    } catch (err: any) {
+      console.error('AI answer key extraction error:', err);
+      addToast('Extraction Failed', err.message || 'Could not parse answer key.', 'error');
+    } finally {
+      setIsExtractingAiKey(false);
+      if (aiKeyFileInputRef.current) aiKeyFileInputRef.current.value = '';
     }
   };
 
@@ -482,6 +618,16 @@ export const AnswerKeyStudioModal: React.FC = () => {
                 multiple
                 className="hidden"
               />
+              <input
+                ref={aiKeyFileInputRef}
+                type="file"
+                accept="image/*,.pdf"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleExtractAiKeyFromFile(file);
+                }}
+              />
 
               {/* Upload Dropzone (Supports Multiple Files) */}
               <div
@@ -517,13 +663,62 @@ export const AnswerKeyStudioModal: React.FC = () => {
                 </div>
               </div>
 
+              {/* AI Progress Banner when scanning */}
+              {isExtractingAiKey && (
+                <div className="bg-indigo-950/80 border border-indigo-700/60 rounded-xl p-3.5 flex items-center justify-between gap-3 shadow-lg animate-pulse">
+                  <div className="flex items-center gap-3">
+                    <Loader2 className="w-5 h-5 text-indigo-400 animate-spin shrink-0" />
+                    <div>
+                      <span className="text-xs font-bold text-indigo-200 block">
+                        AI Scanning & Rescanning Answer Key...
+                      </span>
+                      <span className="text-[11px] text-indigo-300/80 block">
+                        Double-pass verification pass in progress. You can run this process in the background.
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={minimizeBackgroundTask}
+                    className="px-3 py-1.5 bg-indigo-900 hover:bg-indigo-850 border border-indigo-500/50 text-indigo-200 hover:text-white text-xs font-bold rounded-lg flex items-center gap-1.5 shrink-0 shadow-sm transition-all"
+                  >
+                    <Minimize2 className="w-3.5 h-3.5 text-indigo-300" />
+                    <span>Run in Background</span>
+                  </button>
+                </div>
+              )}
+
               {/* Quick Actions Bar */}
               <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 bg-slate-950 rounded-xl border border-slate-800">
                 <div className="flex items-center gap-2 text-xs">
                   <Key className="w-4 h-4 text-amber-400" />
-                  <span className="text-slate-300 font-semibold">Active Paper Tools:</span>
+                  <span className="text-slate-300 font-semibold">Smart Key Tools:</span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  <label className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-900 border border-slate-800 rounded-lg cursor-pointer text-xs text-slate-300 hover:text-white">
+                    <input
+                      type="checkbox"
+                      checked={enableDoublePassRescan}
+                      onChange={(e) => setEnableDoublePassRescan(e.target.checked)}
+                      className="w-3.5 h-3.5 accent-purple-500"
+                    />
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Double-Pass Rescan</span>
+                  </label>
+
+                  <button
+                    onClick={() => aiKeyFileInputRef.current?.click()}
+                    disabled={isExtractingAiKey}
+                    className="px-3 py-1.5 bg-purple-600/20 hover:bg-purple-600/30 border border-purple-500/40 text-purple-300 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                    title="Upload an answer key page (image or PDF) and let AI OCR the table into standard JSON format"
+                  >
+                    {isExtractingAiKey ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-400" />
+                    ) : (
+                      <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                    )}
+                    <span>{isExtractingAiKey ? 'AI Extracting...' : 'Scan Key from PDF/Image (AI)'}</span>
+                  </button>
+
                   <button
                     onClick={() => {
                       if (activeArchive) {
@@ -547,6 +742,7 @@ export const AnswerKeyStudioModal: React.FC = () => {
                     <Download className="w-3.5 h-3.5 text-indigo-400" />
                     <span>Generate Key from Active Paper</span>
                   </button>
+
                   <button
                     onClick={() => fileInputRef.current?.click()}
                     className="px-3 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 text-xs font-semibold rounded-lg transition-colors flex items-center gap-1.5"
