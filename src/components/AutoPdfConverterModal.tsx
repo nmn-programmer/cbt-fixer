@@ -853,10 +853,25 @@ export const AutoPdfConverterModal: React.FC = () => {
                 rawBlob: cropResult.blob,
               });
 
+              const pNum = pagesToProcess[cropResult.pIdx] || 1;
+              const yminVal = part.box[0];
+              const xminVal = part.box[1];
+              const ymaxVal = part.box[2];
+              const xmaxVal = part.box[3];
+
               pdfDataParts.push({
                 filename: partImgName,
-                pageNumber: pagesToProcess[cropResult.pIdx] || 1,
-                bounds: [part.box[1], part.box[0], part.box[3] - part.box[1], part.box[2] - part.box[0]],
+                page: pNum,
+                pageNumber: pNum,
+                ymin: yminVal,
+                xmin: xminVal,
+                ymax: ymaxVal,
+                xmax: xmaxVal,
+                x1: Math.round(xminVal * 1000),
+                y1: Math.round(yminVal * 1000),
+                x2: Math.round(xmaxVal * 1000),
+                y2: Math.round(ymaxVal * 1000),
+                bounds: [xminVal, yminVal, xmaxVal - xminVal, ymaxVal - yminVal],
               });
             }
           });
@@ -890,10 +905,25 @@ export const AutoPdfConverterModal: React.FC = () => {
               rawBlob: cropResult.blob,
             });
 
+            const pNum = pagesToProcess[cropResult.pIdx] || 1;
+            const yminVal = q.box[0];
+            const xminVal = q.box[1];
+            const ymaxVal = q.box[2];
+            const xmaxVal = q.box[3];
+
             pdfDataParts.push({
               filename: imgName,
-              pageNumber: pagesToProcess[cropResult.pIdx] || 1,
-              bounds: [q.box[1], q.box[0], q.box[3] - q.box[1], q.box[2] - q.box[0]],
+              page: pNum,
+              pageNumber: pNum,
+              ymin: yminVal,
+              xmin: xminVal,
+              ymax: ymaxVal,
+              xmax: xmaxVal,
+              x1: Math.round(xminVal * 1000),
+              y1: Math.round(yminVal * 1000),
+              x2: Math.round(xmaxVal * 1000),
+              y2: Math.round(ymaxVal * 1000),
+              bounds: [xminVal, yminVal, xmaxVal - xminVal, ymaxVal - yminVal],
             });
           }
         }

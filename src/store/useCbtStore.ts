@@ -51,6 +51,7 @@ import {
   setStoredPrimaryStatus,
   ToastNotification,
 } from '../utils/geminiKeyManager';
+import { getStoredSelectedModel, setStoredSelectedModel } from '../utils/aiModelConfig';
 
 interface HistoryEntry {
   archive: QuestionPaperArchive;
@@ -113,6 +114,8 @@ interface CbtStoreState {
   primaryRpd: number;
   primaryStatus: ApiKeyStatus;
   primaryExhaustedUntil?: number;
+  selectedModel: string;
+  setSelectedModel: (model: string) => void;
   toasts: ToastNotification[];
 
   activeBackgroundTask: BackgroundTaskState | null;
@@ -314,6 +317,12 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
     primaryRpm: 0,
     primaryRpd: 0,
     primaryStatus: 'Ready',
+    selectedModel: getStoredSelectedModel(),
+    setSelectedModel: (model: string) => {
+      setStoredSelectedModel(model);
+      set({ selectedModel: model });
+      get().addToast('AI Model Updated', `Active model set to ${model}. All AI tasks will now use this model.`, 'success');
+    },
     toasts: [],
 
     activeBackgroundTask: null,

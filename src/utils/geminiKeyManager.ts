@@ -1,4 +1,5 @@
 import { executeGeminiClientSide } from './aiDirectEngine';
+import { getStoredSelectedModel } from './aiModelConfig';
 
 export type ApiKeyStatus = 'Ready' | 'Active' | 'Quota Exhausted' | 'Invalid';
 
@@ -332,6 +333,21 @@ export async function fetchWithGeminiFallback(
   notifyToast?: (title: string, description?: string, type?: 'info' | 'success' | 'warning' | 'error') => void,
   onStateUpdate?: () => void
 ): Promise<Response> {
+  // Ensure selected model is injected into request body for POST requests if not specified
+  const selectedModel = getStoredSelectedModel();
+  let modifiedOptions = { ...options };
+  if (options.body && typeof options.body === 'string') {
+    try {
+      const parsed = JSON.parse(options.body);
+      if (!parsed.model) {
+        parsed.model = selectedModel;
+        modifiedOptions.body = JSON.stringify(parsed);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
   const snapshot = getKeyUsageSnapshot();
   const primaryKey = snapshot.primaryKey;
   const fallbacks = snapshot.fallbackKeys;
@@ -370,7 +386,7 @@ export async function fetchWithGeminiFallback(
 
   if (candidates.length === 0) {
     // No client keys configured - try server
-    const res = await fetch(url, options);
+    const res = await fetch(url, modifiedOptions);
     if (res.status === 404 || res.status === 405) {
       throw new Error('Server returned 404 (Endpoint Not Found). Please configure a Gemini API Key in Settings to run AI extraction directly on client side.');
     }
@@ -401,7 +417,7 @@ export async function fetchWithGeminiFallback(
     recordRequestUsage(candidate.id);
     onStateUpdate?.();
 
-    const headers = new Headers(options.headers || {});
+    const headers = new Headers(modifiedOptions.headers || {});
     headers.set('Authorization', `Bearer ${candidate.key}`);
 
     let res: Response | null = null;
@@ -410,7 +426,7 @@ export async function fetchWithGeminiFallback(
     // Attempt request with exponential backoff for 500/503 errors
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        res = await fetch(url, { ...options, headers });
+        res = await fetch(url, { ...modifiedOptions, headers });
 
         if ((res.status === 500 || res.status === 503 || res.status === 502) && attempt < maxAttempts) {
           await sleep(attempt * 600);

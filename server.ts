@@ -24,7 +24,7 @@ function getErrorStatusCode(err: any): number {
 // API Route to extract test paper instructions blueprint & question ranges from Cover / Instructions page
 app.post('/api/extract-test-blueprint', async (req, res) => {
   try {
-    const { image, text } = req.body;
+    const { image, text, model: requestedModel } = req.body;
     if (!image && !text) {
       return res.status(400).json({ error: 'Instruction page image or text is required' });
     }
@@ -133,6 +133,7 @@ CRITICAL DIRECTIVE ON MARKING SCHEME EXTRACTION:
       contents,
       schema: blueprintSchema,
       temperature: 0.1,
+      preferredModel: requestedModel,
       label: 'Server Extract Test Blueprint'
     });
 
@@ -771,6 +772,41 @@ Verify that NO question numbers are missing, fix OCR typos, and return the audit
     res.json(resultData);
   } catch (error: any) {
     console.error('Error in extract-answer-key-page:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
+
+// API Route for generic Gemini generation requests
+app.post('/api/gemini/generate', async (req, res) => {
+  try {
+    const { contents, config, model: requestedModel } = req.body;
+    if (!contents || !contents.length) {
+      return res.status(400).json({ error: 'Contents are required' });
+    }
+
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
+
+    const resultText = await executeGeminiWithFallback(ai, {
+      contents,
+      temperature: config?.temperature ?? 0.1,
+      preferredModel: requestedModel,
+      label: 'Server Gemini Generate'
+    });
+
+    res.json({ text: resultText, candidates: [{ content: { parts: [{ text: resultText }] } }] });
+  } catch (error: any) {
+    console.error('Error in /api/gemini/generate:', error);
     res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
   }
 });

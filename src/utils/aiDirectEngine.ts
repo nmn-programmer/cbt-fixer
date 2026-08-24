@@ -31,9 +31,22 @@ export async function executeGeminiClientSide(
     return handleExtractAnswerKeyPdf(ai, body);
   } else if (endpoint.endsWith('/api/extract-answer-key-page')) {
     return handleExtractAnswerKeyPage(ai, body);
+  } else if (endpoint.endsWith('/api/gemini/generate')) {
+    return handleGeminiGenerate(ai, body);
   } else {
     throw new Error(`Unsupported client-side AI endpoint: ${endpoint}`);
   }
+}
+
+async function handleGeminiGenerate(ai: GoogleGenAI, body: any) {
+  const { contents, config, model } = body;
+  const resultText = await executeGeminiWithFallback(ai, {
+    contents,
+    temperature: config?.temperature ?? 0.1,
+    preferredModel: model,
+    label: 'Client Direct Gemini Generate'
+  });
+  return { text: resultText, candidates: [{ content: { parts: [{ text: resultText }] } }] };
 }
 
 async function handleExtractTestBlueprint(ai: GoogleGenAI, body: any) {

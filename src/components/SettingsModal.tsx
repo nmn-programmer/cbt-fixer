@@ -22,6 +22,7 @@ import {
   Moon,
   Monitor,
   Zap,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { useCbtStore } from '../store/useCbtStore';
 import {
@@ -31,13 +32,14 @@ import {
   maskApiKey,
   ApiKeyStatus,
 } from '../utils/geminiKeyManager';
+import { GEMINI_MODELS_DESCENDING, GeminiModelInfo } from '../utils/aiModelConfig';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
-type TabType = 'keys' | 'performance' | 'appearance' | 'storage';
+type TabType = 'keys' | 'models' | 'performance' | 'appearance' | 'storage';
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
   const [activeTab, setActiveTab] = useState<TabType>('keys');
@@ -59,6 +61,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     primaryRpd,
     primaryStatus,
     activeKeyId,
+    selectedModel,
+    setSelectedModel,
     theme,
     setTheme,
     enableDoublePassRescan,
@@ -127,7 +131,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
       return (
         <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-          Active
+          Active & Routing
         </span>
       );
     }
@@ -137,7 +141,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium bg-slate-800 text-slate-300 border border-slate-700">
             <CheckCircle2 className="w-3 h-3 text-slate-400" />
-            Ready
+            Standby
           </span>
         );
       case 'Quota Exhausted':
@@ -162,9 +166,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
   const primaryRpmColor = getUsageColor(primaryRpm, GEMINI_FREE_TIER_RPM);
   const primaryRpdColor = getUsageColor(primaryRpd, GEMINI_FREE_TIER_RPD);
 
+  const activeFallbackKey = fallbackApiKeys.find((f) => f.id === activeKeyId);
+  const activeKeyLabel =
+    activeKeyId === 'primary'
+      ? 'Primary API Key'
+      : activeFallbackKey
+      ? activeFallbackKey.label
+      : 'Primary API Key';
+
+  const activeKeyMasked =
+    activeKeyId === 'primary'
+      ? maskApiKey(geminiApiKey)
+      : activeFallbackKey
+      ? maskApiKey(activeFallbackKey.key)
+      : maskApiKey(geminiApiKey);
+
+  const activeModelInfo = GEMINI_MODELS_DESCENDING.find((m) => m.id === selectedModel) || GEMINI_MODELS_DESCENDING[2];
+
   const tabs: { id: TabType; label: string; icon: React.FC<{ className?: string }> }[] = [
-    { id: 'keys', label: 'API Keys & Multi-Key', icon: Key },
-    { id: 'performance', label: 'AI & OCR Engines', icon: Zap },
+    { id: 'keys', label: 'API Keys & Failover', icon: Key },
+    { id: 'models', label: 'AI Model Selection', icon: Sparkles },
+    { id: 'performance', label: 'OCR & Double-Pass', icon: Zap },
     { id: 'appearance', label: 'Appearance', icon: Palette },
     { id: 'storage', label: 'Drafts & Storage', icon: HardDrive },
   ];
@@ -186,7 +208,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
             </div>
             <div>
               <h2 className="text-base sm:text-lg font-bold text-slate-100">Studio Settings</h2>
-              <p className="text-xs text-slate-400">Manage Gemini API keys, OCR preferences & theme</p>
+              <p className="text-xs text-slate-400">Manage Gemini API keys, active model engine & OCR theme</p>
             </div>
           </div>
           <button
@@ -227,11 +249,56 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
           {/* TAB 1: API KEYS & MULTI-KEY FAILOVER */}
           {activeTab === 'keys' && (
             <div className="space-y-6 animate-in fade-in duration-150">
+              {/* Active AI Config Snapshot Card */}
+              <div className="p-4 rounded-xl bg-indigo-950/30 border border-indigo-500/30 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-indigo-400" />
+                    <span className="text-xs font-bold text-indigo-300 uppercase tracking-wider">
+                      Active AI Runtime Config
+                    </span>
+                  </div>
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                    Live Routing Active
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                  <div className="p-3 rounded-lg bg-slate-900/90 border border-slate-800">
+                    <div className="text-[11px] font-semibold text-slate-400">Currently Active API Key</div>
+                    <div className="text-xs font-bold text-slate-100 flex items-center gap-2 mt-1">
+                      <span>{activeKeyLabel}</span>
+                    </div>
+                    <div className="text-[11px] font-mono text-slate-400 mt-0.5">{activeKeyMasked}</div>
+                  </div>
+
+                  <div className="p-3 rounded-lg bg-slate-900/90 border border-slate-800 flex items-center justify-between">
+                    <div>
+                      <div className="text-[11px] font-semibold text-slate-400">Active Gemini Model</div>
+                      <div className="text-xs font-bold text-slate-100 flex items-center gap-1.5 mt-1">
+                        <span>{activeModelInfo.name}</span>
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${activeModelInfo.badgeColor}`}>
+                          {activeModelInfo.badge}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('models')}
+                      className="px-2.5 py-1 rounded-lg bg-indigo-600/20 text-indigo-300 text-xs font-medium hover:bg-indigo-600/30 transition-colors shrink-0"
+                    >
+                      Change
+                    </button>
+                  </div>
+                </div>
+              </div>
+
               {/* Header with Quick Refresh */}
               <div className="flex items-center justify-between">
                 <div>
                   <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
-                    Gemini API Keys & Failover
+                    Gemini API Keys & Pool
                   </h3>
                   <p className="text-xs text-slate-400 mt-0.5">
                     Configure multiple API keys for automated failover during quota exhaustion.
@@ -396,7 +463,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                 {/* Fallback Keys List */}
                 {fallbackApiKeys.length === 0 ? (
                   <div className="text-center py-6 px-4 border border-dashed border-slate-800 rounded-xl text-slate-500 text-xs">
-                    No backup API keys configured. If your primary key hits quota, AI extraction will halt until reset.
+                    No backup API keys configured. If your primary key hits quota, AI extraction will fail over to backup keys if configured.
                   </div>
                 ) : (
                   <div className="space-y-2">
@@ -446,12 +513,115 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
             </div>
           )}
 
-          {/* TAB 2: AI & OCR ENGINES */}
+          {/* TAB 2: AI MODEL SELECTION */}
+          {activeTab === 'models' && (
+            <div className="space-y-5 animate-in fade-in duration-150">
+              <div>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
+                    Select AI Model Engine
+                  </h3>
+                  <span className="text-xs px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-400 font-semibold border border-emerald-500/30">
+                    Free Tier Compatible
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 mt-1">
+                  Choose which Gemini model to use for all AI extraction and paper generation tasks across the site. Models are listed in descending order of capability.
+                </p>
+              </div>
+
+              {/* Currently Selected Model Summary Banner */}
+              <div className="p-4 rounded-xl bg-indigo-950/40 border border-indigo-500/30 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 font-bold">
+                    ⚡
+                  </div>
+                  <div>
+                    <div className="text-xs font-semibold text-indigo-300 uppercase tracking-wider">
+                      Currently Active AI Model
+                    </div>
+                    <div className="text-base font-bold text-slate-100 flex items-center gap-2 mt-0.5">
+                      {activeModelInfo.name}
+                      <span className={`text-xs px-2.5 py-0.5 rounded-full font-medium border ${activeModelInfo.badgeColor}`}>
+                        {activeModelInfo.badge}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <span className="text-xs text-indigo-300 font-bold block">
+                    Capability Rank #{activeModelInfo.rank}
+                  </span>
+                  <span className="text-[11px] text-slate-400 block font-mono mt-0.5">
+                    {activeModelInfo.id}
+                  </span>
+                </div>
+              </div>
+
+              {/* Models List in Descending Capability Order */}
+              <div className="space-y-3">
+                {GEMINI_MODELS_DESCENDING.map((model) => {
+                  const isSelected = selectedModel === model.id;
+                  return (
+                    <div
+                      key={model.id}
+                      onClick={() => setSelectedModel(model.id)}
+                      className={`p-4 rounded-xl border transition-all cursor-pointer min-h-[44px] flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                        isSelected
+                          ? 'bg-indigo-600/15 border-indigo-500 ring-1 ring-indigo-500/50 text-slate-100 shadow-lg'
+                          : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-300 hover:bg-slate-900/60'
+                      }`}
+                    >
+                      <div className="space-y-1.5 flex-1">
+                        <div className="flex items-center gap-2.5 flex-wrap">
+                          <span className="w-6 h-6 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-bold text-slate-300 shrink-0">
+                            #{model.rank}
+                          </span>
+                          <span className="text-sm font-bold text-slate-100">{model.name}</span>
+                          <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border ${model.badgeColor}`}>
+                            {model.badge}
+                          </span>
+                          {model.isFreeTierCompatible && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">
+                              Free Key OK
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-slate-400 leading-relaxed">{model.description}</p>
+                        <div className="text-[11px] font-mono text-slate-500">Model ID: {model.id}</div>
+                      </div>
+
+                      <div className="flex items-center gap-2 self-start sm:self-center">
+                        {isSelected ? (
+                          <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 text-white text-xs font-bold shadow-md shadow-indigo-600/30">
+                            <Check className="w-4 h-4" /> Selected
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedModel(model.id);
+                            }}
+                            className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors min-h-[36px]"
+                          >
+                            Select Model
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* TAB 3: AI & OCR ENGINES */}
           {activeTab === 'performance' && (
             <div className="space-y-5 animate-in fade-in duration-150">
               <div>
                 <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
-                  AI OCR & Extraction Engine
+                  AI OCR & Extraction Settings
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
                   Tune document recognition, bounding box precision, and double-pass algorithms.
@@ -508,39 +678,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                   </p>
                 </div>
               </div>
-
-              {/* Active Model Chain */}
-              <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
-                    <Zap className="w-4 h-4 text-amber-400" />
-                    <span>Active Model Pipeline</span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                    Fast & Flash Lite
-                  </span>
-                </div>
-                <div className="space-y-1.5 pt-1">
-                  <div className="flex items-center justify-between text-xs p-2 rounded-lg bg-slate-900/80 border border-slate-800">
-                    <div className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-                      <span className="font-mono font-medium text-slate-200">gemini-2.5-flash</span>
-                    </div>
-                    <span className="text-[10px] uppercase font-bold text-emerald-400 tracking-wider">Primary Default</span>
-                  </div>
-                  <div className="flex items-center justify-between text-xs p-2 rounded-lg bg-slate-900/80 border border-slate-800">
-                    <div className="flex items-center gap-2">
-                      <span className="w-2 h-2 rounded-full bg-indigo-400"></span>
-                      <span className="font-mono font-medium text-slate-300">gemini-3.1-flash-lite</span>
-                    </div>
-                    <span className="text-[10px] uppercase font-semibold text-indigo-400 tracking-wider">Fast Lite Fallback</span>
-                  </div>
-                </div>
-              </div>
             </div>
           )}
 
-          {/* TAB 3: APPEARANCE & THEME */}
+          {/* TAB 4: APPEARANCE & THEME */}
           {activeTab === 'appearance' && (
             <div className="space-y-5 animate-in fade-in duration-150">
               <div>
@@ -613,7 +754,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
             </div>
           )}
 
-          {/* TAB 4: DRAFTS & LOCAL STORAGE */}
+          {/* TAB 5: DRAFTS & LOCAL STORAGE */}
           {activeTab === 'storage' && (
             <div className="space-y-5 animate-in fade-in duration-150">
               <div>
