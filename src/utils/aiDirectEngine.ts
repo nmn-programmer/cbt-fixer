@@ -1,6 +1,5 @@
 import { GoogleGenAI, Type, Schema } from '@google/genai';
-
-const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+import { executeGeminiWithFallback } from './aiModelConfig';
 
 /**
  * Direct client-side execution for Gemini AI endpoints
@@ -108,30 +107,17 @@ Examine this Instructions / Cover page or text thoroughly and extract Test Title
   }
   contents.push({ text: prompt });
 
-  for (const model of MODELS) {
-    try {
-      const resp = await ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: blueprintSchema,
-          temperature: 0.1
-        }
-      });
-      if (resp.text) {
-        return JSON.parse(resp.text);
-      }
-    } catch (e: any) {
-      console.warn(`[Client AI] Blueprint failed on model ${model}:`, e.message);
-    }
-  }
-  throw new Error('Failed to extract test blueprint via client-side AI processing.');
+  return executeGeminiWithFallback(ai, {
+    contents,
+    schema: blueprintSchema,
+    temperature: 0.1,
+    label: 'Extract Test Blueprint'
+  });
 }
 
 async function handleExtractPdfStructure(ai: GoogleGenAI, body: any) {
   const { images, pageOffset = 0, options = {} } = body;
-  const { hasAnswerKey = true, extractEnglishOnly = false } = options;
+  const { hasAnswerKey = true, extractEnglishOnly = false, enableDoublePass = true } = options;
   if (!images || !images.length) throw new Error('No images provided');
 
   const contents = images.map((base64: string) => ({
@@ -152,62 +138,96 @@ async function handleExtractPdfStructure(ai: GoogleGenAI, body: any) {
         items: {
           type: Type.OBJECT,
           properties: {
-            qNo: { type: Type.INTEGER },
-            type: { type: Type.STRING },
-            subject: { type: Type.STRING },
-            section: { type: Type.STRING },
-            questionText: { type: Type.STRING },
-            optionsText: { type: Type.ARRAY, items: { type: Type.STRING } },
-            correctAnswer: { type: Type.STRING },
-            hasAnswerKeyGiven: { type: Type.BOOLEAN },
-            boundingBox: { type: Type.ARRAY, items: { type: Type.NUMBER } },
             pageIndex: { type: Type.INTEGER },
-            isSplitQuestion: { type: Type.BOOLEAN },
-            isOptionSplit: { type: Type.BOOLEAN },
-            splitPart: { type: Type.INTEGER },
-            missingOptionsInThisPage: { type: Type.ARRAY, items: { type: Type.STRING } }
+            qNo: { type: Type.INTEGER },
+            subject: { type: Type.STRING },
+            type: { type: Type.STRING },
+            box: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+            optionsFound: { type: Type.ARRAY, items: { type: Type.STRING } },
+            completeness: { type: Type.STRING },
+            isSplit: { type: Type.BOOLEAN },
+            splitParts: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  pageIndex: { type: Type.INTEGER },
+                  box: { type: Type.ARRAY, items: { type: Type.NUMBER } },
+                  partLabel: { type: Type.STRING }
+                },
+                required: ["pageIndex", "box"]
+              }
+            },
+            isOrphanContinuation: { type: Type.BOOLEAN },
+            continuationForQNo: { type: Type.INTEGER }
           },
-          required: ["qNo", "type", "boundingBox", "pageIndex"]
+          required: ["pageIndex", "qNo", "subject", "type", "box"]
+        }
+      },
+      answerKeys: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            qNo: { type: Type.INTEGER },
+            answer: { type: Type.STRING }
+          },
+          required: ["qNo", "answer"]
         }
       }
     },
     required: ["questions"]
   };
 
-  const prompt = `You are a high-precision OCR and document analysis AI specializing in JEE / NEET / Competitive Exam CBT Question Papers.
-Analyze these page images (Absolute Page Numbers: ${pageOffset + 1} to ${pageOffset + images.length}).
-Extract all question bounding boxes [ymin, xmin, ymax, xmax] normalized from 0.0 to 1.0, question text, type ('mcq', 'msq', 'nat', 'msm'), options, and correct answers.
-${extractEnglishOnly ? 'CRITICAL: Extract ONLY ENGLISH text.' : ''}
-${hasAnswerKey ? 'Extract answers if present.' : ''}`;
+  const prompt = `You are an expert exam layout parser specializing in JEE / NEET / CBSE test papers.
+Analyze the provided page images (Pages ${pageOffset + 1} to ${pageOffset + images.length}).
+The document is an official exam paper with printed question numbers and formulas.
+
+CRITICAL BOUNDING BOX & COLUMN PROTOCOL:
+1. Column Separation in 2-Column Papers:
+   - Left Column: The bounding box MUST span from the left margin (~0.03 to 0.05) to the center column divider (~0.485). NEVER cross into the right column.
+   - Right Column: The bounding box MUST start after the center divider (~0.515) and span to the right margin (~0.97).
+   - Full-Width Questions: span from left margin (~0.035) to right margin (~0.97).
+
+2. Zero-Clipping Rules:
+   - Question Number Margin: The bounding box xmin MUST start to the LEFT of the question number (e.g. "Q.15", "15.").
+   - Complete Options Enclosure: For MCQs, the bounding box ymax MUST comfortably enclose the entire bottom line of all options (A, B, C, D) or (1, 2, 3, 4).
+   - Exclude page headers, subject header banners, and page numbers.
+
+3. MANDATORY PROTOCOL FOR MULTI-COLUMN & MULTI-PAGE SPLIT QUESTIONS:
+   - If a question near the bottom of a left column ends before listing all options, mark "isSplit": true, "completeness": "split", and locate the continuation at the top of the right column or next page.
+   - Provide "splitParts" with ordered normalized boxes for each part.
+   - If the top of a column starts with orphaned options (e.g. "(A)... (B)... (C)... (D)..." or "(C)... (D)...") without a new Q-number, mark "isOrphanContinuation": true, and set "continuationForQNo" to the preceding question number.
+
+${extractEnglishOnly ? 'BILINGUAL PAPER: Extract ONLY the English version of questions.' : ''}
+
+Output normalized bounding box [ymin, xmin, ymax, xmax] between 0.0 and 1.0 for each question.
+${hasAnswerKey ? 'Extract printed answer key table if present on these pages.' : ''}`;
 
   contents.push({ text: prompt });
 
-  let resultData: any = null;
-  for (const model of MODELS) {
-    try {
-      const resp = await ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema,
-          temperature: 0.1
-        }
-      });
-      if (resp.text) {
-        resultData = JSON.parse(resp.text);
-        break;
-      }
-    } catch (e: any) {
-      console.warn(`[Client AI] Extract PDF structure failed on model ${model}:`, e.message);
-    }
+  const parsed = await executeGeminiWithFallback(ai, {
+    contents,
+    schema: responseSchema,
+    temperature: 0.1,
+    label: 'Client Direct Extract PDF Structure'
+  });
+
+  // Adjust pageIndex by pageOffset (for both main question and splitParts)
+  if (parsed.questions && Array.isArray(parsed.questions)) {
+    parsed.questions = parsed.questions.map((q: any) => ({
+      ...q,
+      pageIndex: (typeof q.pageIndex === 'number' ? q.pageIndex : 0) + pageOffset,
+      splitParts: Array.isArray(q.splitParts)
+        ? q.splitParts.map((sp: any) => ({
+            ...sp,
+            pageIndex: (typeof sp.pageIndex === 'number' ? sp.pageIndex : 0) + pageOffset
+          }))
+        : q.splitParts
+    }));
   }
 
-  if (!resultData) {
-    throw new Error('Client-side AI extraction failed across all models');
-  }
-
-  return resultData;
+  return parsed;
 }
 
 async function handleDetectQuestionBox(ai: GoogleGenAI, body: any) {
@@ -232,23 +252,12 @@ async function handleDetectQuestionBox(ai: GoogleGenAI, body: any) {
   const prompt = `Find the precise normalized bounding box [ymin, xmin, ymax, xmax] (0.0 to 1.0) enclosing Question ${qNo || ''} on this page.
 Text context: "${questionText ? questionText.slice(0, 150) : ''}"`;
 
-  for (const model of MODELS) {
-    try {
-      const resp = await ai.models.generateContent({
-        model,
-        contents: [{ inlineData }, { text: prompt }],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: schema,
-          temperature: 0.1
-        }
-      });
-      if (resp.text) return JSON.parse(resp.text);
-    } catch (e: any) {
-      console.warn(`[Client AI] detectQuestionBox failed on model ${model}:`, e.message);
-    }
-  }
-  throw new Error('Failed to detect question box via client-side AI.');
+  return executeGeminiWithFallback(ai, {
+    contents: [{ inlineData }, { text: prompt }],
+    schema,
+    temperature: 0.1,
+    label: 'Detect Question Box'
+  });
 }
 
 async function handleAnalyzeQuestionImage(ai: GoogleGenAI, body: any) {
@@ -283,23 +292,12 @@ async function handleAnalyzeQuestionImage(ai: GoogleGenAI, body: any) {
   const prompt = `Analyze this cropped question image for clarity, clipping, and completeness.
 Context: "${questionContext || ''}"`;
 
-  for (const model of MODELS) {
-    try {
-      const resp = await ai.models.generateContent({
-        model,
-        contents: [{ inlineData }, { text: prompt }],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: schema,
-          temperature: 0.1
-        }
-      });
-      if (resp.text) return JSON.parse(resp.text);
-    } catch (e: any) {
-      console.warn(`[Client AI] analyzeQuestionImage failed on model ${model}:`, e.message);
-    }
-  }
-  throw new Error('Failed to analyze question image via client-side AI.');
+  return executeGeminiWithFallback(ai, {
+    contents: [{ inlineData }, { text: prompt }],
+    schema,
+    temperature: 0.1,
+    label: 'Analyze Question Image'
+  });
 }
 
 async function handleExtractAnswerKeyPdf(ai: GoogleGenAI, body: any) {
@@ -343,23 +341,12 @@ async function handleExtractAnswerKeyPdf(ai: GoogleGenAI, body: any) {
   const prompt = `Extract all question-to-answer mappings from this document.`;
   contents.push({ text: prompt });
 
-  for (const model of MODELS) {
-    try {
-      const resp = await ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: keySchema,
-          temperature: 0.1
-        }
-      });
-      if (resp.text) return JSON.parse(resp.text);
-    } catch (e: any) {
-      console.warn(`[Client AI] extractAnswerKeyPdf failed on model ${model}:`, e.message);
-    }
-  }
-  throw new Error('Failed to extract answer key PDF via client-side AI.');
+  return executeGeminiWithFallback(ai, {
+    contents,
+    schema: keySchema,
+    temperature: 0.1,
+    label: 'Extract Answer Key PDF'
+  });
 }
 
 async function handleExtractAnswerKeyPage(ai: GoogleGenAI, body: any) {
@@ -393,21 +380,11 @@ async function handleExtractAnswerKeyPage(ai: GoogleGenAI, body: any) {
 
   const prompt = `Extract all answers from this answer key table page image.`;
 
-  for (const model of MODELS) {
-    try {
-      const resp = await ai.models.generateContent({
-        model,
-        contents: [{ inlineData }, { text: prompt }],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: keySchema,
-          temperature: 0.1
-        }
-      });
-      if (resp.text) return JSON.parse(resp.text);
-    } catch (e: any) {
-      console.warn(`[Client AI] extractAnswerKeyPage failed on model ${model}:`, e.message);
-    }
-  }
-  throw new Error('Failed to extract answer key page via client-side AI.');
+  return executeGeminiWithFallback(ai, {
+    contents: [{ inlineData }, { text: prompt }],
+    schema: keySchema,
+    temperature: 0.1,
+    label: 'Extract Answer Key Page'
+  });
 }
+

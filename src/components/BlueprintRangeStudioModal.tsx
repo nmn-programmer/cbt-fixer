@@ -21,6 +21,7 @@ import {
   Info,
 } from 'lucide-react';
 import { generateId } from '../utils/constants';
+import { getPdfjsLib } from '../utils/pdfWorkerConfig';
 
 const PRESET_TEMPLATES: {
   id: string;
@@ -420,10 +421,7 @@ export const BlueprintRangeStudioModal: React.FC = () => {
       let base64Image = '';
       if (imageFile) {
         if (imageFile.type.includes('pdf') || imageFile.name.endsWith('.pdf')) {
-          const pdfjsLib = await import('pdfjs-dist');
-          const pdfWorkerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
-          pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-
+          const pdfjsLib = await getPdfjsLib();
           const arrayBuffer = await imageFile.arrayBuffer();
           const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
           const page = await pdfDoc.getPage(1);
@@ -501,13 +499,21 @@ export const BlueprintRangeStudioModal: React.FC = () => {
 
         setRanges(newParsedRanges.sort((a, b) => a.fromQNo - b.fromQNo));
         setActiveTab('editor');
-        alert(`Successfully parsed ${newParsedRanges.length} section ranges & marking scheme from instructions!`);
+        addToast({
+          title: 'Blueprint Parsed',
+          description: `Successfully parsed ${newParsedRanges.length} section ranges & marking scheme from instructions!`,
+          type: 'success',
+        });
       } else {
         throw new Error('No structured section ranges were found in the provided instructions.');
       }
     } catch (err: any) {
-      console.error('Error scanning instructions:', err);
-      alert(`AI Extraction Error: ${err.message}`);
+      console.warn('Notice scanning instructions:', err?.message || err);
+      addToast({
+        title: 'AI Blueprint Scan Notice',
+        description: err.message || 'Unable to scan instructions page.',
+        type: 'warning',
+      });
     } finally {
       setIsScanningAi(false);
       setAiScanStatus('');
@@ -518,7 +524,11 @@ export const BlueprintRangeStudioModal: React.FC = () => {
   const handleApplyToArchive = () => {
     if (!activeArchive) return;
     if (ranges.length === 0) {
-      alert('Please add at least one subject range.');
+      addToast({
+        title: 'Ranges Required',
+        description: 'Please add at least one subject range.',
+        type: 'warning',
+      });
       return;
     }
 

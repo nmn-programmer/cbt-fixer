@@ -54,6 +54,7 @@ export const Header: React.FC = () => {
     redo,
     theme,
     setTheme,
+    addToast,
   } = useCbtStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -180,8 +181,17 @@ export const Header: React.FC = () => {
         try {
           const result = await parseZipArchive(file, file.name);
           addArchive(result.archive, true);
+          addToast({
+            title: 'ZIP Loaded',
+            description: `Loaded ${file.name} successfully.`,
+            type: 'success',
+          });
         } catch (err: any) {
-          alert(`Failed to load ZIP ${file.name}: ${err.message}`);
+          addToast({
+            title: 'Failed to load ZIP',
+            description: `${file.name}: ${err.message}`,
+            type: 'error',
+          });
         }
       }
     }
@@ -386,10 +396,18 @@ export const Header: React.FC = () => {
               title="Export Sanitized ZIP Archive"
             >
               <Upload className="w-3.5 h-3.5" />
-              <span>Export ZIP</span>
+              <span className="hidden sm:inline">Export ZIP</span>
+              <span className="sm:hidden">Export</span>
             </button>
           )}
-          <button onClick={() => window.dispatchEvent(new CustomEvent("open-settings"))} className="flex items-center justify-center p-1.5 ml-2 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-md transition-colors" title="Settings">
+
+          {/* Settings Button */}
+          <button
+            id="header-settings-btn"
+            onClick={() => window.dispatchEvent(new CustomEvent('open-settings'))}
+            className="flex items-center justify-center p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded-md transition-colors min-h-[32px] min-w-[32px]"
+            title="Studio Settings & API Keys"
+          >
             <Settings className="w-4 h-4" />
           </button>
         </div>

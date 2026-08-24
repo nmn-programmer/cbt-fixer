@@ -17,7 +17,7 @@ import { useCbtStore } from '../store/useCbtStore';
 import { serializeDataJson, serializeZipArchive } from '../utils/zipSerializer';
 
 export const ExportModal: React.FC = () => {
-  const { archives, activeArchiveId, isExportModalOpen, setExportModalOpen, diagnostics } =
+  const { archives, activeArchiveId, isExportModalOpen, setExportModalOpen, diagnostics, addToast } =
     useCbtStore();
 
   const [exportFormat, setExportFormat] = useState<'pdfCropper' | 'ultimate' | 'dataJsonOnly'>(
@@ -78,7 +78,12 @@ export const ExportModal: React.FC = () => {
         });
       }
     } catch (err: any) {
-      alert(`Export failed: ${err.message}`);
+      console.warn('Export notice:', err?.message || err);
+      addToast({
+        title: 'Export Failed',
+        description: err.message || 'An error occurred while compiling export package.',
+        type: 'error',
+      });
     } finally {
       setIsExporting(false);
     }

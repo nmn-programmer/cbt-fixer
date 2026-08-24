@@ -555,7 +555,14 @@ export async function fetchWithGeminiFallback(
       }
     }
 
-    // Success response
+    // If server returned an error (e.g. 503 high demand or 500) and we have more keys, try next key
+    if (!res.ok && !isLastCandidate) {
+      const next = usableCandidates[cIdx + 1];
+      console.warn(`[GeminiKeyManager] Server returned ${res.status} with ${candidate.label}. Trying ${next.label}...`);
+      continue;
+    }
+
+    // Success response or final handled response
     return res;
   }
 

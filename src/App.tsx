@@ -22,10 +22,10 @@ import { FloatingBgTaskWidget } from './components/FloatingBgTaskWidget';
 export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
 
-  React.useEffect(() => {
+  useEffect(() => {
     const handleOpen = () => setIsSettingsOpen(true);
-    window.addEventListener("open-settings", handleOpen);
-    return () => window.removeEventListener("open-settings", handleOpen);
+    window.addEventListener('open-settings', handleOpen);
+    return () => window.removeEventListener('open-settings', handleOpen);
   }, []);
 
   const {

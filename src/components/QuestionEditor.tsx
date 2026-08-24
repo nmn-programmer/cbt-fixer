@@ -63,6 +63,7 @@ export const QuestionEditor: React.FC = () => {
     setAnswerKeyModalOpen,
     openPdfRecrop,
     openAiRepair,
+    addToast,
   } = useCbtStore();
 
   const [activeTab, setActiveTab] = useState<'editor' | 'json'>('editor');
@@ -366,8 +367,20 @@ export const QuestionEditor: React.FC = () => {
               <span>data.json representation for Q{currentQuestion.que}</span>
               <button
                 onClick={() => {
-                  navigator.clipboard.writeText(JSON.stringify(currentQuestion, null, 2));
-                  alert('Copied question JSON to clipboard!');
+                  try {
+                    navigator.clipboard.writeText(JSON.stringify(currentQuestion, null, 2));
+                    addToast({
+                      title: 'Copied JSON',
+                      description: `Copied question Q${currentQuestion.que} JSON to clipboard!`,
+                      type: 'success',
+                    });
+                  } catch {
+                    addToast({
+                      title: 'Copy Notice',
+                      description: 'Clipboard write requires user permission.',
+                      type: 'warning',
+                    });
+                  }
                 }}
                 className="flex items-center gap-1 text-[11px] hover:text-white"
               >

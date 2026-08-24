@@ -24,6 +24,7 @@ export const BulkOperationsModal: React.FC = () => {
     fixRenumberSection,
     bulkApplyMarkingScheme,
     addArchive,
+    addToast,
   } = useCbtStore();
 
   const [activeTab, setActiveTab] = useState<'renumber' | 'marking' | 'merge' | 'split'>('renumber');
@@ -51,7 +52,11 @@ export const BulkOperationsModal: React.FC = () => {
 
   const handleMergeArchives = () => {
     if (mergeArchiveIds.length < 2) {
-      alert('Select at least 2 archives to merge.');
+      addToast({
+        title: 'Merge Archives',
+        description: 'Select at least 2 archives to merge.',
+        type: 'warning',
+      });
       return;
     }
 
@@ -314,10 +319,19 @@ export const BulkOperationsModal: React.FC = () => {
               <button
                 onClick={() => {
                   if (selectedSectionIds.length === 0) {
-                    alert('Please select at least one section.');
+                    addToast({
+                      title: 'Select Sections',
+                      description: 'Please select at least one section.',
+                      type: 'warning',
+                    });
                     return;
                   }
                   bulkApplyMarkingScheme(selectedSectionIds, selectedPresetId);
+                  addToast({
+                    title: 'Marking Scheme Applied',
+                    description: `Applied scheme to ${selectedSectionIds.length} sections.`,
+                    type: 'success',
+                  });
                   setBulkModalOpen(false);
                 }}
                 className="w-full py-2.5 bg-purple-600 hover:bg-purple-500 font-bold text-white rounded-lg transition-colors shadow-md"

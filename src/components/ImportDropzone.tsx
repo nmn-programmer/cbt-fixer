@@ -23,7 +23,7 @@ import {
 } from '../utils/answerKeyManager';
 
 export const ImportDropzone: React.FC = () => {
-  const { addArchive, loadSample, createNewPaper, setAnswerKeyModalOpen } = useCbtStore();
+  const { addArchive, loadSample, createNewPaper, setAnswerKeyModalOpen, addToast } = useCbtStore();
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [loadingStatus, setLoadingStatus] = useState<string>('');
@@ -88,7 +88,12 @@ export const ImportDropzone: React.FC = () => {
         setAnswerKeyModalOpen(true);
       }
     } catch (err: any) {
-      alert(`Error processing files: ${err.message}`);
+      console.warn('Import notice:', err?.message || err);
+      addToast({
+        title: 'Import Notice',
+        description: `Error processing files: ${err.message}`,
+        type: 'error',
+      });
     } finally {
       setIsLoading(false);
       setLoadingStatus('');

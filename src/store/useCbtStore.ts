@@ -132,7 +132,11 @@ interface CbtStoreState {
   deleteFallbackApiKey: (id: string) => void;
   reorderFallbackApiKeys: (fromIndex: number, toIndex: number) => void;
   refreshUsageMetrics: () => void;
-  addToast: (title: string, description?: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
+  addToast: (
+    titleOrObj: string | { title: string; description?: string; type?: 'info' | 'success' | 'warning' | 'error' },
+    description?: string,
+    type?: 'info' | 'success' | 'warning' | 'error'
+  ) => void;
   removeToast: (id: string) => void;
 
   // History / Undo / Redo
@@ -457,12 +461,30 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       });
     },
 
-    addToast: (title: string, description?: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
+    addToast: (
+      titleOrObj: string | { title: string; description?: string; type?: 'info' | 'success' | 'warning' | 'error' },
+      description?: string,
+      type: 'info' | 'success' | 'warning' | 'error' = 'info'
+    ) => {
+      let finalTitle = '';
+      let finalDesc: string | undefined = undefined;
+      let finalType: 'info' | 'success' | 'warning' | 'error' = type;
+
+      if (typeof titleOrObj === 'string') {
+        finalTitle = titleOrObj;
+        finalDesc = description;
+        finalType = type;
+      } else if (titleOrObj && typeof titleOrObj === 'object') {
+        finalTitle = titleOrObj.title;
+        finalDesc = titleOrObj.description;
+        finalType = titleOrObj.type || 'info';
+      }
+
       const newToast: ToastNotification = {
         id: generateId(),
-        title,
-        description,
-        type,
+        title: finalTitle,
+        description: finalDesc,
+        type: finalType,
         timestamp: Date.now(),
       };
       set((state) => ({ toasts: [...state.toasts.slice(-4), newToast] }));

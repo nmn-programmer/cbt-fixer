@@ -1,6 +1,7 @@
 import { MarksScheme, QuestionData, QuestionPaperArchive, QuestionType, SubjectData } from '../types/cbt';
 import { generateId } from './constants';
 import { fetchWithGeminiFallback } from './geminiKeyManager';
+import { getPdfjsLib } from './pdfWorkerConfig';
 
 /**
  * Standard Answer Key Entry representing a single question's answer in the official format.
@@ -992,7 +993,7 @@ export async function extractAnswerKeyFromPdfFile(
   onProgress?.('Rendering Answer Key PDF pages...', 20);
 
   const arrayBuffer = await file.arrayBuffer();
-  const pdfjsLib = await import('pdfjs-dist');
+  const pdfjsLib = await getPdfjsLib();
   const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
   const numPages = Math.min(pdfDoc.numPages, 10); // Process up to 10 pages of answer key
 

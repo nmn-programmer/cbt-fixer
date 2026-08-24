@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { GoogleGenAI, Type, Schema } from '@google/genai';
+import { executeGeminiWithFallback, isAuthError, isTransientError, formatAiErrorMessage } from './src/utils/aiModelConfig';
 
 export const app = express();
 const PORT = 3000;
@@ -8,76 +9,88 @@ const PORT = 3000;
 app.use(express.json({ limit: '200mb' }));
 app.use(express.urlencoded({ extended: true, limit: '200mb' }));
 
-  // API Route to extract test paper instructions blueprint & question ranges from Cover / Instructions page
-  app.post('/api/extract-test-blueprint', async (req, res) => {
-    try {
-      const { image, text } = req.body;
-      if (!image && !text) {
-        return res.status(400).json({ error: 'Instruction page image or text is required' });
-      }
+// Helper to determine HTTP status code from error
+function getErrorStatusCode(err: any): number {
+  if (isAuthError(err)) return 401;
+  const msg = String(err?.message || '').toLowerCase();
+  const status = err?.status || err?.code || err?.statusCode;
+  if (status === 503 || msg.includes('503') || msg.includes('high demand') || msg.includes('unavailable') || msg.includes('overloaded')) {
+    return 503;
+  }
+  if (isTransientError(err)) return 429;
+  return 500;
+}
 
-      const authHeader = req.headers.authorization;
-      const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
-      const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+// API Route to extract test paper instructions blueprint & question ranges from Cover / Instructions page
+app.post('/api/extract-test-blueprint', async (req, res) => {
+  try {
+    const { image, text } = req.body;
+    if (!image && !text) {
+      return res.status(400).json({ error: 'Instruction page image or text is required' });
+    }
 
-      if (!apiKey) {
-        return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
-      }
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
 
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-      });
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
 
-      const blueprintSchema: Schema = {
-        type: Type.OBJECT,
-        properties: {
-          testTitle: { type: Type.STRING, description: "Official test name/title from cover or instructions" },
-          durationMinutes: { type: Type.INTEGER, description: "Total test duration in minutes (e.g. 60, 180, 200)" },
-          totalMarks: { type: Type.INTEGER, description: "Maximum aggregate marks (e.g. 96, 300, 360, 720)" },
-          totalQuestions: { type: Type.INTEGER, description: "Total number of questions in booklet (e.g. 24, 75, 90, 180)" },
-          hasInstructedMarkingScheme: { type: Type.BOOLEAN, description: "True if explicit marking scheme rules are written in the instructions" },
-          markingSchemeSummary: { type: Type.STRING, description: "Concise human-readable summary of the exact instructed marking scheme (e.g., 'MCQ: +4/-1, Numerical: +4/0, MSQ: +4/-2 with partial marks')" },
-          defaultMarkingScheme: {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
+
+    const blueprintSchema: Schema = {
+      type: Type.OBJECT,
+      properties: {
+        testTitle: { type: Type.STRING, description: "Official test name/title from cover or instructions" },
+        durationMinutes: { type: Type.INTEGER, description: "Total test duration in minutes (e.g. 60, 180, 200)" },
+        totalMarks: { type: Type.INTEGER, description: "Maximum aggregate marks (e.g. 96, 300, 360, 720)" },
+        totalQuestions: { type: Type.INTEGER, description: "Total number of questions in booklet (e.g. 24, 75, 90, 180)" },
+        hasInstructedMarkingScheme: { type: Type.BOOLEAN, description: "True if explicit marking scheme rules are written in the instructions" },
+        markingSchemeSummary: { type: Type.STRING, description: "Concise human-readable summary of the exact instructed marking scheme (e.g., 'MCQ: +4/-1, Numerical: +4/0, MSQ: +4/-2 with partial marks')" },
+        defaultMarkingScheme: {
+          type: Type.OBJECT,
+          properties: {
+            cm: { type: Type.NUMBER, description: "Default correct marks, e.g. 4 or 3" },
+            im: { type: Type.NUMBER, description: "Default incorrect/negative marks, e.g. -1 or 0" },
+            pm: { type: Type.NUMBER, description: "Default partial marks, e.g. 0 or 1" },
+            max: { type: Type.NUMBER, description: "Default max marks per question, e.g. 4" }
+          },
+          required: ["cm", "im"]
+        },
+        sections: {
+          type: Type.ARRAY,
+          description: "List of subject and section question ranges parsed strictly from instructions",
+          items: {
             type: Type.OBJECT,
             properties: {
-              cm: { type: Type.NUMBER, description: "Default correct marks, e.g. 4 or 3" },
-              im: { type: Type.NUMBER, description: "Default incorrect/negative marks, e.g. -1 or 0" },
-              pm: { type: Type.NUMBER, description: "Default partial marks, e.g. 0 or 1" },
-              max: { type: Type.NUMBER, description: "Default max marks per question, e.g. 4" }
+              subjectName: { type: Type.STRING, description: "Standard Subject Name: Physics, Chemistry, Mathematics, Biology, Botany, Zoology, etc." },
+              sectionName: { type: Type.STRING, description: "Section name, e.g. Section 1 (MCQ), Section 2 (Numerical), Part A, etc." },
+              fromQNo: { type: Type.INTEGER, description: "Starting question number (inclusive), e.g. 1" },
+              toQNo: { type: Type.INTEGER, description: "Ending question number (inclusive), e.g. 8" },
+              type: { type: Type.STRING, description: "Question type: 'mcq' (single correct), 'msq' (multiple correct), 'nat' (numerical), 'msm' (matrix match)" },
+              marks: {
+                type: Type.OBJECT,
+                properties: {
+                  cm: { type: Type.NUMBER, description: "Exact instructed correct marks, e.g. 4, 3" },
+                  im: { type: Type.NUMBER, description: "Exact instructed negative marks (negative number e.g. -1, -2 or 0)" },
+                  pm: { type: Type.NUMBER, description: "Exact instructed partial marks if specified for MSQ (e.g. 1), else 0" },
+                  max: { type: Type.NUMBER, description: "Maximum marks per question e.g. 4" }
+                },
+                required: ["cm", "im"]
+              }
             },
-            required: ["cm", "im"]
-          },
-          sections: {
-            type: Type.ARRAY,
-            description: "List of subject and section question ranges parsed strictly from instructions",
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                subjectName: { type: Type.STRING, description: "Standard Subject Name: Physics, Chemistry, Mathematics, Biology, Botany, Zoology, etc." },
-                sectionName: { type: Type.STRING, description: "Section name, e.g. Section 1 (MCQ), Section 2 (Numerical), Part A, etc." },
-                fromQNo: { type: Type.INTEGER, description: "Starting question number (inclusive), e.g. 1" },
-                toQNo: { type: Type.INTEGER, description: "Ending question number (inclusive), e.g. 8" },
-                type: { type: Type.STRING, description: "Question type: 'mcq' (single correct), 'msq' (multiple correct), 'nat' (numerical), 'msm' (matrix match)" },
-                marks: {
-                  type: Type.OBJECT,
-                  properties: {
-                    cm: { type: Type.NUMBER, description: "Exact instructed correct marks, e.g. 4, 3" },
-                    im: { type: Type.NUMBER, description: "Exact instructed negative marks (negative number e.g. -1, -2 or 0)" },
-                    pm: { type: Type.NUMBER, description: "Exact instructed partial marks if specified for MSQ (e.g. 1), else 0" },
-                    max: { type: Type.NUMBER, description: "Maximum marks per question e.g. 4" }
-                  },
-                  required: ["cm", "im"]
-                }
-              },
-              required: ["subjectName", "sectionName", "fromQNo", "toQNo", "type", "marks"]
-            }
+            required: ["subjectName", "sectionName", "fromQNo", "toQNo", "type", "marks"]
           }
-        },
-        required: ["sections", "defaultMarkingScheme"]
-      };
+        }
+      },
+      required: ["sections", "defaultMarkingScheme"]
+    };
 
-      const prompt = `You are a test paper booklet blueprint & marking scheme specialist.
+    const prompt = `You are a test paper booklet blueprint & marking scheme specialist.
 Examine this Instructions / Cover page or text thoroughly.
 
 CRITICAL DIRECTIVE ON MARKING SCHEME EXTRACTION:
@@ -101,473 +114,409 @@ CRITICAL DIRECTIVE ON MARKING SCHEME EXTRACTION:
      * 'msm' for Matrix Match / List Match
    - Ensure all questions from 1 to Total Questions are mapped without gaps or overlapping ranges.`;
 
-      const contents: any[] = [];
-      if (image) {
-        const isJpeg = image.startsWith('data:image/jpeg');
-        contents.push({
-          inlineData: {
-            data: image.replace(/^data:image\/\w+;base64,/, ''),
-            mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+    const contents: any[] = [];
+    if (image) {
+      const isJpeg = image.startsWith('data:image/jpeg');
+      contents.push({
+        inlineData: {
+          data: image.replace(/^data:image\/\w+;base64,/, ''),
+          mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+        }
+      });
+    }
+    if (text) {
+      contents.push({ text: `Instructions Text:\n${text}` });
+    }
+    contents.push({ text: prompt });
+
+    const blueprintResult = await executeGeminiWithFallback(ai, {
+      contents,
+      schema: blueprintSchema,
+      temperature: 0.1,
+      label: 'Server Extract Test Blueprint'
+    });
+
+    res.json(blueprintResult);
+  } catch (error: any) {
+    console.error('Error extracting test blueprint:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
+
+// API Route for Gemini Multi-modal PDF analysis
+app.post('/api/extract-pdf-structure', async (req, res) => {
+  try {
+    const { images, pageOffset = 0, options = {} } = req.body;
+    const { hasAnswerKey = true, extractEnglishOnly = false } = options;
+    
+    if (!images || !images.length) {
+      return res.status(400).json({ error: 'No images provided' });
+    }
+
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
+
+    const ai = new GoogleGenAI({ 
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+
+    const contents = images.map((base64: string) => {
+      const isJpeg = base64.startsWith('data:image/jpeg');
+      return {
+        inlineData: {
+          data: base64.replace(/^data:image\/\w+;base64,/, ''),
+          mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+        }
+      };
+    });
+
+    // Define the schema for structured output with split questions and option completeness support
+    const responseSchema: Schema = {
+      type: Type.OBJECT,
+      properties: {
+        testTitle: { type: Type.STRING, description: "Title of the test paper if found" },
+        durationMinutes: { type: Type.INTEGER, description: "Duration in minutes if found" },
+        totalMarks: { type: Type.INTEGER, description: "Maximum marks if found" },
+        questions: {
+          type: Type.ARRAY,
+          description: "List of all questions found in the images in sequential order",
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              pageIndex: { type: Type.INTEGER, description: "0-based index of the page within this batch where question starts" },
+              qNo: { type: Type.INTEGER, description: "The printed question number (e.g. 1, 2, 3...)" },
+              subject: { type: Type.STRING, description: "Subject of the question (e.g., Physics, Chemistry, Mathematics, Biology, General)" },
+              type: { type: Type.STRING, description: "Type of the question: MCQ_SINGLE, MCQ_MULTIPLE, NUMERICAL, MATRIX_MATCH" },
+              box: {
+                type: Type.ARRAY,
+                description: "Primary bounding box [ymin, xmin, ymax, xmax] normalized between 0.0 and 1.0",
+                items: { type: Type.NUMBER }
+              },
+              optionsFound: {
+                type: Type.ARRAY,
+                description: "List of option labels detected inside this question, e.g. ['(A)', '(B)', '(C)', '(D)'] or ['(1)', '(2)', '(3)', '(4)']",
+                items: { type: Type.STRING }
+              },
+              completeness: {
+                type: Type.STRING,
+                description: "'complete' (all options/stems present), 'split' (spills over into next column/page), 'missing_options' (options could not be located)"
+              },
+              isSplit: { type: Type.BOOLEAN, description: "True if question is split across columns or pages" },
+              splitParts: {
+                type: Type.ARRAY,
+                description: "Ordered bounding boxes for multi-column or multi-page split parts",
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    pageIndex: { type: Type.INTEGER, description: "0-based index of the page for this part" },
+                    box: {
+                      type: Type.ARRAY,
+                      description: "[ymin, xmin, ymax, xmax] normalized bounds for this part",
+                      items: { type: Type.NUMBER }
+                    },
+                    partLabel: { type: Type.STRING, description: "e.g. 'Part 1 (Stem & Diagram)', 'Part 2 (Options A-D)'" }
+                  },
+                  required: ["pageIndex", "box"]
+                }
+              },
+              isOrphanContinuation: {
+                type: Type.BOOLEAN,
+                description: "True if this block was found at the top of a column/page continuing the previous question"
+              },
+              continuationForQNo: {
+                type: Type.INTEGER,
+                description: "If this block contains orphaned options from previous column/page, the question number it belongs to"
+              }
+            },
+            required: ["pageIndex", "qNo", "subject", "type", "box"]
           }
+        },
+        answerKeys: {
+          type: Type.ARRAY,
+          description: "Extracted answer keys if present in these pages. Omit if not found.",
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              qNo: { type: Type.INTEGER },
+              answer: { type: Type.STRING, description: "Correct option(s) or numerical value" }
+            },
+            required: ["qNo", "answer"]
+          }
+        }
+      },
+      required: ["questions"]
+    };
+
+    const prompt = `You are an expert exam layout parser specializing in JEE / NEET / CBSE test papers.
+Analyze the provided page images (up to 2-3 pages per batch).
+The document is an official exam paper with printed question numbers and formulas.
+
+CRITICAL BOUNDING BOX & COLUMN PROTOCOL:
+1. Column Separation in 2-Column Papers:
+   - Left Column: The bounding box MUST span from the left margin (~0.03 to 0.05) to the center column divider (~0.485). NEVER cross the central vertical divider into the right column.
+   - Right Column: The bounding box MUST start after the center divider (~0.515) and span to the right margin (~0.97).
+   - Full-Width Questions / Headers: span from left margin (~0.035) to right margin (~0.97).
+
+2. Zero-Clipping Rules for Question Slices:
+   - Question Number Margin: The bounding box xmin MUST start to the LEFT of the question number (e.g. "Q.15", "15.", "Question 15"). NEVER slice through the question number.
+   - Complete Options Enclosure: For MCQs, the bounding box ymax MUST comfortably enclose the entire bottom line of all options (A, B, C, D) or (1, 2, 3, 4), including formulas, exponents, and subscript units.
+   - Exclude page headers, subject header banners (e.g. "SECTION - 1: PHYSICS"), and page numbers at bottom.
+
+3. Reading Order & Question Sequence:
+   - Read columns strictly top-to-bottom for LEFT column first, then top-to-bottom for RIGHT column.
+   - Extract questions in strict ascending sequence according to printed numbers (Q1, Q2, Q3...).
+
+4. MANDATORY PROTOCOL FOR MULTI-COLUMN & MULTI-PAGE SPLIT QUESTIONS:
+   - Exam questions often split across columns or pages due to page/column limits.
+   - Scenario A: Left Column Bottom -> Right Column Top:
+     * A question starts near the bottom of the left column (with stem/diagram) and ends before listing all options (or has 0, 1, or 2 options).
+     * The missing options (A-D, or C-D) appear at the VERY TOP of the RIGHT column.
+     * ACTION: Mark "isSplit": true, "completeness": "split".
+     * Provide "splitParts":
+       [
+         { "pageIndex": <page_index>, "box": [<ymin>, <xmin>, <ymax>, <xmax> on left column], "partLabel": "Part 1 (Stem)" },
+         { "pageIndex": <page_index>, "box": [<ymin>, <xmin>, <ymax>, <xmax> at top of right column], "partLabel": "Part 2 (Options)" }
+       ]
+   - Scenario B: Bottom of Page N -> Top of Page N+1:
+     * A question starts near the bottom of Page N, and its remaining options/stem continue at the top of Page N+1.
+     * ACTION: Mark "isSplit": true, "completeness": "split", and specify both parts across the pages in "splitParts".
+   - Scenario C: Unexpected Options at Top of Column / Page without Question Number:
+     * When beginning to read the top of a column or top of a page, if you see options like "(A)... (B)... (C)... (D)..." or "(C)... (D)..." WITHOUT a new question number (e.g. no "Q16"):
+     * THIS CONTENT BELONGS TO THE PREVIOUS QUESTION (e.g. Q15)!
+     * DO NOT ignore or drop it!
+     * DO NOT create a new question number for it!
+     * Attach it as Part 2 to the preceding question in "splitParts", or if outputting as a block, mark "isOrphanContinuation": true and "continuationForQNo": <previous_question_number>.
+
+${extractEnglishOnly ? 'BILINGUAL PAPER: Extract ONLY the English version of questions and options.' : ''}
+
+Output normalized bounding box [ymin, xmin, ymax, xmax] between 0.0 and 1.0 for each question.
+${hasAnswerKey ? 'Extract printed answer key table if present on these pages.' : ''}`;
+
+    const parsed = await executeGeminiWithFallback(ai, {
+      contents: [...contents, { text: prompt }],
+      schema: responseSchema,
+      temperature: 0.1,
+      label: 'Server Extract PDF Structure (Pass 1)'
+    });
+
+    // PASS 2 GAP-FILL & SEQUENCE AUDIT RESCAN (NON-DESTRUCTIVE)
+    if (options.enableDoublePass !== false && parsed.questions && parsed.questions.length > 0) {
+      try {
+        console.log(`Executing Pass 2 Gap-Fill & Sequence Audit for ${parsed.questions.length} detected questions...`);
+        const detectedQNums = parsed.questions.map((q: any) => q.qNo).filter(Boolean);
+        const rescanPrompt = `PASS 2 AUDIT & GAP-FILL RESCAN:
+Pass 1 detected questions: [${detectedQNums.join(', ')}].
+
+AUDIT TASKS:
+1. SEQUENCE CHECK: Verify if any printed question was skipped in this page batch (e.g. Q1, Q2, Q4 were found but Q3 was missed). If any question was missed, output that missing question with its exact bounding box [ymin, xmin, ymax, xmax] and metadata.
+2. SPLIT/CONTINUATION VERIFICATION: If any question was incomplete (missing options C/D or split across columns/pages), verify and provide its complete splitParts.
+3. ORPHAN OPTIONS RECOVERY: If any options at the top of a column were missed or detached, connect them to the preceding question.
+Return the complete audited list including any recovered missing questions.`;
+
+        const audited = await executeGeminiWithFallback(ai, {
+          contents: [...contents, { text: rescanPrompt }],
+          schema: responseSchema,
+          temperature: 0.0,
+          label: 'Server Pass 2 Audit'
         });
-      }
-      if (text) {
-        contents.push({ text: `Instructions Text:\n${text}` });
-      }
-      contents.push({ text: prompt });
 
-      const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-      let blueprintResult: any = null;
+        if (audited && audited.questions && Array.isArray(audited.questions)) {
+          const pass1Map = new Map<number, any>();
+          parsed.questions.forEach((q: any) => {
+            if (q.qNo != null) pass1Map.set(q.qNo, q);
+          });
 
-      for (const model of MODELS) {
-        try {
-          const resp = await ai.models.generateContent({
-            model,
-            contents,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: blueprintSchema,
-              temperature: 0.1
+          // Non-destructive merge: preserve Pass 1's high-precision visual boxes, insert missing questions from Pass 2
+          audited.questions.forEach((auditedQ: any) => {
+            if (!auditedQ || auditedQ.qNo == null) return;
+            const existing = pass1Map.get(auditedQ.qNo);
+            if (!existing) {
+              // Recovered missing question from Pass 2!
+              console.log(`Pass 2 recovered missing Question Q${auditedQ.qNo}`);
+              parsed.questions.push(auditedQ);
+              pass1Map.set(auditedQ.qNo, auditedQ);
+            } else {
+              // If Pass 2 identified splitParts that Pass 1 missed, enrich it
+              if (auditedQ.isSplit && auditedQ.splitParts && (!existing.splitParts || existing.splitParts.length <= 1)) {
+                existing.isSplit = true;
+                existing.splitParts = auditedQ.splitParts;
+              }
+              if (auditedQ.optionsFound && (!existing.optionsFound || auditedQ.optionsFound.length > existing.optionsFound.length)) {
+                existing.optionsFound = auditedQ.optionsFound;
+              }
             }
           });
-          if (resp.text) {
-            blueprintResult = JSON.parse(resp.text);
-            break;
-          }
-        } catch (e: any) {
-          console.warn(`extract-test-blueprint failed on model ${model}:`, e.message);
+
+          if (audited.testTitle && !parsed.testTitle) parsed.testTitle = audited.testTitle;
+          if (audited.answerKeys && (!parsed.answerKeys || parsed.answerKeys.length === 0)) parsed.answerKeys = audited.answerKeys;
         }
+      } catch (e) {
+        console.warn('Pass 2 verification audit skipped:', e);
       }
-
-      if (!blueprintResult) {
-        return res.status(500).json({ error: 'Failed to extract test blueprint from instructions page' });
-      }
-
-      res.json(blueprintResult);
-    } catch (error: any) {
-      console.error('Error extracting test blueprint:', error);
-      res.status(500).json({ error: error.message || 'Internal server error' });
     }
-  });
 
-  // API Route for Gemini Multi-modal PDF analysis
-  app.post('/api/extract-pdf-structure', async (req, res) => {
-    try {
-      const { images, pageOffset = 0, options = {} } = req.body;
-      const { hasAnswerKey = true, extractEnglishOnly = false } = options;
-      
-      if (!images || !images.length) {
-        return res.status(400).json({ error: 'No images provided' });
-      }
-
-      const authHeader = req.headers.authorization;
-      const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
-      const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
-
-      if (!apiKey) {
-        return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
-      }
-
-      const ai = new GoogleGenAI({ 
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
-        }
-      });
-
-      const contents = images.map((base64: string) => {
-        const isJpeg = base64.startsWith('data:image/jpeg');
-        return {
-          inlineData: {
-            data: base64.replace(/^data:image\/\w+;base64,/, ''),
-            mimeType: isJpeg ? 'image/jpeg' : 'image/png'
-          }
-        };
-      });
-
-      // Define the schema for structured output with split questions and option completeness support
-      const responseSchema: Schema = {
-        type: Type.OBJECT,
-        properties: {
-          testTitle: { type: Type.STRING, description: "Title of the test paper if found" },
-          durationMinutes: { type: Type.INTEGER, description: "Duration in minutes if found" },
-          totalMarks: { type: Type.INTEGER, description: "Maximum marks if found" },
-          questions: {
-            type: Type.ARRAY,
-            description: "List of all questions found in the images in sequential order",
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                pageIndex: { type: Type.INTEGER, description: "0-based index of the page within this batch where question starts" },
-                qNo: { type: Type.INTEGER, description: "The printed question number (e.g. 1, 2, 3...)" },
-                subject: { type: Type.STRING, description: "Subject of the question (e.g., Physics, Chemistry, Mathematics, Biology, General)" },
-                type: { type: Type.STRING, description: "Type of the question: MCQ_SINGLE, MCQ_MULTIPLE, NUMERICAL, MATRIX_MATCH" },
-                box: {
-                  type: Type.ARRAY,
-                  description: "Primary bounding box [ymin, xmin, ymax, xmax] normalized between 0.0 and 1.0",
-                  items: { type: Type.NUMBER }
-                },
-                optionsFound: {
-                  type: Type.ARRAY,
-                  description: "List of option labels detected inside this question, e.g. ['(A)', '(B)', '(C)', '(D)'] or ['(1)', '(2)', '(3)', '(4)']",
-                  items: { type: Type.STRING }
-                },
-                completeness: {
-                  type: Type.STRING,
-                  description: "'complete' (all options/stems present), 'split' (spills over into next column/page), 'missing_options' (options could not be located)"
-                },
-                isSplit: { type: Type.BOOLEAN, description: "True if question is split across columns or pages" },
-                splitParts: {
-                  type: Type.ARRAY,
-                  description: "Ordered bounding boxes for multi-column or multi-page split parts",
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      pageIndex: { type: Type.INTEGER, description: "0-based index of the page for this part" },
-                      box: {
-                        type: Type.ARRAY,
-                        description: "[ymin, xmin, ymax, xmax] normalized bounds for this part",
-                        items: { type: Type.NUMBER }
-                      },
-                      partLabel: { type: Type.STRING, description: "e.g. 'Part 1 (Stem & Diagram)', 'Part 2 (Options A-D)'" }
-                    },
-                    required: ["pageIndex", "box"]
-                  }
-                },
-                isOrphanContinuation: {
-                  type: Type.BOOLEAN,
-                  description: "True if this block was found at the top of a column/page continuing the previous question"
-                },
-                continuationForQNo: {
-                  type: Type.INTEGER,
-                  description: "If this block contains orphaned options from previous column/page, the question number it belongs to"
-                }
-              },
-              required: ["pageIndex", "qNo", "subject", "type", "box"]
-            }
-          },
-          answerKeys: {
-            type: Type.ARRAY,
-            description: "Extracted answer keys if present in these pages. Omit if not found.",
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                qNo: { type: Type.INTEGER },
-                answer: { type: Type.STRING, description: "Correct option(s) or numerical value" }
-              },
-              required: ["qNo", "answer"]
-            }
-          }
-        },
-        required: ["questions"]
-      };
-
-      const prompt = `You are a high-precision exam layout parser for JEE / NEET / CBSE test papers.
-Analyze the provided page images (up to 2-3 pages per batch).
-The document is a test paper with multiple subjects and sequential questions.
-
-CRITICAL INSTRUCTIONS FOR READING ORDER & QUESTION SEQUENCE:
-1. Two-Column Layout: Read columns strictly in top-to-bottom order for the LEFT column first, then top-to-bottom for the RIGHT column.
-2. Extract questions in strict ascending sequence according to printed question numbers (e.g. Q1, Q2, Q3...).
-3. Exclude headers, footers, subject banner titles, and page numbers from question bounding boxes.
-
-MANDATORY PROTOCOL FOR MCQ OPTION COMPLETENESS & CONTINUATION CROSS-CHECK:
-1. Option Completeness Verification:
-   - For every MCQ (Single or Multiple Choice), an exam question MUST contain all its options (usually 4 options: (A), (B), (C), (D) or (1), (2), (3), (4)).
-   - Always list detected options in "optionsFound", e.g. ["(A)", "(B)", "(C)", "(D)"].
-   - If a question near the bottom of a column ends after the problem stem or only contains options (A) and (B):
-     * DO NOT treat it as finished!
-     * DO NOT ignore the rest of the question!
-     * Set "completeness": "split" and "isSplit": true.
-     * Check the top of the next column (or top of the next page) to find the remaining options (e.g. (C) and (D) or (A)–(D)).
-     * Include BOTH parts in "splitParts" in sequence:
-       - Part 1: [ymin, xmin, ymax, xmax] on the starting column/page (containing stem & diagram)
-       - Part 2: [ymin, xmin, ymax, xmax] on the next column/page (containing options A-D / C-D)
-     * For "box", provide the primary bounding box enclosing Part 1.
-
-2. Orphaned Continuation & Top-of-Column Cross-Check:
-   - When you start reading a new column or a new page from the top, BEFORE assuming a new question starts, check what is at the top of that column:
-   - If the top of the column begins directly with options (e.g. "(C)... (D)..." or "(A)... (B)... (C)... (D)...") or continuation text WITHOUT a new question number like "Q15":
-     * THIS CONTENT BELONGS TO THE PREVIOUS QUESTION (e.g. Q14)!
-     * DO NOT discard or skip it!
-     * DO NOT start the next question until you have linked this top block to the preceding question's "splitParts".
-     * If the preceding question was already recorded, mark this block as "isOrphanContinuation": true, "continuationForQNo": <previous_question_number>, and attach it to that question's splitParts.
-
-3. Cross-Check Before Starting Next Question:
-   - When you encounter a new question number (e.g. Q15), verify that the space ABOVE it on that column was not an uncaptured continuation of Q14.
-   - If the previous question (Q14) had missing options, link the text above Q15 to Q14.
-
-${extractEnglishOnly ? 'BILINGUAL PAPER DETECTED: This paper contains questions in two languages (e.g. Hindi and English). You MUST extract ONLY the English version of the questions. Ensure your bounding box ONLY surrounds the English text and options.' : ''}
-
-For each question, find its precise bounding box enclosing the question text, all math equations, diagrams, and options.
-The bounding box format is [ymin, xmin, ymax, xmax] normalized between 0.0 and 1.0 (where 0,0 is top-left and 1,1 is bottom-right).
-
-${hasAnswerKey ? 'If there is an answer key table present on these pages, extract those answers as well.' : 'Do NOT look for or extract answer keys, as they are not present.'}`;
-
-      // Official supported model list in priority order
-      const MODELS_TO_TRY = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-      let jsonStr = '';
-      let lastError: any = null;
-
-      for (const model of MODELS_TO_TRY) {
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            console.log(`Sending batch extraction request to model ${model} (attempt ${attempt})...`);
-            const response = await ai.models.generateContent({
-              model,
-              contents: [
-                ...contents,
-                { text: prompt }
-              ],
-              config: {
-                responseMimeType: 'application/json',
-                responseSchema: responseSchema,
-                temperature: 0.1,
-              }
-            });
-
-            if (response.text) {
-              jsonStr = response.text;
-              break;
-            }
-          } catch (err: any) {
-            lastError = err;
-            const errStr = String(err?.message || '');
-            const isTransient = err?.status === 503 || err?.code === 503 || err?.status === 429 || err?.code === 429 || errStr.includes('503') || errStr.includes('high demand') || errStr.includes('UNAVAILABLE') || errStr.includes('RESOURCE_EXHAUSTED');
-
-            if (isTransient) {
-              console.warn(`Model ${model} attempt ${attempt} failed with transient error: ${errStr}. Retrying in ${attempt * 1000}ms...`);
-              await new Promise((r) => setTimeout(r, attempt * 1000));
-            } else {
-              console.warn(`Model ${model} failed with non-transient error: ${errStr}. Trying fallback model...`);
-              break;
-            }
-          }
-        }
-        if (jsonStr) break;
-      }
-
-      if (!jsonStr) {
-        throw lastError || new Error('All Gemini model fallback attempts failed');
-      }
-
-      const parsed = JSON.parse(jsonStr);
-
-      // PASS 2 STRUCTURE VERIFICATION AUDIT RESCAN FOR QUESTION PAPERS
-      if (options.enableDoublePass !== false && parsed.questions && parsed.questions.length > 0) {
-        try {
-          console.log(`Executing Pass 2 Structure Verification Audit for ${parsed.questions.length} detected questions...`);
-          const rescanPrompt = `PASS 2 STRUCTURE VERIFICATION RESCAN AUDIT (PASS 2/2):
-Below is the initial layout extraction from Pass 1 for this page batch:
-${JSON.stringify(parsed.questions)}
-
-CRITICAL VERIFICATION AUDIT TASKS:
-1. SEQUENCE & MISSING QUESTION AUDIT: Inspect the numerical sequence of question numbers. If any question number was skipped or missed (e.g. Q1..Q5 are present but Q3 was missed), locate Q3 on the page image and include its bounding box and metadata.
-2. OPTION COMPLETENESS: Confirm that every MCQ has all its options (e.g. (A), (B), (C), (D)). If options spill over into the next column/page, confirm 'isSplit' and 'splitParts'.
-3. QUESTION TYPES: Verify MCQ vs MCQ_MULTIPLE vs NUMERICAL vs MATRIX_MATCH matches the section headers.
-Return the complete, audited JSON structure.`;
-
-          for (const model of MODELS_TO_TRY) {
-            try {
-              const rescanResp = await ai.models.generateContent({
-                model,
-                contents: [...contents, { text: rescanPrompt }],
-                config: {
-                  responseMimeType: 'application/json',
-                  responseSchema: responseSchema,
-                  temperature: 0.0,
-                }
-              });
-              if (rescanResp.text) {
-                const audited = JSON.parse(rescanResp.text);
-                if (audited && audited.questions && audited.questions.length >= parsed.questions.length) {
-                  console.log(`Pass 2 Structure Audit successful. Questions verified: ${audited.questions.length}`);
-                  parsed.questions = audited.questions;
-                  if (audited.testTitle) parsed.testTitle = audited.testTitle;
-                  if (audited.answerKeys) parsed.answerKeys = audited.answerKeys;
-                }
-                break;
-              }
-            } catch (e: any) {
-              console.warn(`Pass 2 structure audit failed on model ${model}:`, e.message);
-            }
-          }
-        } catch (e) {
-          console.warn('Pass 2 structure verification audit skipped due to error:', e);
-        }
-      }
-
-      // Adjust pageIndex by pageOffset for seamless chunk merging
-      if (parsed.questions && Array.isArray(parsed.questions)) {
-        parsed.questions = parsed.questions.map((q: any) => ({
-          ...q,
-          pageIndex: (typeof q.pageIndex === 'number' ? q.pageIndex : 0) + pageOffset
-        }));
-      }
-
-      res.json(parsed);
-    } catch (error: any) {
-      console.error('Error extracting PDF structure:', error);
-      res.status(500).json({ error: error.message || 'Internal server error' });
+    // Adjust pageIndex by pageOffset for seamless chunk merging (for both main question and splitParts)
+    if (parsed.questions && Array.isArray(parsed.questions)) {
+      parsed.questions = parsed.questions.map((q: any) => ({
+        ...q,
+        pageIndex: (typeof q.pageIndex === 'number' ? q.pageIndex : 0) + pageOffset,
+        splitParts: Array.isArray(q.splitParts)
+          ? q.splitParts.map((sp: any) => ({
+              ...sp,
+              pageIndex: (typeof sp.pageIndex === 'number' ? sp.pageIndex : 0) + pageOffset
+            }))
+          : q.splitParts
+      }));
     }
-  });
 
-  // API Route to detect the precise bounding box of a single question on a page image
-  app.post('/api/detect-question-box', async (req, res) => {
-    try {
-      const { image, qNo, promptHint = '' } = req.body;
-      if (!image) {
-        return res.status(400).json({ error: 'Page image is required' });
-      }
+    res.json(parsed);
+  } catch (error: any) {
+    console.error('Error extracting PDF structure:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
 
-      const authHeader = req.headers.authorization;
-      const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
-      const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+// API Route to detect the precise bounding box of a single question on a page image
+app.post('/api/detect-question-box', async (req, res) => {
+  try {
+    const { image, qNo, promptHint = '' } = req.body;
+    if (!image) {
+      return res.status(400).json({ error: 'Page image is required' });
+    }
 
-      if (!apiKey) {
-        return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
-      }
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
 
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-      });
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
 
-      const isJpeg = image.startsWith('data:image/jpeg');
-      const inlineData = {
-        data: image.replace(/^data:image\/\w+;base64,/, ''),
-        mimeType: isJpeg ? 'image/jpeg' : 'image/png'
-      };
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
 
-      const detectSchema: Schema = {
-        type: Type.OBJECT,
-        properties: {
-          found: { type: Type.BOOLEAN, description: "Whether the requested question was found on this page image" },
-          box: {
-            type: Type.ARRAY,
-            description: "Normalized bounding box [ymin, xmin, ymax, xmax] between 0.0 and 1.0 enclosing the entire question (question text, math equations, diagrams, and options)",
-            items: { type: Type.NUMBER }
-          },
-          detectedQNo: { type: Type.INTEGER, description: "The question number identified" },
-          subject: { type: Type.STRING, description: "Detected subject name" },
-          type: { type: Type.STRING, description: "One of: MCQ_SINGLE, MCQ_MULTIPLE, NUMERICAL, MATRIX_MATCH" }
+    const isJpeg = image.startsWith('data:image/jpeg');
+    const inlineData = {
+      data: image.replace(/^data:image\/\w+;base64,/, ''),
+      mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+    };
+
+    const detectSchema: Schema = {
+      type: Type.OBJECT,
+      properties: {
+        found: { type: Type.BOOLEAN, description: "Whether the requested question was found on this page image" },
+        box: {
+          type: Type.ARRAY,
+          description: "Normalized bounding box [ymin, xmin, ymax, xmax] between 0.0 and 1.0 enclosing the entire question (question text, math equations, diagrams, and options)",
+          items: { type: Type.NUMBER }
         },
-        required: ["found", "box"]
-      };
+        detectedQNo: { type: Type.INTEGER, description: "The question number identified" },
+        subject: { type: Type.STRING, description: "Detected subject name" },
+        type: { type: Type.STRING, description: "One of: MCQ_SINGLE, MCQ_MULTIPLE, NUMERICAL, MATRIX_MATCH" }
+      },
+      required: ["found", "box"]
+    };
 
-      const prompt = `You are a precision layout detection specialist for exam papers.
+    const prompt = `You are a precision layout detection specialist for exam papers.
 Locate Question ${qNo ? `Number ${qNo}` : 'the primary question'} on this page image.
 ${promptHint ? `User guidance: "${promptHint}".` : ''}
 Exclude headers, footers, page numbering, or adjacent questions.
 Output the precise normalized bounding box [ymin, xmin, ymax, xmax] (0.0 to 1.0) enclosing ALL parts of this question: text, formulas, diagrams, and options A/B/C/D or 1/2/3/4.`;
 
-      const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-      let resultData: any = null;
+    const resultData = await executeGeminiWithFallback(ai, {
+      contents: [{ inlineData }, { text: prompt }],
+      schema: detectSchema,
+      temperature: 0.1,
+      label: 'Server Detect Question Box'
+    });
 
-      for (const model of MODELS) {
-        try {
-          const resp = await ai.models.generateContent({
-            model,
-            contents: [
-              { inlineData },
-              { text: prompt }
-            ],
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: detectSchema,
-              temperature: 0.1
-            }
-          });
-          if (resp.text) {
-            resultData = JSON.parse(resp.text);
-            break;
-          }
-        } catch (e: any) {
-          console.warn(`detect-question-box failed on model ${model}:`, e.message);
-        }
-      }
+    res.json(resultData);
+  } catch (error: any) {
+    console.error('Error in detect-question-box:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
 
-      if (!resultData) {
-        return res.status(500).json({ error: 'Failed to detect question box with AI' });
-      }
-
-      res.json(resultData);
-    } catch (error: any) {
-      console.error('Error in detect-question-box:', error);
-      res.status(500).json({ error: error.message || 'Internal server error' });
+// API Route to analyze & repair a question image slice (OCR, Question Type, Answer Key, Marking Scheme)
+app.post('/api/analyze-question-image', async (req, res) => {
+  try {
+    const { images, currentQuestion = {} } = req.body;
+    if (!images || !images.length) {
+      return res.status(400).json({ error: 'Question image is required' });
     }
-  });
 
-  // API Route to analyze & repair a question image slice (OCR, Question Type, Answer Key, Marking Scheme)
-  app.post('/api/analyze-question-image', async (req, res) => {
-    try {
-      const { images, currentQuestion = {} } = req.body;
-      if (!images || !images.length) {
-        return res.status(400).json({ error: 'Question image is required' });
-      }
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
 
-      const authHeader = req.headers.authorization;
-      const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
-      const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
 
-      if (!apiKey) {
-        return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
-      }
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
 
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-      });
-
-      const contents = images.map((base64: string) => {
-        const isJpeg = base64.startsWith('data:image/jpeg');
-        return {
-          inlineData: {
-            data: base64.replace(/^data:image\/\w+;base64,/, ''),
-            mimeType: isJpeg ? 'image/jpeg' : 'image/png'
-          }
-        };
-      });
-
-      const repairSchema: Schema = {
-        type: Type.OBJECT,
-        properties: {
-          detectedType: { 
-            type: Type.STRING, 
-            description: "Strictly one of: mcq (Single Correct), msq (Multiple Correct), nat (Numerical / Integer), msm (Matrix Match)" 
-          },
-          detectedQNo: { type: Type.INTEGER, description: "Question sequence number if visible" },
-          detectedAnswer: { type: Type.STRING, description: "Detected answer key or options (e.g. '3', '1,3,4', '24.5', 'A->P,Q; B->R') if discernible from solution/marking, else empty string" },
-          marks: {
-            type: Type.OBJECT,
-            properties: {
-              cm: { type: Type.NUMBER, description: "Correct marks (e.g. 4 or 3)" },
-              im: { type: Type.NUMBER, description: "Negative marks (e.g. -1 or -2)" },
-              pm: { type: Type.NUMBER, description: "Partial marks per option" },
-              max: { type: Type.NUMBER, description: "Max marks" }
-            },
-            required: ["cm", "im"]
-          },
-          latexSummary: { type: Type.STRING, description: "Clean LaTeX / text representation of the question statement and formulas" },
-          optionsList: {
-            type: Type.ARRAY,
-            description: "List of options (A, B, C, D) if MCQ/MSQ",
-            items: { type: Type.STRING }
-          },
-          qualityIssues: {
-            type: Type.ARRAY,
-            description: "Any detected quality problems (e.g., 'Clipped diagram at bottom', 'Low scan resolution', 'Bilingual overlapping text', 'Cutoff option D')",
-            items: { type: Type.STRING }
-          },
-          isClean: { type: Type.BOOLEAN, description: "Whether the question image is complete and clear" },
-          recommendations: { type: Type.STRING, description: "Helpful recommendations for the teacher/editor" }
-        },
-        required: ["detectedType", "marks", "latexSummary", "isClean"]
+    const contents = images.map((base64: string) => {
+      const isJpeg = base64.startsWith('data:image/jpeg');
+      return {
+        inlineData: {
+          data: base64.replace(/^data:image\/\w+;base64,/, ''),
+          mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+        }
       };
+    });
 
-      const prompt = `You are a senior exam paper reviewer and OCR specialist for JEE Advanced / NEET / CBT exams.
+    const repairSchema: Schema = {
+      type: Type.OBJECT,
+      properties: {
+        detectedType: { 
+          type: Type.STRING, 
+          description: "Strictly one of: mcq (Single Correct), msq (Multiple Correct), nat (Numerical / Integer), msm (Matrix Match)" 
+        },
+        detectedQNo: { type: Type.INTEGER, description: "Question sequence number if visible" },
+        detectedAnswer: { type: Type.STRING, description: "Detected answer key or options (e.g. '3', '1,3,4', '24.5', 'A->P,Q; B->R') if discernible from solution/marking, else empty string" },
+        marks: {
+          type: Type.OBJECT,
+          properties: {
+            cm: { type: Type.NUMBER, description: "Correct marks (e.g. 4 or 3)" },
+            im: { type: Type.NUMBER, description: "Negative marks (e.g. -1 or -2)" },
+            pm: { type: Type.NUMBER, description: "Partial marks per option" },
+            max: { type: Type.NUMBER, description: "Max marks" }
+          },
+          required: ["cm", "im"]
+        },
+        latexSummary: { type: Type.STRING, description: "Clean LaTeX / text representation of the question statement and formulas" },
+        optionsList: {
+          type: Type.ARRAY,
+          description: "List of options (A, B, C, D) if MCQ/MSQ",
+          items: { type: Type.STRING }
+        },
+        qualityIssues: {
+          type: Type.ARRAY,
+          description: "Any detected quality problems (e.g., 'Clipped diagram at bottom', 'Low scan resolution', 'Bilingual overlapping text', 'Cutoff option D')",
+          items: { type: Type.STRING }
+        },
+        isClean: { type: Type.BOOLEAN, description: "Whether the question image is complete and clear" },
+        recommendations: { type: Type.STRING, description: "Helpful recommendations for the teacher/editor" }
+      },
+      required: ["detectedType", "marks", "latexSummary", "isClean"]
+    };
+
+    const prompt = `You are a senior exam paper reviewer and OCR specialist for JEE Advanced / NEET / CBT exams.
 Examine this question slice carefully.
 Current question metadata: ${JSON.stringify(currentQuestion)}.
 
@@ -581,112 +530,89 @@ Perform a thorough diagnostic:
 3. Check for any flaws: is any part of the question text or options clipped off? Is the diagram incomplete?
 4. Recommend standard marking scheme for this exam type.`;
 
-      const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-      let resultData: any = null;
+    const resultData = await executeGeminiWithFallback(ai, {
+      contents: [...contents, { text: prompt }],
+      schema: repairSchema,
+      temperature: 0.1,
+      label: 'Server Analyze Question Image'
+    });
 
-      for (const model of MODELS) {
-        try {
-          const resp = await ai.models.generateContent({
-            model,
-            contents: [
-              ...contents,
-              { text: prompt }
-            ],
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: repairSchema,
-              temperature: 0.1
-            }
-          });
-          if (resp.text) {
-            resultData = JSON.parse(resp.text);
-            break;
-          }
-        } catch (e: any) {
-          console.warn(`analyze-question-image failed on model ${model}:`, e.message);
-        }
-      }
+    res.json(resultData);
+  } catch (error: any) {
+    console.error('Error in analyze-question-image:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
 
-      if (!resultData) {
-        return res.status(500).json({ error: 'Failed to analyze question with AI' });
-      }
-
-      res.json(resultData);
-    } catch (error: any) {
-      console.error('Error in analyze-question-image:', error);
-      res.status(500).json({ error: error.message || 'Internal server error' });
+// API Route to extract Answer Key table & verify types from single or multi-page Answer Key PDF images
+app.post('/api/extract-answer-key-pdf', async (req, res) => {
+  try {
+    const { images, text = '', context = {} } = req.body;
+    if ((!images || !images.length) && !text) {
+      return res.status(400).json({ error: 'Answer key page image or text is required' });
     }
-  });
 
-  // API Route to extract Answer Key table & verify types from single or multi-page Answer Key PDF images
-  app.post('/api/extract-answer-key-pdf', async (req, res) => {
-    try {
-      const { images, text = '', context = {} } = req.body;
-      if ((!images || !images.length) && !text) {
-        return res.status(400).json({ error: 'Answer key page image or text is required' });
-      }
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
 
-      const authHeader = req.headers.authorization;
-      const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
-      const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
 
-      if (!apiKey) {
-        return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
-      }
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
 
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-      });
-
-      const contents: any[] = [];
-      if (images && Array.isArray(images)) {
-        images.forEach((img: string) => {
-          const isJpeg = img.startsWith('data:image/jpeg');
-          contents.push({
-            inlineData: {
-              data: img.replace(/^data:image\/\w+;base64,/, ''),
-              mimeType: isJpeg ? 'image/jpeg' : 'image/png'
-            }
-          });
+    const contents: any[] = [];
+    if (images && Array.isArray(images)) {
+      images.forEach((img: string) => {
+        const isJpeg = img.startsWith('data:image/jpeg');
+        contents.push({
+          inlineData: {
+            data: img.replace(/^data:image\/\w+;base64,/, ''),
+            mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+          }
         });
-      }
+      });
+    }
 
-      if (text) {
-        contents.push({ text: `Raw Answer Key Text / OCR:\n${text}` });
-      }
+    if (text) {
+      contents.push({ text: `Raw Answer Key Text / OCR:\n${text}` });
+    }
 
-      const keySchema: Schema = {
-        type: Type.OBJECT,
-        properties: {
-          answers: {
-            type: Type.ARRAY,
-            description: "Extracted question-to-answer mappings with verified question types",
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                qNo: { type: Type.INTEGER, description: "Question sequence number (1, 2, 3...)" },
-                answer: { type: Type.STRING, description: "Raw answer string as printed (e.g. 'A', 'B,D', '32', '3.14', 'A->P; B->Q')" },
-                normalizedAnswer: { type: Type.STRING, description: "Standard CBT answer string: 1-based index for MCQ ('1','2','3','4'), comma-separated indices for MSQ ('1,3'), exact numerical for NAT ('32'), or mapping for MSM ('A->P; B->Q')" },
-                letterAnswer: { type: Type.STRING, description: "Standard letter format (e.g. 'A', 'A,C', '32', 'A->P; B->Q')" },
-                inferredType: { 
-                  type: Type.STRING, 
-                  description: "Question type inferred from answer: 'mcq' (Single option A/B/C/D or 1/2/3/4), 'msq' (Multiple options e.g. A,C or 1,3), 'nat' (Numerical integer/decimal value e.g. 24 or 3.14), 'msm' (Matrix match mapping e.g. A->P; B->Q)" 
-                },
-                subject: { type: Type.STRING, description: "Subject name (Physics, Chemistry, Mathematics, Biology) if indicated" },
-                confidence: { type: Type.NUMBER, description: "Detection confidence score between 0 and 100" }
+    const keySchema: Schema = {
+      type: Type.OBJECT,
+      properties: {
+        answers: {
+          type: Type.ARRAY,
+          description: "Extracted question-to-answer mappings with verified question types",
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              qNo: { type: Type.INTEGER, description: "Question sequence number (1, 2, 3...)" },
+              answer: { type: Type.STRING, description: "Raw answer string as printed (e.g. 'A', 'B,D', '32', '3.14', 'A->P; B->Q')" },
+              normalizedAnswer: { type: Type.STRING, description: "Standard CBT answer string: 1-based index for MCQ ('1','2','3','4'), comma-separated indices for MSQ ('1,3'), exact numerical for NAT ('32'), or mapping for MSM ('A->P; B->Q')" },
+              letterAnswer: { type: Type.STRING, description: "Standard letter format (e.g. 'A', 'A,C', '32', 'A->P; B->Q')" },
+              inferredType: { 
+                type: Type.STRING, 
+                description: "Question type inferred from answer: 'mcq' (Single option A/B/C/D or 1/2/3/4), 'msq' (Multiple options e.g. A,C or 1,3), 'nat' (Numerical integer/decimal value e.g. 24 or 3.14), 'msm' (Matrix match mapping e.g. A->P; B->Q)" 
               },
-              required: ["qNo", "answer", "normalizedAnswer", "inferredType"]
-            }
-          },
-          tableName: { type: Type.STRING, description: "Title or header of the answer key table (e.g. 'Official Answer Key - JEE Advanced Paper 1')" },
-          totalQuestionsDetected: { type: Type.INTEGER, description: "Total number of answer entries identified" },
-          summary: { type: Type.STRING, description: "Concise summary of detected subjects, total answers, and type breakdown" }
+              subject: { type: Type.STRING, description: "Subject name (Physics, Chemistry, Mathematics, Biology) if indicated" },
+              confidence: { type: Type.NUMBER, description: "Detection confidence score between 0 and 100" }
+            },
+            required: ["qNo", "answer", "normalizedAnswer", "inferredType"]
+          }
         },
-        required: ["answers"]
-      };
+        tableName: { type: Type.STRING, description: "Title or header of the answer key table (e.g. 'Official Answer Key - JEE Advanced Paper 1')" },
+        totalQuestionsDetected: { type: Type.INTEGER, description: "Total number of answer entries identified" },
+        summary: { type: Type.STRING, description: "Concise summary of detected subjects, total answers, and type breakdown" }
+      },
+      required: ["answers"]
+    };
 
-      const prompt = `You are an expert exam key parser and question type validator for JEE Advanced, JEE Main, NEET, and CBT exam papers.
+    const prompt = `You are an expert exam key parser and question type validator for JEE Advanced, JEE Main, NEET, and CBT exam papers.
 Analyze this Answer Key document / page images thoroughly.
 
 CRITICAL PARSING & INFERENCE RULES:
@@ -704,40 +630,20 @@ CRITICAL PARSING & INFERENCE RULES:
 ${context?.totalQuestions ? `Expected Question Count in Paper: ${context.totalQuestions}.` : ''}
 ${context?.subjects ? `Expected Subjects: ${JSON.stringify(context.subjects)}.` : ''}`;
 
-      contents.push({ text: prompt });
+    contents.push({ text: prompt });
 
-      const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-      let resultData: any = null;
+    let resultData = await executeGeminiWithFallback(ai, {
+      contents,
+      schema: keySchema,
+      temperature: 0.1,
+      label: 'Server Extract Answer Key PDF'
+    });
 
-      for (const model of MODELS) {
-        try {
-          const resp = await ai.models.generateContent({
-            model,
-            contents,
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: keySchema,
-              temperature: 0.1
-            }
-          });
-          if (resp.text) {
-            resultData = JSON.parse(resp.text);
-            break;
-          }
-        } catch (e: any) {
-          console.warn(`extract-answer-key-pdf failed on model ${model}:`, e.message);
-        }
-      }
-
-      if (!resultData) {
-        return res.status(500).json({ error: 'Failed to parse Answer Key PDF with AI' });
-      }
-
-      // PASS 2: VERIFICATION RESCAN AUDIT PASS FOR HIGH ACCURACY
-      if (req.body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
-        try {
-          console.log(`Executing Pass 2 Answer Key Verification Audit Rescan on ${resultData.answers.length} extracted items...`);
-          const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
+    // PASS 2: VERIFICATION RESCAN AUDIT PASS FOR HIGH ACCURACY
+    if (req.body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
+      try {
+        console.log(`Executing Pass 2 Answer Key Verification Audit Rescan on ${resultData.answers.length} extracted items...`);
+        const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
 Below is the initial raw answer key extracted from Pass 1:
 ${JSON.stringify(resultData.answers.slice(0, 150))}
 
@@ -751,170 +657,123 @@ CRITICAL VERIFICATION TASKS FOR PASS 2:
 3. FIX OCR TYPOS: Correct common OCR confusion: 'O'->'0', 'I'->'1', 'B'->'8', 'S'->'5', 'BD'->'B,D'.
 Return the complete, audited and verified answer key mapping.`;
 
-          const auditContents = [
-            ...contents.filter((c: any) => c.inlineData || c.text?.startsWith('Raw Answer Key Text')),
-            { text: auditPrompt }
-          ];
+        const auditContents = [
+          ...contents.filter((c: any) => c.inlineData || c.text?.startsWith('Raw Answer Key Text')),
+          { text: auditPrompt }
+        ];
 
-          for (const model of MODELS) {
-            try {
-              const resp = await ai.models.generateContent({
-                model,
-                contents: auditContents,
-                config: {
-                  responseMimeType: 'application/json',
-                  responseSchema: keySchema,
-                  temperature: 0.0
-                }
-              });
-              if (resp.text) {
-                const audited = JSON.parse(resp.text);
-                if (audited && audited.answers && audited.answers.length >= resultData.answers.length) {
-                  console.log(`Pass 2 Verification Audit successful. Items verified: ${audited.answers.length}`);
-                  resultData = audited;
-                }
-                break;
-              }
-            } catch (e: any) {
-              console.warn(`Pass 2 audit failed on model ${model}:`, e.message);
-            }
-          }
-        } catch (e) {
-          console.warn('Pass 2 answer key verification pass skipped due to error:', e);
+        const audited = await executeGeminiWithFallback(ai, {
+          contents: auditContents,
+          schema: keySchema,
+          temperature: 0.0,
+          label: 'Server Pass 2 Answer Key Audit'
+        });
+
+        if (audited && audited.answers && audited.answers.length >= resultData.answers.length) {
+          console.log(`Pass 2 Verification Audit successful. Items verified: ${audited.answers.length}`);
+          resultData = audited;
         }
+      } catch (e) {
+        console.warn('Pass 2 answer key verification pass skipped due to error:', e);
       }
-
-      res.json(resultData);
-    } catch (error: any) {
-      console.error('Error in extract-answer-key-pdf:', error);
-      res.status(500).json({ error: error.message || 'Internal server error' });
     }
-  });
 
-  // API Route to extract Answer Key table from a dedicated page
-  app.post('/api/extract-answer-key-page', async (req, res) => {
-    try {
-      const { image } = req.body;
-      if (!image) {
-        return res.status(400).json({ error: 'Page image is required' });
-      }
+    res.json(resultData);
+  } catch (error: any) {
+    console.error('Error in extract-answer-key-pdf:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
 
-      const authHeader = req.headers.authorization;
-      const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
-      const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+// API Route to extract Answer Key table from a dedicated page
+app.post('/api/extract-answer-key-page', async (req, res) => {
+  try {
+    const { image } = req.body;
+    if (!image) {
+      return res.status(400).json({ error: 'Page image is required' });
+    }
 
-      if (!apiKey) {
-        return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
-      }
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
 
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-      });
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
 
-      const isJpeg = image.startsWith('data:image/jpeg');
-      const inlineData = {
-        data: image.replace(/^data:image\/\w+;base64,/, ''),
-        mimeType: isJpeg ? 'image/jpeg' : 'image/png'
-      };
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
 
-      const keySchema: Schema = {
-        type: Type.OBJECT,
-        properties: {
-          answers: {
-            type: Type.ARRAY,
-            description: "Extracted question-to-answer mappings",
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                qNo: { type: Type.INTEGER, description: "Question number" },
-                answer: { type: Type.STRING, description: "Answer option(s) e.g. '1', 'A', '1,3', '5.2', 'A->P; B->Q'" },
-                subject: { type: Type.STRING, description: "Subject name if listed in the table" }
-              },
-              required: ["qNo", "answer"]
-            }
-          },
-          tableName: { type: Type.STRING, description: "Title or header of the answer key table" }
+    const isJpeg = image.startsWith('data:image/jpeg');
+    const inlineData = {
+      data: image.replace(/^data:image\/\w+;base64,/, ''),
+      mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+    };
+
+    const keySchema: Schema = {
+      type: Type.OBJECT,
+      properties: {
+        answers: {
+          type: Type.ARRAY,
+          description: "Extracted question-to-answer mappings",
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              qNo: { type: Type.INTEGER, description: "Question number" },
+              answer: { type: Type.STRING, description: "Answer option(s) e.g. '1', 'A', '1,3', '5.2', 'A->P; B->Q'" },
+              subject: { type: Type.STRING, description: "Subject name if listed in the table" }
+            },
+            required: ["qNo", "answer"]
+          }
         },
-        required: ["answers"]
-      };
+        tableName: { type: Type.STRING, description: "Title or header of the answer key table" }
+      },
+      required: ["answers"]
+    };
 
-      const prompt = `Extract all answers from this answer key table page image.
+    const prompt = `Extract all answers from this answer key table page image.
 Parse all question numbers (1, 2, 3...) and their corresponding answers (A, B, C, D or 1, 2, 3, 4 or numerical values).
 Support multi-column tables, grids, and matrix match keys. Output complete and accurate answer pairs.`;
 
-      const MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash'];
-      let resultData: any = null;
+    let resultData = await executeGeminiWithFallback(ai, {
+      contents: [{ inlineData }, { text: prompt }],
+      schema: keySchema,
+      temperature: 0.1,
+      label: 'Server Extract Answer Key Page'
+    });
 
-      for (const model of MODELS) {
-        try {
-          const resp = await ai.models.generateContent({
-            model,
-            contents: [
-              { inlineData },
-              { text: prompt }
-            ],
-            config: {
-              responseMimeType: 'application/json',
-              responseSchema: keySchema,
-              temperature: 0.1
-            }
-          });
-          if (resp.text) {
-            resultData = JSON.parse(resp.text);
-            break;
-          }
-        } catch (e: any) {
-          console.warn(`extract-answer-key-page failed on model ${model}:`, e.message);
-        }
-      }
-
-      if (!resultData) {
-        return res.status(500).json({ error: 'Failed to parse answer key page with AI' });
-      }
-
-      // PASS 2: VERIFICATION AUDIT RESCAN
-      if (req.body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
-        try {
-          const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
+    // PASS 2: VERIFICATION AUDIT RESCAN
+    if (req.body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
+      try {
+        const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
 Below is the initial answer key extracted from Pass 1:
 ${JSON.stringify(resultData.answers.slice(0, 150))}
 
 Verify that NO question numbers are missing, fix OCR typos, and return the audited, complete answer key table.`;
 
-          for (const model of MODELS) {
-            try {
-              const resp = await ai.models.generateContent({
-                model,
-                contents: [{ inlineData }, { text: auditPrompt }],
-                config: {
-                  responseMimeType: 'application/json',
-                  responseSchema: keySchema,
-                  temperature: 0.0
-                }
-              });
-              if (resp.text) {
-                const audited = JSON.parse(resp.text);
-                if (audited && audited.answers && audited.answers.length >= resultData.answers.length) {
-                  resultData = audited;
-                }
-                break;
-              }
-            } catch (e: any) {
-              console.warn(`extract-answer-key-page Pass 2 audit failed on model ${model}:`, e.message);
-            }
-          }
-        } catch (e) {
-          // ignore
-        }
-      }
+        const audited = await executeGeminiWithFallback(ai, {
+          contents: [{ inlineData }, { text: auditPrompt }],
+          schema: keySchema,
+          temperature: 0.0,
+          label: 'Server Pass 2 Answer Key Page Audit'
+        });
 
-      res.json(resultData);
-    } catch (error: any) {
-      console.error('Error in extract-answer-key-page:', error);
-      res.status(500).json({ error: error.message || 'Internal server error' });
+        if (audited && audited.answers && audited.answers.length >= resultData.answers.length) {
+          resultData = audited;
+        }
+      } catch (e) {
+        // ignore
+      }
     }
-  });
+
+    res.json(resultData);
+  } catch (error: any) {
+    console.error('Error in extract-answer-key-page:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {

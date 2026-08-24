@@ -26,7 +26,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { generateId } from '../utils/constants';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { getPdfjsLib } from '../utils/pdfWorkerConfig';
 
 interface QuestionDetection {
   pageIndex: number;
@@ -186,12 +186,7 @@ export const AutoPdfConverterModal: React.FC = () => {
 
       try {
         const arrayBuffer = await selected.arrayBuffer();
-        const pdfjsLib = await import('pdfjs-dist');
-        if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-          pdfjsLib.GlobalWorkerOptions.workerSrc =
-            pdfWorkerUrl ||
-            `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-        }
+        const pdfjsLib = await getPdfjsLib();
         const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
         const numPages = pdfDoc.numPages;
 
@@ -258,12 +253,7 @@ export const AutoPdfConverterModal: React.FC = () => {
       setInstructionsScanStatus('Rendering instruction page...');
 
       const arrayBuffer = await file.arrayBuffer();
-      const pdfjsLib = await import('pdfjs-dist');
-      if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-        pdfjsLib.GlobalWorkerOptions.workerSrc =
-          pdfWorkerUrl ||
-          `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-      }
+      const pdfjsLib = await getPdfjsLib();
       const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       const page = await pdfDoc.getPage(1);
       const viewport = page.getViewport({ scale: 2.0 });
@@ -329,8 +319,12 @@ export const AutoPdfConverterModal: React.FC = () => {
         setBlueprintRanges(newRanges.sort((a, b) => a.fromQNo - b.fromQNo));
       }
     } catch (err: any) {
-      console.error('Scan instructions error:', err);
-      alert(`AI Extraction: ${err.message}`);
+      console.warn('Scan instructions notice:', err?.message || err);
+      addToast({
+        title: 'Instruction Scan Notice',
+        description: err.message || 'Unable to parse instruction blueprint.',
+        type: 'warning',
+      });
     } finally {
       setIsScanningInstructions(false);
       setInstructionsScanStatus('');
@@ -349,14 +343,7 @@ export const AutoPdfConverterModal: React.FC = () => {
       setStatus('Reading PDF file buffer...');
       setProgressDetail('Loading document buffer into memory...');
       const arrayBuffer = await file.arrayBuffer();
-
-      const pdfjsLib = await import('pdfjs-dist');
-      if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-        pdfjsLib.GlobalWorkerOptions.workerSrc =
-          pdfWorkerUrl ||
-          `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-      }
-
+      const pdfjsLib = await getPdfjsLib();
       const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       const numPages = pdfDoc.numPages;
       if (numPages === 0) throw new Error('PDF has no readable pages');
@@ -381,14 +368,19 @@ export const AutoPdfConverterModal: React.FC = () => {
       for (let i = 0; i < pagesToProcess.length; i++) {
         const pageNum = pagesToProcess[i];
         const page = await pdfDoc.getPage(pageNum);
-        const viewport = page.getViewport({ scale: 2.0 }); // Crisp 2.0x scale
+        const viewport = page.getViewport({ scale: 2.6 }); // Ultra-crisp 2.6x scale (185-200 DPI for high-DPI text & math clarity)
 
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         if (!context) throw new Error('Canvas context null');
 
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
+        canvas.width = Math.round(viewport.width);
+        canvas.height = Math.round(viewport.height);
+
+        context.imageSmoothingEnabled = true;
+        context.imageSmoothingQuality = 'high';
+        context.fillStyle = '#ffffff';
+        context.fillRect(0, 0, canvas.width, canvas.height);
 
         await page.render({ canvasContext: context, viewport } as any).promise;
 
@@ -398,7 +390,7 @@ export const AutoPdfConverterModal: React.FC = () => {
 
         const pagePercent = Math.min(35, Math.round(5 + ((i + 1) / pagesToProcess.length) * 30));
         setPercent(pagePercent);
-        setProgressDetail(`Rendered page ${pageNum} (${i + 1}/${pagesToProcess.length})`);
+        setProgressDetail(`Rendered page ${pageNum} (${i + 1}/${pagesToProcess.length}) at 2.6x resolution`);
         updateBackgroundTask({
           percent: pagePercent,
           statusText: `Rendering page ${pageNum} (${i + 1}/${pagesToProcess.length})...`,
@@ -481,69 +473,106 @@ export const AutoPdfConverterModal: React.FC = () => {
       setStatus('Resolving question continuations & option completeness...');
 
       // Pre-pass: Sort and resolve split-question continuations and orphaned option blocks
-      allExtractedQuestions.sort((a, b) => (a.qNo || 0) - (b.qNo || 0));
+      // Step 1: Sort all extracted blocks into physical 2-column reading order:
+      // Page 0 -> Page 1 -> Page 2...
+      // Within page: Left Column (xmin < 0.49) first, then Right Column (xmin >= 0.49).
+      // Within column: Top to Bottom (ymin).
+      allExtractedQuestions.sort((a, b) => {
+        const pA = a.pageIndex ?? 0;
+        const pB = b.pageIndex ?? 0;
+        if (pA !== pB) return pA - pB;
 
+        const colA = (a.box && a.box[1] >= 0.49) ? 1 : 0;
+        const colB = (b.box && b.box[1] >= 0.49) ? 1 : 0;
+        if (colA !== colB) return colA - colB;
+
+        const yA = a.box ? a.box[0] : 0;
+        const yB = b.box ? b.box[0] : 0;
+        return yA - yB;
+      });
+
+      // Step 2: Intelligent Orphan Continuation Detection & Multi-Part Stitching
       const resolvedQuestions: QuestionDetection[] = [];
-      const orphanMap = new Map<number, QuestionDetection[]>();
 
       for (let i = 0; i < allExtractedQuestions.length; i++) {
         const item = allExtractedQuestions[i];
-        if (!item) continue;
+        if (!item || !item.box || item.box.length < 4) continue;
 
-        // If explicitly flagged as orphan continuation or targeted to continue previous question
-        if (item.isOrphanContinuation || (item.continuationForQNo && item.continuationForQNo !== item.qNo)) {
-          const targetQNo =
-            item.continuationForQNo ||
-            (resolvedQuestions.length > 0 ? resolvedQuestions[resolvedQuestions.length - 1].qNo : null);
-          if (targetQNo) {
-            const list = orphanMap.get(targetQNo) || [];
-            list.push(item);
-            orphanMap.set(targetQNo, list);
-            continue; // Do not add as standalone question
+        const prevQ = resolvedQuestions.length > 0 ? resolvedQuestions[resolvedQuestions.length - 1] : null;
+
+        // Check if this item is an orphan continuation:
+        // 1. Explicitly flagged as isOrphanContinuation: true OR continuationForQNo matching prevQ.qNo
+        // 2. Or: has no valid qNo (e.g. 0, null, or same qNo as prevQ) and is situated near the top of the column/page (ymin < 0.38)
+        // 3. Or: prevQ is an MCQ with completeness === 'split' or fewer than 3 options detected, AND this item is at the top of next column/page.
+        const isExplicitOrphan = Boolean(
+          item.isOrphanContinuation ||
+          (item.continuationForQNo && prevQ && item.continuationForQNo === prevQ.qNo)
+        );
+
+        const isUnnumberedTopContinuation = Boolean(
+          prevQ &&
+          (!item.qNo || item.qNo === 0 || item.qNo === prevQ.qNo) &&
+          item.box[0] < 0.38
+        );
+
+        const isSplitPredecessorNeedsOptions = Boolean(
+          prevQ &&
+          handleSplitQuestions &&
+          (prevQ.completeness === 'split' || prevQ.isSplit || (prevQ.type === 'mcq' && (!prevQ.optionsFound || prevQ.optionsFound.length < 3))) &&
+          item.box[0] < 0.38 &&
+          (!item.qNo || item.qNo === prevQ.qNo || (item.optionsFound && item.optionsFound.length >= 1))
+        );
+
+        if (prevQ && (isExplicitOrphan || isUnnumberedTopContinuation || isSplitPredecessorNeedsOptions)) {
+          console.log(`[Split Assembler] Merging continuation box from Page ${item.pageIndex + 1} into Question Q${prevQ.qNo}`);
+          prevQ.isSplit = true;
+          if (!prevQ.splitParts || prevQ.splitParts.length === 0) {
+            prevQ.splitParts = [{ pageIndex: prevQ.pageIndex, box: prevQ.box, partIndex: 1 }];
+          }
+
+          if (item.splitParts && item.splitParts.length > 0) {
+            item.splitParts.forEach((sp) => {
+              prevQ.splitParts!.push({
+                pageIndex: sp.pageIndex,
+                box: sp.box,
+                partIndex: prevQ.splitParts!.length + 1,
+              });
+            });
+          } else {
+            prevQ.splitParts.push({
+              pageIndex: item.pageIndex,
+              box: item.box,
+              partIndex: prevQ.splitParts!.length + 1,
+            });
+          }
+
+          if (item.optionsFound && item.optionsFound.length > 0) {
+            const combined = Array.from(new Set([...(prevQ.optionsFound || []), ...item.optionsFound]));
+            prevQ.optionsFound = combined;
+          }
+          prevQ.completeness = 'complete';
+          continue; // Merged into previous question, do not create duplicate question entry
+        }
+
+        // If item itself is already marked isSplit with splitParts, ensure part 1 is valid
+        if (item.isSplit && item.splitParts && item.splitParts.length > 0) {
+          if (!item.splitParts.some(p => p.pageIndex === item.pageIndex)) {
+            item.splitParts.unshift({ pageIndex: item.pageIndex, box: item.box, partIndex: 1 });
           }
         }
+
         resolvedQuestions.push(item);
       }
 
-      // Merge orphaned parts into target questions
-      resolvedQuestions.forEach((q, idx) => {
-        const qNo = q.qNo || idx + 1;
-        const orphans = orphanMap.get(qNo);
-        if (orphans && orphans.length > 0) {
-          q.isSplit = true;
-          if (!q.splitParts || q.splitParts.length === 0) {
-            q.splitParts = [{ pageIndex: q.pageIndex, box: q.box, partIndex: 1 }];
-          }
-          orphans.forEach((orphan) => {
-            q.splitParts!.push({
-              pageIndex: orphan.pageIndex,
-              box: orphan.box,
-              partIndex: q.splitParts!.length + 1,
-            });
-          });
+      // Step 3: Final sequential numbering fix for any missing / zero Q-numbers
+      let nextExpectedQ = 1;
+      resolvedQuestions.forEach((q) => {
+        if (!q.qNo || q.qNo <= 0) {
+          q.qNo = nextExpectedQ;
+        } else {
+          nextExpectedQ = q.qNo;
         }
-
-        // Cross-check: If MCQ question is incomplete (< 3 options found or flagged 'split') and next item is continuation
-        if (
-          handleSplitQuestions &&
-          (q.completeness === 'split' || (q.type === 'mcq' && q.optionsFound && q.optionsFound.length < 3)) &&
-          idx + 1 < resolvedQuestions.length
-        ) {
-          const nextItem = resolvedQuestions[idx + 1];
-          // If next item has no distinct Q-number or has continuation flag or starts at top of next column
-          if (nextItem && (!nextItem.qNo || nextItem.isOrphanContinuation || nextItem.box[0] < 0.25)) {
-            if (!q.splitParts || q.splitParts.length === 0) {
-              q.splitParts = [{ pageIndex: q.pageIndex, box: q.box, partIndex: 1 }];
-            }
-            q.splitParts.push({
-              pageIndex: nextItem.pageIndex,
-              box: nextItem.box,
-              partIndex: q.splitParts.length + 1,
-            });
-            q.isSplit = true;
-            resolvedQuestions.splice(idx + 1, 1);
-          }
-        }
+        nextExpectedQ++;
       });
 
       setStatus('Cropping questions and allocating strictly via Blueprint Ranges...');
@@ -582,7 +611,7 @@ export const AutoPdfConverterModal: React.FC = () => {
         size: file.size,
       });
 
-      // Helper function to crop a box on a canvas
+      // Helper function to crop a box on a canvas with column-aware padding & zero-clipping safeguards
       const cropBoxFromCanvas = (pageIndex: number, boxCoords: [number, number, number, number]) => {
         const pIdx = typeof pageIndex === 'number' ? Math.max(0, Math.min(canvasImages.length - 1, pageIndex)) : 0;
         const canvas = canvasImages[pIdx] || canvasImages[0];
@@ -592,27 +621,91 @@ export const AutoPdfConverterModal: React.FC = () => {
         ymin = Math.max(0, Math.min(0.98, Number(ymin) || 0));
         xmin = Math.max(0, Math.min(0.98, Number(xmin) || 0));
         ymax = Math.max(ymin + 0.02, Math.min(1, Number(ymax) || 1));
-        xmax = Math.max(xmin + 0.05, Math.min(1, Number(xmax) || 1));
+        xmax = Math.max(xmin + 0.04, Math.min(1, Number(xmax) || 1));
+
+        // Intelligent column layout detection for this question
+        const isLeftCol = xmin < 0.46 && xmax <= 0.52;
+        const isRightCol = xmin >= 0.48;
+        const isFullCol = xmin < 0.25 && xmax > 0.75;
+
+        // Auto-expand bounding box to include printed question number and complete options
+        if (isLeftCol) {
+          // Generously include left margin for question numbers (Q15), clamp right before vertical divider
+          xmin = Math.min(xmin, 0.035);
+          xmax = Math.min(Math.max(xmax, 0.46), 0.490);
+        } else if (isRightCol) {
+          // Start cleanly past the central divider gutter, extend to right page margin
+          xmin = Math.max(Math.min(xmin, 0.53), 0.508);
+          xmax = Math.max(xmax, 0.965);
+        } else if (isFullCol) {
+          xmin = Math.min(xmin, 0.035);
+          xmax = Math.max(xmax, 0.965);
+        }
 
         const pxYmin = Math.floor(ymin * canvas.height);
         const pxXmin = Math.floor(xmin * canvas.width);
         const pxHeight = Math.ceil((ymax - ymin) * canvas.height);
         const pxWidth = Math.ceil((xmax - xmin) * canvas.width);
 
-        const pad = 8;
-        const cropY = Math.max(0, pxYmin - pad);
-        const cropX = Math.max(0, pxXmin - pad);
-        const cropW = Math.min(canvas.width - cropX, Math.max(20, pxWidth + pad * 2));
-        const cropH = Math.min(canvas.height - cropY, Math.max(20, pxHeight + pad * 2));
+        // Safe asymmetric padding: Top 12px, Bottom 22px (prevents cutting bottom options/subscripts), Left 16px, Right 14px
+        const padT = 12;
+        const padB = 22;
+        const padL = 16;
+        const padR = 14;
+
+        let cropY = Math.max(0, pxYmin - padT);
+        let cropX = Math.max(0, pxXmin - padL);
+        let cropW = Math.min(canvas.width - cropX, Math.max(30, pxWidth + padL + padR));
+        let cropH = Math.min(canvas.height - cropY, Math.max(30, pxHeight + padT + padB));
+
+        // Prevent cross-column bleeding across the central vertical divider line
+        if (isLeftCol) {
+          const maxRightPx = Math.floor(canvas.width * 0.495);
+          if (cropX + cropW > maxRightPx) {
+            cropW = Math.max(30, maxRightPx - cropX);
+          }
+        } else if (isRightCol) {
+          const minLeftPx = Math.floor(canvas.width * 0.505);
+          if (cropX < minLeftPx) {
+            const diff = minLeftPx - cropX;
+            cropX = minLeftPx;
+            cropW = Math.max(30, cropW - diff);
+          }
+        }
 
         const cropCanvas = document.createElement('canvas');
         cropCanvas.width = cropW;
         cropCanvas.height = cropH;
         const cropCtx = cropCanvas.getContext('2d');
         if (cropCtx) {
+          cropCtx.imageSmoothingEnabled = true;
+          cropCtx.imageSmoothingQuality = 'high';
           cropCtx.fillStyle = '#ffffff';
           cropCtx.fillRect(0, 0, cropW, cropH);
           cropCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+          // Smooth tone-curve background whitening (preserves anti-aliased font edges & boosts dark ink)
+          const imgData = cropCtx.getImageData(0, 0, cropW, cropH);
+          const data = imgData.data;
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i];
+            const g = data[i + 1];
+            const b = data[i + 2];
+            const avg = (r + g + b) / 3;
+
+            if (avg > 218) {
+              const factor = Math.min(1, (avg - 218) / 37);
+              data[i] = Math.round(r + (255 - r) * factor);
+              data[i + 1] = Math.round(g + (255 - g) * factor);
+              data[i + 2] = Math.round(b + (255 - b) * factor);
+            } else if (avg < 140) {
+              const boost = 0.84;
+              data[i] = Math.round(r * boost);
+              data[i + 1] = Math.round(g * boost);
+              data[i + 2] = Math.round(b * boost);
+            }
+          }
+          cropCtx.putImageData(imgData, 0, 0);
         }
 
         const dataUrl = cropCanvas.toDataURL('image/png');
@@ -642,7 +735,7 @@ export const AutoPdfConverterModal: React.FC = () => {
           return { blob, blobUrl: URL.createObjectURL(blob) };
         }
 
-        const gap = 12;
+        const gap = 16;
         const maxWidth = Math.max(...cropList.map((c) => c.cropCanvas.width));
         const totalHeight =
           cropList.reduce((acc, c) => acc + c.cropCanvas.height, 0) + (cropList.length - 1) * gap;
@@ -653,6 +746,8 @@ export const AutoPdfConverterModal: React.FC = () => {
         const sCtx = stitchedCanvas.getContext('2d');
         if (!sCtx) return null;
 
+        sCtx.imageSmoothingEnabled = true;
+        sCtx.imageSmoothingQuality = 'high';
         sCtx.fillStyle = '#ffffff';
         sCtx.fillRect(0, 0, maxWidth, totalHeight);
 
@@ -663,12 +758,12 @@ export const AutoPdfConverterModal: React.FC = () => {
 
           if (idx < cropList.length - 1) {
             sCtx.save();
-            sCtx.strokeStyle = '#e2e8f0';
+            sCtx.strokeStyle = '#cbd5e1';
             sCtx.lineWidth = 1.5;
-            sCtx.setLineDash([4, 4]);
+            sCtx.setLineDash([5, 5]);
             sCtx.beginPath();
-            sCtx.moveTo(16, currentY + gap / 2);
-            sCtx.lineTo(maxWidth - 16, currentY + gap / 2);
+            sCtx.moveTo(20, currentY + gap / 2);
+            sCtx.lineTo(maxWidth - 20, currentY + gap / 2);
             sCtx.stroke();
             sCtx.restore();
             currentY += gap;

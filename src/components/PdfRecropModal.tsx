@@ -27,7 +27,7 @@ import {
   Loader2,
   FileText
 } from 'lucide-react';
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { getPdfjsLib } from '../utils/pdfWorkerConfig';
 
 interface BoxCoord {
   ymin: number;
@@ -102,6 +102,7 @@ export const PdfRecropModal: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const activeRenderTaskRef = useRef<any>(null);
 
   // Initialize Target State
   useEffect(() => {
@@ -196,11 +197,7 @@ export const PdfRecropModal: React.FC = () => {
       setLoadingDoc(true);
       try {
         const arrayBuffer = await pdfFile.arrayBuffer();
-        const pdfjsLib = await import('pdfjs-dist');
-        if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-          pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl || `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-        }
-
+        const pdfjsLib = await getPdfjsLib();
         const loaded = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
         if (!isMounted) return;
         setPdfDoc(loaded);
@@ -245,6 +242,17 @@ export const PdfRecropModal: React.FC = () => {
   const renderCurrentPage = useCallback(async () => {
     if (!pdfDoc || !canvasRef.current) return;
     setRenderingPage(true);
+
+    // Cancel any previous render task in flight on this canvas to prevent collision errors
+    if (activeRenderTaskRef.current) {
+      try {
+        activeRenderTaskRef.current.cancel();
+      } catch {
+        // Ignored
+      }
+      activeRenderTaskRef.current = null;
+    }
+
     try {
       const pageToRender = activeRegion === 'B' && isMultiRegion ? pageB : currentPage;
       const page = await pdfDoc.getPage(pageToRender);
@@ -256,10 +264,15 @@ export const PdfRecropModal: React.FC = () => {
       canvas.width = viewport.width;
       canvas.height = viewport.height;
 
-      await page.render({ canvasContext: ctx, viewport } as any).promise;
-    } catch (err) {
-      console.error("Failed rendering page:", err);
+      const renderTask = page.render({ canvasContext: ctx, viewport } as any);
+      activeRenderTaskRef.current = renderTask;
+      await renderTask.promise;
+    } catch (err: any) {
+      if (err?.name !== 'RenderingCancelledException' && !err?.message?.includes('cancelled')) {
+        console.warn('Page rendering notice:', err?.message || err);
+      }
     } finally {
+      activeRenderTaskRef.current = null;
       setRenderingPage(false);
     }
   }, [pdfDoc, currentPage, pageB, activeRegion, isMultiRegion, scale]);
@@ -274,13 +287,18 @@ export const PdfRecropModal: React.FC = () => {
       if (!pdfDoc) return null;
       try {
         const page = await pdfDoc.getPage(pageIndex);
-        const hiScale = 2.5; // High resolution crop for crisp text & math
+        const hiScale = 2.6; // High resolution 2.6x crop for razor-sharp text & math
         const viewport = page.getViewport({ scale: hiScale });
         const fullCanvas = document.createElement('canvas');
-        fullCanvas.width = viewport.width;
-        fullCanvas.height = viewport.height;
+        fullCanvas.width = Math.round(viewport.width);
+        fullCanvas.height = Math.round(viewport.height);
         const fullCtx = fullCanvas.getContext('2d');
         if (!fullCtx) return null;
+
+        fullCtx.imageSmoothingEnabled = true;
+        fullCtx.imageSmoothingQuality = 'high';
+        fullCtx.fillStyle = '#FFFFFF';
+        fullCtx.fillRect(0, 0, fullCanvas.width, fullCanvas.height);
 
         await page.render({ canvasContext: fullCtx, viewport } as any).promise;
 
@@ -300,11 +318,13 @@ export const PdfRecropModal: React.FC = () => {
         const cropCtx = cropCanvas.getContext('2d');
         if (!cropCtx) return null;
 
+        cropCtx.imageSmoothingEnabled = true;
+        cropCtx.imageSmoothingQuality = 'high';
         cropCtx.fillStyle = '#FFFFFF';
         cropCtx.fillRect(0, 0, pxW, pxH);
         cropCtx.drawImage(fullCanvas, pxX, pxY, pxW, pxH, 0, 0, pxW, pxH);
 
-        // Apply Image Clean / Enhancement filters if enabled
+        // Apply Image Clean / Enhancement filters with continuous smooth tone-curves
         if (autoWhiten || sharpenText) {
           const imgData = cropCtx.getImageData(0, 0, pxW, pxH);
           const data = imgData.data;
@@ -312,22 +332,26 @@ export const PdfRecropModal: React.FC = () => {
             const r = data[i];
             const g = data[i + 1];
             const b = data[i + 2];
+            const avg = (r + g + b) / 3;
 
             if (autoWhiten) {
-              // Convert scanner off-white / light-grey background (r,g,b > 210) to clean #FFFFFF
-              if (r > 200 && g > 200 && b > 200) {
-                data[i] = 255;
-                data[i + 1] = 255;
-                data[i + 2] = 255;
+              // Smooth knee-curve: brighten off-white/scanner grey backgrounds while preserving delicate font anti-aliasing
+              if (avg > 210) {
+                const factor = Math.min(1, (avg - 210) / 42);
+                data[i] = Math.min(255, Math.round(r + (255 - r) * factor));
+                data[i + 1] = Math.min(255, Math.round(g + (255 - g) * factor));
+                data[i + 2] = Math.min(255, Math.round(b + (255 - b) * factor));
               }
             }
 
             if (sharpenText) {
-              // Darken text pixels for crisp contrast
-              if (r < 140 && g < 140 && b < 140) {
-                data[i] = Math.max(0, r - 30);
-                data[i + 1] = Math.max(0, g - 30);
-                data[i + 2] = Math.max(0, b - 30);
+              // Smoothly deepen dark ink contrast without introducing jagged threshold artifacts
+              if (avg < 130) {
+                const factor = (130 - avg) / 130;
+                const boost = Math.round(28 * factor);
+                data[i] = Math.max(0, r - boost);
+                data[i + 1] = Math.max(0, g - boost);
+                data[i + 2] = Math.max(0, b - boost);
               }
             }
           }
@@ -455,11 +479,25 @@ export const PdfRecropModal: React.FC = () => {
       const result = await res.json();
       if (result.box && Array.isArray(result.box) && result.box.length === 4) {
         let [ymin, xmin, ymax, xmax] = result.box;
-        // Expand slightly for clean safety margins
+        ymin = Math.max(0, Math.min(0.98, Number(ymin) || 0));
+        xmin = Math.max(0, Math.min(0.98, Number(xmin) || 0));
+        ymax = Math.max(ymin + 0.02, Math.min(1, Number(ymax) || 1));
+        xmax = Math.max(xmin + 0.04, Math.min(1, Number(xmax) || 1));
+
+        // Intelligent column alignment
+        const isLeftCol = xmin < 0.46 && xmax <= 0.52;
+        const isRightCol = xmin >= 0.48;
+        if (isLeftCol) {
+          xmin = Math.min(xmin, 0.035);
+          xmax = Math.min(Math.max(xmax, 0.46), 0.492);
+        } else if (isRightCol) {
+          xmin = Math.max(Math.min(xmin, 0.53), 0.508);
+          xmax = Math.max(xmax, 0.965);
+        }
+
+        // Asymmetric safe margin
         ymin = Math.max(0, ymin - 0.008);
-        xmin = Math.max(0, xmin - 0.008);
-        ymax = Math.min(1, ymax + 0.008);
-        xmax = Math.min(1, xmax + 0.008);
+        ymax = Math.min(1, ymax + 0.012);
 
         const newBox: BoxCoord = { ymin, xmin, ymax, xmax };
         if (activeRegion === 'A') {

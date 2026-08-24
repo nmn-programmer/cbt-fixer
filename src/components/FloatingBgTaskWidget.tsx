@@ -34,12 +34,6 @@ export const FloatingBgTaskWidget: React.FC = () => {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  if (!activeBackgroundTask || !activeBackgroundTask.isMinimized) {
-    return null;
-  }
-
-  const { title, statusText, percent, isComplete, resultSummary } = activeBackgroundTask;
-
   // Drag handlers for mouse
   const handleMouseDown = (e: React.MouseEvent) => {
     // Only drag when holding header/drag handle
@@ -108,6 +102,12 @@ export const FloatingBgTaskWidget: React.FC = () => {
   const handleTouchEnd = () => {
     setIsDragging(false);
   };
+
+  if (!activeBackgroundTask || !activeBackgroundTask.isMinimized) {
+    return null;
+  }
+
+  const { title, statusText, percent, isComplete, resultSummary } = activeBackgroundTask;
 
   // SVG Circular progress math
   const radius = 20;

@@ -39,6 +39,7 @@ import {
 } from 'lucide-react';
 import { useCbtStore } from '../store/useCbtStore';
 import { fetchWithGeminiFallback } from '../utils/geminiKeyManager';
+import { getPdfjsLib } from '../utils/pdfWorkerConfig';
 import {
   AnswerKeyParseResult,
   ClassificationReport,
@@ -303,10 +304,7 @@ export const AnswerKeyStudioModal: React.FC = () => {
 
       if (file.type.includes('pdf') || file.name.endsWith('.pdf')) {
         // Render PDF first page or prompt
-        const pdfjsLib = await import('pdfjs-dist');
-        const pdfWorkerUrl = (await import('pdfjs-dist/build/pdf.worker.min.mjs?url')).default;
-        pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-
+        const pdfjsLib = await getPdfjsLib();
         const arrayBuffer = await file.arrayBuffer();
         const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
         const page = await pdfDoc.getPage(1);
@@ -411,9 +409,11 @@ export const AnswerKeyStudioModal: React.FC = () => {
   const handleApplyToPaper = () => {
     if (!classificationReport || !activeArchive) return;
     applyAnswerKeyClassification(classificationReport, updateMarksOnApply);
-    alert(
-      `Successfully applied verified answer key to ${classificationReport.matchedCount} questions in ${activeArchive.title}!`
-    );
+    addToast({
+      title: 'Answer Key Applied',
+      description: `Successfully applied verified answer key to ${classificationReport.matchedCount} questions in ${activeArchive.title}!`,
+      type: 'success',
+    });
     setActiveTab('matrix');
   };
 
@@ -469,9 +469,18 @@ export const AnswerKeyStudioModal: React.FC = () => {
     try {
       await navigator.clipboard.writeText(exportString);
       setCopied(true);
+      addToast({
+        title: 'Copied Export',
+        description: 'Answer key copied to clipboard!',
+        type: 'success',
+      });
       setTimeout(() => setCopied(false), 2000);
-    } catch (err) {
-      alert('Failed to copy to clipboard');
+    } catch {
+      addToast({
+        title: 'Clipboard Notice',
+        description: 'Failed to copy to clipboard automatically.',
+        type: 'warning',
+      });
     }
   };
 
