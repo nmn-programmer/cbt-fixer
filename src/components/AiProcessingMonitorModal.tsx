@@ -39,6 +39,7 @@ import {
   allocateSwarmFleet,
   SwarmAgent,
 } from '../utils/amasOrchestrator';
+import { LoadBalancerDashboard } from './LoadBalancerDashboard';
 
 export interface WorkerActivityLog {
   id: string;
@@ -130,6 +131,7 @@ export const AiProcessingMonitorModal: React.FC<AiProcessingMonitorModalProps> =
 }) => {
   const [internalLogs, setInternalLogs] = useState<WorkerActivityLog[]>(() => getGlobalWorkerLogs());
   const [logFilter, setLogFilter] = useState<'all' | 'workers' | 'merger' | 'errors'>('all');
+  const [activeSectionTab, setActiveSectionTab] = useState<'swarm' | 'loadbalancer'>('swarm');
   const [autoScroll, setAutoScroll] = useState(true);
   const logContainerRef = useRef<HTMLDivElement>(null);
 
@@ -303,7 +305,36 @@ export const AiProcessingMonitorModal: React.FC<AiProcessingMonitorModalProps> =
             </div>
           )}
 
-          {/* SWARM AGENTS & ROLES FLEET GRID */}
+          {/* SECTION TAB NAVIGATION */}
+          <div className="flex items-center gap-2 p-1.5 rounded-xl bg-slate-950 border border-slate-800">
+            <button
+              type="button"
+              onClick={() => setActiveSectionTab('swarm')}
+              className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-2 ${
+                activeSectionTab === 'swarm'
+                  ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/30'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+              }`}
+            >
+              <Cpu className="w-3.5 h-3.5" />
+              <span>AMAS Swarm Fleet Roles</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSectionTab('loadbalancer')}
+              className={`flex-1 py-2 px-3 rounded-lg text-xs font-bold transition-all flex items-center justify-center gap-2 ${
+                activeSectionTab === 'loadbalancer'
+                  ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/30'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+              }`}
+            >
+              <Activity className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Load Balancer & Health Telemetry</span>
+            </button>
+          </div>
+
+          {/* TAB 1: SWARM AGENTS & ROLES FLEET GRID */}
+          {activeSectionTab === 'swarm' && (
           <div className="space-y-2.5">
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
@@ -401,6 +432,14 @@ export const AiProcessingMonitorModal: React.FC<AiProcessingMonitorModalProps> =
               })}
             </div>
           </div>
+          )}
+
+          {/* TAB 2: LOAD BALANCER & TELEMETRY */}
+          {activeSectionTab === 'loadbalancer' && (
+            <div className="animate-in fade-in duration-150">
+              <LoadBalancerDashboard onStateChange={refreshUsageMetrics} />
+            </div>
+          )}
 
           {/* PAGE PARTITIONS GRID */}
           {pagePartitions.length > 0 && (

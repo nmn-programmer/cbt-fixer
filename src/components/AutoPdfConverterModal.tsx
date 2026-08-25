@@ -34,6 +34,7 @@ import {
   Scissors,
   RotateCcw,
   Cpu,
+  Upload,
 } from 'lucide-react';
 import { generateId } from '../utils/constants';
 import { getPdfjsLib } from '../utils/pdfWorkerConfig';
@@ -59,6 +60,13 @@ import {
   setCachedTaskResult,
   getTaskCacheKey,
 } from '../utils/amasOrchestrator';
+import {
+  reconcileGroundTruthKeys,
+  identifyMissingQuestionPages,
+  StreamingProducerConsumerMerger,
+  ReconciliationReport,
+  AnswerKeyEntry,
+} from '../utils/streamingMerger';
 
 interface QuestionDetection {
   pageIndex: number;
@@ -175,6 +183,14 @@ export const AutoPdfConverterModal: React.FC = () => {
   const [durationMinutes, setDurationMinutes] = useState<number>(60);
   const [totalMarks, setTotalMarks] = useState<number>(96);
   const [isScanningInstructions, setIsScanningInstructions] = useState(false);
+  const [instructionPageNum, setInstructionPageNum] = useState<number>(1);
+  const [answerKeyMode, setAnswerKeyMode] = useState<'auto' | 'separate_file' | 'selected_pages'>('auto');
+  const [answerKeyFile, setAnswerKeyFile] = useState<File | null>(null);
+  const [answerKeySelectedPages, setAnswerKeySelectedPages] = useState<Set<number>>(new Set());
+  const [streamBStatus, setStreamBStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  const [streamBCount, setStreamBCount] = useState<number>(0);
+  const [reconciliationReport, setReconciliationReport] = useState<ReconciliationReport | null>(null);
+  const [liveStreamingCount, setLiveStreamingCount] = useState<number>(0);
   const [instructionsScanStatus, setInstructionsScanStatus] = useState('');
   const [instructionMarkingSummary, setInstructionMarkingSummary] = useState<string>('');
   const [hasInstructedMarkingScheme, setHasInstructedMarkingScheme] = useState<boolean>(false);
@@ -434,12 +450,13 @@ export const AutoPdfConverterModal: React.FC = () => {
     setBlueprintRanges((prev) => prev.filter((r) => r.id !== id));
   };
 
-  // AI Scan Instructions Page from the uploaded PDF/ZIP (typically Page 1)
-  const handleScanInstructionsFromPdf = async () => {
+  // AI Scan Instructions Page from the uploaded PDF/ZIP (Page 1 or user-selected page)
+  const handleScanInstructionsFromPdf = async (targetPageNum?: number) => {
     if (!file) return;
+    const pageToScan = Math.max(1, targetPageNum || instructionPageNum || 1);
     try {
       setIsScanningInstructions(true);
-      setInstructionsScanStatus('Rendering instruction page...');
+      setInstructionsScanStatus(`Rendering instruction page ${pageToScan}...`);
 
       let base64Image = '';
       const isZip = file.name.toLowerCase().endsWith('.zip') || file.type.includes('zip');
@@ -455,7 +472,8 @@ export const AutoPdfConverterModal: React.FC = () => {
           const pdfBuf = await loadedZip.files[pdfEntryName].async('arraybuffer');
           const pdfjsLib = await getPdfjsLib();
           const pdfDoc = await pdfjsLib.getDocument({ data: pdfBuf }).promise;
-          const page = await pdfDoc.getPage(1);
+          const validPageNum = Math.min(pageToScan, pdfDoc.numPages);
+          const page = await pdfDoc.getPage(validPageNum);
           const viewport = page.getViewport({ scale: 2.0 });
           const canvas = document.createElement('canvas');
           canvas.width = viewport.width;
@@ -470,11 +488,12 @@ export const AutoPdfConverterModal: React.FC = () => {
             .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 
           if (imgEntries.length > 0) {
-            const firstBlob = await imgEntries[0][1].async('blob');
+            const validIdx = Math.min(pageToScan - 1, imgEntries.length - 1);
+            const targetBlob = await imgEntries[validIdx][1].async('blob');
             base64Image = await new Promise<string>((resolve) => {
               const reader = new FileReader();
               reader.onloadend = () => resolve(reader.result as string);
-              reader.readAsDataURL(firstBlob);
+              reader.readAsDataURL(targetBlob);
             });
           }
         }
@@ -482,7 +501,8 @@ export const AutoPdfConverterModal: React.FC = () => {
         const arrayBuffer = await file.arrayBuffer();
         const pdfjsLib = await getPdfjsLib();
         const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-        const page = await pdfDoc.getPage(1);
+        const validPageNum = Math.min(pageToScan, pdfDoc.numPages);
+        const page = await pdfDoc.getPage(validPageNum);
         const viewport = page.getViewport({ scale: 2.0 });
 
         const canvas = document.createElement('canvas');
@@ -495,7 +515,7 @@ export const AutoPdfConverterModal: React.FC = () => {
         base64Image = canvas.toDataURL('image/jpeg', 0.85);
       }
 
-      if (!base64Image) throw new Error('Unable to render page 1 for blueprint extraction');
+      if (!base64Image) throw new Error(`Unable to render page ${pageToScan} for blueprint extraction`);
 
       setInstructionsScanStatus('Analyzing General Instructions & question ranges with Gemini Vision...');
 
@@ -651,9 +671,32 @@ export const AutoPdfConverterModal: React.FC = () => {
           }
         }
 
-        const base64ForAi = canvas.toDataURL('image/jpeg', 0.82);
+        // Create downscaled canvas for Pass 1 AI Layout Pass (max 1200px width @ 0.72 JPEG)
+        // This cuts input token payload from ~200k down to ~25k tokens per batch, preventing 429 RESOURCE_EXHAUSTED errors
+        let base64ForAi = '';
+        const MAX_AI_WIDTH = 1200;
+        if (canvas.width > MAX_AI_WIDTH) {
+          const scaledCanvas = document.createElement('canvas');
+          const scaleFactor = MAX_AI_WIDTH / canvas.width;
+          scaledCanvas.width = MAX_AI_WIDTH;
+          scaledCanvas.height = Math.round(canvas.height * scaleFactor);
+          const scaledCtx = scaledCanvas.getContext('2d');
+          if (scaledCtx) {
+            scaledCtx.imageSmoothingEnabled = true;
+            scaledCtx.imageSmoothingQuality = 'high';
+            scaledCtx.fillStyle = '#ffffff';
+            scaledCtx.fillRect(0, 0, scaledCanvas.width, scaledCanvas.height);
+            scaledCtx.drawImage(canvas, 0, 0, scaledCanvas.width, scaledCanvas.height);
+            base64ForAi = scaledCanvas.toDataURL('image/jpeg', 0.72);
+          } else {
+            base64ForAi = canvas.toDataURL('image/jpeg', 0.72);
+          }
+        } else {
+          base64ForAi = canvas.toDataURL('image/jpeg', 0.72);
+        }
+
         base64Images.push(base64ForAi);
-        canvasImages.push(canvas);
+        canvasImages.push(canvas); // Keep original 300 DPI native canvas for high-res bounding box cropping
 
         const pagePercent = Math.min(35, Math.round(5 + ((i + 1) / pagesToProcess.length) * 30));
         setPercent(pagePercent);
@@ -723,6 +766,24 @@ export const AutoPdfConverterModal: React.FC = () => {
         managers: 1,
       });
 
+      // Phase 0: Global Blueprint Manifest Assembly (Scout Directive Agent)
+      const globalManifest = {
+        testTitle: testTitle || file.name,
+        durationMinutes,
+        totalMarks,
+        totalExpectedQuestions: blueprintRanges.length > 0 ? Math.max(...blueprintRanges.map((r) => r.toQNo)) : 90,
+        sections: blueprintRanges,
+        instructionMarkingSummary,
+        defaultMarkingScheme,
+      };
+
+      emitWorkerLog({
+        workerId: 'orchestrator',
+        workerLabel: 'Scout Directive Agent',
+        level: 'info',
+        message: `Global Blueprint Manifest Active: ${globalManifest.totalExpectedQuestions} questions target across ${globalManifest.sections.length} section range(s).`,
+      });
+
       const BATCH_SIZE = swarmFleet.batchSize || 2;
       const totalBatches = Math.ceil(pagesToProcess.length / BATCH_SIZE);
 
@@ -747,6 +808,95 @@ export const AutoPdfConverterModal: React.FC = () => {
         message: `Swarm Mode [${swarmFleet.strategy.toUpperCase()}]: Allocated ${swarmFleet.workers.length} Layout Workers, ${swarmFleet.auditors.length} Diagram Auditors, 1 Consensus Manager (${swarmFleet.manager.label}) with ${swarmFleet.ratePacingMs}ms pacing.`,
       });
 
+      // Stream B: Parallel Answer Key Extractor Worker Stream
+      let streamBPromise: Promise<any[]> | null = null;
+      if (!isCachedRecall && hasAnswerKey) {
+        setStreamBStatus('running');
+        emitWorkerLog({
+          workerId: 'stream_b_answer_key',
+          workerLabel: 'Stream B: Answer Key Extractor',
+          level: 'info',
+          message: `Stream B Active: Launching parallel Answer Key Extraction Stream (${answerKeyMode.toUpperCase()} mode)...`,
+        });
+
+        streamBPromise = (async () => {
+          try {
+            const akImages: string[] = [];
+            if (answerKeyMode === 'separate_file' && answerKeyFile) {
+              const pdfjsLib = await getPdfjsLib();
+              const akBuf = await answerKeyFile.arrayBuffer();
+              const akDoc = await pdfjsLib.getDocument({ data: akBuf }).promise;
+              for (let p = 1; p <= Math.min(5, akDoc.numPages); p++) {
+                const page = await akDoc.getPage(p);
+                const viewport = page.getViewport({ scale: 1.5 });
+                const canvas = document.createElement('canvas');
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                  ctx.fillStyle = '#ffffff';
+                  ctx.fillRect(0, 0, canvas.width, canvas.height);
+                  await page.render({ canvasContext: ctx, viewport } as any).promise;
+                  akImages.push(canvas.toDataURL('image/jpeg', 0.72));
+                }
+              }
+            } else if (answerKeyMode === 'selected_pages' && answerKeySelectedPages.size > 0 && pdfDoc) {
+              for (const pNum of Array.from(answerKeySelectedPages)) {
+                const page = await pdfDoc.getPage(pNum);
+                const viewport = page.getViewport({ scale: 1.5 });
+                const canvas = document.createElement('canvas');
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                  ctx.fillStyle = '#ffffff';
+                  ctx.fillRect(0, 0, canvas.width, canvas.height);
+                  await page.render({ canvasContext: ctx, viewport } as any).promise;
+                  akImages.push(canvas.toDataURL('image/jpeg', 0.72));
+                }
+              }
+            }
+
+            if (akImages.length > 0) {
+              const res = await fetchWithGeminiFallback(
+                '/api/extract-answer-key',
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ images: akImages, manifest: globalManifest }),
+                },
+                addToast,
+                refreshUsageMetrics
+              );
+
+              if (res.ok) {
+                const data = await res.json();
+                const keys = data.answerKeys || [];
+                setStreamBCount(keys.length);
+                setStreamBStatus('done');
+                emitWorkerLog({
+                  workerId: 'stream_b_answer_key',
+                  workerLabel: 'Stream B: Answer Key Extractor',
+                  level: 'success',
+                  message: `Stream B completed: Extracted ${keys.length} answer keys in parallel.`,
+                });
+                return keys;
+              }
+            }
+          } catch (err: any) {
+            console.warn('[Stream B] Parallel answer key extraction notice:', err);
+            setStreamBStatus('error');
+            emitWorkerLog({
+              workerId: 'stream_b_answer_key',
+              workerLabel: 'Stream B: Answer Key Extractor',
+              level: 'warning',
+              message: `Stream B notice: ${err.message || 'Falling back to main document answer key extraction.'}`,
+            });
+          }
+          return [];
+        })();
+      }
+
       // Restore resumed questions if available
       if (!isCachedRecall && resumedQuestions.length > 0) {
         allExtractedQuestions.push(...resumedQuestions);
@@ -770,6 +920,7 @@ export const AutoPdfConverterModal: React.FC = () => {
         updateBackgroundTask({ percent: 36, statusText: passStatusMsg });
 
         let lastBatchError = '';
+        const streamingMerger = new StreamingProducerConsumerMerger(handleSplitQuestions);
 
         for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
           if (batchIdx > 0) {
@@ -838,6 +989,7 @@ export const AutoPdfConverterModal: React.FC = () => {
                       hasAnswerKey,
                       extractEnglishOnly,
                       enableDoublePass: enableDoublePassRescan,
+                      manifest: globalManifest,
                     },
                   }),
                 },
@@ -860,6 +1012,11 @@ export const AutoPdfConverterModal: React.FC = () => {
                   allAnswerKeys.push(...batchResponse.answerKeys);
                 }
 
+                // Phase 2: Incremental Producer-Consumer Merger with Pending Boundary Buffer
+                const isLastBatch = batchIdx === totalBatches - 1;
+                const mergeRes = streamingMerger.pushBatch(detectedList, isLastBatch);
+                setLiveStreamingCount(streamingMerger.getConfirmedQuestions().length);
+
                 setPagePartitions((prev) =>
                   prev.map((p) =>
                     p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
@@ -872,7 +1029,7 @@ export const AutoPdfConverterModal: React.FC = () => {
                   workerId: assignedWorker.id,
                   workerLabel: assignedWorker.label,
                   level: 'success',
-                  message: `Batch ${batchIdx + 1} completed: ${detectedList.length} questions extracted.`,
+                  message: `Batch ${batchIdx + 1} completed: +${detectedList.length} items (Streaming Merger: ${streamingMerger.getConfirmedQuestions().length} confirmed, ${mergeRes.pendingBufferCount} pending boundary).`,
                   pageNumber: realStartPage,
                 });
 
@@ -947,6 +1104,134 @@ export const AutoPdfConverterModal: React.FC = () => {
             lastBatchError ||
               'No questions were detected across the selected pages. Please verify your Gemini API Key in Settings and ensure the document contains clear printed questions.'
           );
+        }
+
+        // Await parallel Stream B Answer Key Extraction results if active
+        if (streamBPromise) {
+          const parallelKeys = await streamBPromise;
+          if (parallelKeys && parallelKeys.length > 0) {
+            allAnswerKeys.push(...parallelKeys);
+          }
+        }
+
+        // Phase 2: Ground-Truth Reconciliation Pass
+        const questionsToReconcile =
+          streamingMerger.getConfirmedQuestions().length > 0
+            ? streamingMerger.getConfirmedQuestions()
+            : allExtractedQuestions;
+
+        const { reconciledQuestions: finalReconciled, report: reconReport } = reconcileGroundTruthKeys(
+          questionsToReconcile,
+          allAnswerKeys,
+          blueprintRanges
+        );
+        setReconciliationReport(reconReport);
+
+        emitWorkerLog({
+          workerId: swarmFleet.manager.id,
+          workerLabel: swarmFleet.manager.label,
+          level: 'success',
+          message: `Ground-Truth Reconciliation Complete: ${reconReport.matchedKeysCount}/${reconReport.totalExpectedKeys || reconReport.totalExtractedQuestions} keys matched (${reconReport.precisionScorePercent}% Precision). Missing Gaps: ${reconReport.missingGaps.length > 0 ? reconReport.missingGaps.join(', ') : 'None'}. NAT Validated: ${reconReport.natValidatedCount}.`,
+        });
+
+        // Replace questions pool with reconciled questions
+        allExtractedQuestions.length = 0;
+        allExtractedQuestions.push(...finalReconciled);
+
+        // Phase 3: Ground-Truth Discrepancy Pinpoint Auto-Rescan
+        if (reconReport.missingGaps.length > 0 && pdfDoc) {
+          emitWorkerLog({
+            workerId: swarmFleet.manager.id,
+            workerLabel: swarmFleet.manager.label,
+            level: 'warning',
+            message: `Phase 3 Ground-Truth Auto-Rescan: Pinpointing missing gap(s) Q${reconReport.missingGaps.join(', Q')}...`,
+          });
+
+          const missingTargets = identifyMissingQuestionPages(
+            reconReport.missingGaps,
+            finalReconciled,
+            pdfDoc.numPages
+          );
+
+          const candidatePagesToRescan = Array.from(
+            new Set(missingTargets.flatMap((t) => t.candidatePageIndices))
+          );
+
+          const recoveredQuestions: QuestionDetection[] = [];
+
+          for (const pageIdx of candidatePagesToRescan) {
+            const pageNum = pageIdx + 1;
+            try {
+              const page = await pdfDoc.getPage(pageNum);
+              const viewport = page.getViewport({ scale: 1.5 });
+              const canvas = document.createElement('canvas');
+              canvas.width = viewport.width;
+              canvas.height = viewport.height;
+              const ctx = canvas.getContext('2d');
+              if (ctx) {
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                await page.render({ canvasContext: ctx, viewport } as any).promise;
+                const pageImg = canvas.toDataURL('image/jpeg', 0.85);
+
+                const targetQNosForPage = missingTargets
+                  .filter((t) => t.candidatePageIndices.includes(pageIdx))
+                  .map((t) => t.qNo);
+
+                const rescanRes = await fetchWithGeminiFallback(
+                  '/api/extract-pdf-structure',
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      images: [pageImg],
+                      pageOffset: pageIdx,
+                      options: {
+                        hasAnswerKey: false,
+                        manifest: globalManifest,
+                        targetQNos: targetQNosForPage,
+                        enableDoublePass: false,
+                      },
+                    }),
+                  },
+                  addToast,
+                  refreshUsageMetrics
+                );
+
+                if (rescanRes.ok) {
+                  const rescanData = await rescanRes.json();
+                  const found = rescanData.questions || [];
+                  if (found.length > 0) {
+                    recoveredQuestions.push(...found);
+                  }
+                }
+              }
+            } catch (rescanErr: any) {
+              console.warn(`[Phase 3 Pinpoint Rescan] Page ${pageNum} error:`, rescanErr);
+            }
+          }
+
+          if (recoveredQuestions.length > 0) {
+            streamingMerger.pushBatch(recoveredQuestions, true);
+            const updatedReconciled = streamingMerger.getConfirmedQuestions();
+
+            const { reconciledQuestions: updatedFinal, report: updatedReport } = reconcileGroundTruthKeys(
+              updatedReconciled,
+              allAnswerKeys,
+              blueprintRanges
+            );
+
+            setReconciliationReport(updatedReport);
+            allExtractedQuestions.length = 0;
+            allExtractedQuestions.push(...updatedFinal);
+
+            emitWorkerLog({
+              workerId: swarmFleet.manager.id,
+              workerLabel: swarmFleet.manager.label,
+              level: 'success',
+              message: `Phase 3 Ground-Truth Auto-Rescan Successful: Recovered ${recoveredQuestions.length} missing question(s)! Precision Score updated to ${updatedReport.precisionScorePercent}% (${updatedReport.matchedKeysCount}/${updatedReport.totalExpectedKeys || updatedReport.totalExtractedQuestions} keys matched).`,
+            });
+          }
         }
 
         // Cache task execution result for future instant zero-API recalls
@@ -1911,22 +2196,80 @@ export const AutoPdfConverterModal: React.FC = () => {
                     </div>
                   </label>
 
-                  <label className="flex items-start gap-2 cursor-pointer group">
-                    <input
-                      type="checkbox"
-                      checked={hasAnswerKey}
-                      onChange={(e) => setHasAnswerKey(e.target.checked)}
-                      className="w-4 h-4 mt-0.5 accent-indigo-500 cursor-pointer shrink-0"
-                    />
-                    <div>
-                      <span className="text-xs font-semibold text-slate-200 group-hover:text-white transition-colors block">
-                        Auto-Extract Answer Key Table
-                      </span>
-                      <span className="text-[10px] text-slate-400 block mt-0.5">
-                        Scans tables at the end for correct answers.
-                      </span>
-                    </div>
-                  </label>
+                  <div className="space-y-2 border-t border-slate-800/80 pt-2">
+                    <label className="flex items-start gap-2 cursor-pointer group">
+                      <input
+                        type="checkbox"
+                        checked={hasAnswerKey}
+                        onChange={(e) => setHasAnswerKey(e.target.checked)}
+                        className="w-4 h-4 mt-0.5 accent-indigo-500 cursor-pointer shrink-0"
+                      />
+                      <div>
+                        <span className="text-xs font-semibold text-slate-200 group-hover:text-white transition-colors block">
+                          Dual-Stream Answer Key Worker
+                        </span>
+                        <span className="text-[10px] text-slate-400 block mt-0.5">
+                          Runs Stream B in parallel to extract official answer keys & NAT decimal values.
+                        </span>
+                      </div>
+                    </label>
+
+                    {hasAnswerKey && (
+                      <div className="ml-6 space-y-2 bg-slate-900/60 p-2.5 rounded-lg border border-slate-800 text-xs">
+                        <div className="text-[11px] font-bold text-slate-300">Answer Key Source:</div>
+                        <div className="flex flex-col gap-1.5 text-[11px] text-slate-300">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="akMode"
+                              checked={answerKeyMode === 'auto'}
+                              onChange={() => setAnswerKeyMode('auto')}
+                              className="accent-indigo-500"
+                            />
+                            <span>Auto-detect in booklet pages</span>
+                          </label>
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="akMode"
+                              checked={answerKeyMode === 'separate_file'}
+                              onChange={() => setAnswerKeyMode('separate_file')}
+                              className="accent-indigo-500"
+                            />
+                            <span>Upload separate Answer Key PDF/Image</span>
+                          </label>
+                          {answerKeyMode === 'separate_file' && (
+                            <div className="mt-1 pl-4">
+                              <label className="cursor-pointer inline-flex items-center gap-1.5 px-2.5 py-1 bg-indigo-950/60 hover:bg-indigo-900/80 border border-indigo-700/50 rounded text-indigo-300 font-medium text-[11px] transition-colors">
+                                <Upload className="w-3 h-3" />
+                                <span>{answerKeyFile ? answerKeyFile.name : 'Choose Answer Key File...'}</span>
+                                <input
+                                  type="file"
+                                  accept=".pdf,image/*"
+                                  className="hidden"
+                                  onChange={(e) => {
+                                    if (e.target.files && e.target.files[0]) {
+                                      setAnswerKeyFile(e.target.files[0]);
+                                    }
+                                  }}
+                                />
+                              </label>
+                            </div>
+                          )}
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="radio"
+                              name="akMode"
+                              checked={answerKeyMode === 'selected_pages'}
+                              onChange={() => setAnswerKeyMode('selected_pages')}
+                              className="accent-indigo-500"
+                            />
+                            <span>Select specific document pages ({answerKeySelectedPages.size} selected)</span>
+                          </label>
+                        </div>
+                      </div>
+                    )}
+                  </div>
 
                   <label className="flex items-start gap-2 cursor-pointer group">
                     <input
@@ -1945,25 +2288,39 @@ export const AutoPdfConverterModal: React.FC = () => {
                     </div>
                   </label>
 
-                  {/* Fast Scan Instructions Trigger */}
-                  <div className="pt-2 border-t border-slate-800">
+                  {/* Phase 0 Scout: Fast Instruction Directive Trigger */}
+                  <div className="pt-2.5 border-t border-slate-800 space-y-2">
+                    <div className="flex items-center justify-between text-[11px] text-slate-400">
+                      <span>Instruction Page:</span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] text-slate-400">Page</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={thumbnails.length || 100}
+                          value={instructionPageNum}
+                          onChange={(e) => setInstructionPageNum(Math.max(1, Number(e.target.value)))}
+                          className="w-12 px-1.5 py-0.5 bg-slate-900 border border-slate-700 rounded text-xs text-center font-bold text-indigo-300"
+                        />
+                      </div>
+                    </div>
                     <button
                       onClick={async () => {
-                        await handleScanInstructionsFromPdf();
+                        await handleScanInstructionsFromPdf(instructionPageNum);
                         setStep('blueprint');
                       }}
                       disabled={isScanningInstructions}
                       className="w-full py-2 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-800/60 text-purple-300 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors"
                     >
                       {isScanningInstructions ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-400" />
                       ) : (
-                        <Sparkles className="w-3.5 h-3.5" />
+                        <Sparkles className="w-3.5 h-3.5 text-purple-400" />
                       )}
                       <span>
                         {isScanningInstructions
-                          ? 'Scanning Instructions...'
-                          : 'Auto-Detect Blueprint (Page 1)'}
+                          ? `Scanning Page ${instructionPageNum}...`
+                          : `Auto-Detect Blueprint (Page ${instructionPageNum})`}
                       </span>
                     </button>
                   </div>
@@ -2392,6 +2749,53 @@ export const AutoPdfConverterModal: React.FC = () => {
                   <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-lg text-xs font-mono text-indigo-300 flex items-center justify-between">
                     <span className="truncate">{progressDetail}</span>
                     <span className="shrink-0 text-slate-500 text-[10px]">{elapsedSec}s</span>
+                  </div>
+
+                  {/* Phase 2: Live Incremental Streaming & Ground-Truth Reconciliation Card */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <div className="p-2 bg-indigo-500/20 text-indigo-400 rounded-lg">
+                          <Layers className="w-4 h-4 text-indigo-400" />
+                        </div>
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+                            Producer-Consumer Streaming Queue
+                          </div>
+                          <div className="text-xs font-bold text-slate-200 mt-0.5">
+                            {liveStreamingCount} Questions Confirmed & Merged
+                          </div>
+                        </div>
+                      </div>
+                      <span className="text-xs font-mono font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                        Live Stream
+                      </span>
+                    </div>
+
+                    <div className="bg-slate-900/90 border border-slate-800 p-3 rounded-xl flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <div className="p-2 bg-emerald-500/20 text-emerald-400 rounded-lg">
+                          <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                        </div>
+                        <div>
+                          <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">
+                            Ground-Truth Reconciliation
+                          </div>
+                          <div className="text-xs font-bold text-slate-200 mt-0.5">
+                            {reconciliationReport ? (
+                              <span>
+                                {reconciliationReport.matchedKeysCount}/{reconciliationReport.totalExpectedKeys || reconciliationReport.totalExtractedQuestions} Keys Matched ({reconciliationReport.precisionScorePercent}%)
+                              </span>
+                            ) : (
+                              <span className="text-slate-400">Reconciling Stream A & Stream B...</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <span className="text-xs font-mono font-bold text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">
+                        {reconciliationReport ? `${reconciliationReport.precisionScorePercent}% Precision` : 'Cross-Checking'}
+                      </span>
+                    </div>
                   </div>
                 </>
               ) : error ? (

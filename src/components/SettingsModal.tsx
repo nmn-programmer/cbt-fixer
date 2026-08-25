@@ -42,16 +42,18 @@ import {
   importApiKeysFromJson,
   getStoredPrimaryApiKey,
   validateApiKey,
+  recordRequestUsage,
 } from '../utils/geminiKeyManager';
 import { GEMINI_MODELS_DESCENDING, GeminiModelInfo } from '../utils/aiModelConfig';
 import { AiProcessingMonitorModal } from './AiProcessingMonitorModal';
+import { LoadBalancerDashboard } from './LoadBalancerDashboard';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
-type TabType = 'keys' | 'models' | 'performance' | 'appearance' | 'storage';
+type TabType = 'keys' | 'loadbalancer' | 'models' | 'performance' | 'appearance' | 'storage';
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
   const [activeTab, setActiveTab] = useState<TabType>('keys');
@@ -120,6 +122,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
     activeKeyId,
     selectedModel,
     setSelectedModel,
+    fallbackModelQueue,
+    reorderFallbackModelQueue,
+    resetFallbackModelQueue,
     theme,
     setTheme,
     enableDoublePassRescan,
@@ -131,6 +136,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
   useEffect(() => {
     if (isOpen) {
       refreshUsageMetrics();
+      const interval = setInterval(() => {
+        refreshUsageMetrics();
+      }, 1000);
+      return () => clearInterval(interval);
     }
   }, [isOpen, refreshUsageMetrics]);
 
@@ -172,6 +181,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
       const res = await validateApiKey(key.trim(), selectedModel);
       const latencyMs = Date.now() - start;
       if (res.valid) {
+        recordRequestUsage(id, 1);
+        refreshUsageMetrics();
         setTestResults((prev) => ({
           ...prev,
           [id]: { valid: true, latencyMs, model: res.modelUsed || selectedModel },
@@ -260,7 +271,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
 
   const tabs: { id: TabType; label: string; icon: React.FC<{ className?: string }> }[] = [
     { id: 'keys', label: 'API Keys & Fleet', icon: Key },
-    { id: 'models', label: 'AI Model Selection', icon: Sparkles },
+    { id: 'loadbalancer', label: 'Load Balancer & Auto-Ping', icon: Activity },
+    { id: 'models', label: 'AI Models & Fallback Queue', icon: Sparkles },
     { id: 'performance', label: 'OCR & Double-Pass', icon: Zap },
     { id: 'appearance', label: 'Appearance', icon: Palette },
     { id: 'storage', label: 'Drafts & Storage', icon: HardDrive },
@@ -274,16 +286,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
       >
         <div
           id="settings-modal-container"
-          className="flex flex-col w-full h-full sm:h-auto sm:max-h-[90vh] sm:max-w-2xl bg-slate-900 border-0 sm:border border-slate-800 sm:rounded-2xl shadow-2xl overflow-hidden text-slate-100"
+          className="flex flex-col w-full h-full sm:h-auto sm:max-h-[90vh] sm:max-w-3xl bg-slate-900 border-0 sm:border border-slate-800 sm:rounded-2xl shadow-2xl overflow-hidden text-slate-100"
         >
           {/* Modal Header */}
-          <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-slate-950/60 sticky top-0 z-10">
+          <div className="flex items-center justify-between px-5 py-3.5 border-b border-slate-800 bg-slate-950/80 sticky top-0 z-20">
             <div className="flex items-center gap-3">
               <div className="w-9 h-9 rounded-xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
                 <Sparkles className="w-5 h-5" />
               </div>
               <div>
-                <h2 className="text-base sm:text-lg font-bold text-slate-100">Studio Settings</h2>
+                <h2 className="text-base sm:text-lg font-bold text-slate-100 flex items-center gap-2">
+                  Studio Settings
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 font-medium border border-slate-700">
+                    v2.5
+                  </span>
+                </h2>
                 <p className="text-xs text-slate-400">Manage Gemini API keys, worker fleet & model configuration</p>
               </div>
             </div>
@@ -297,27 +314,56 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
             </button>
           </div>
 
-          {/* Tab Navigation - Horizontal Scrollable on Mobile */}
-          <div className="flex border-b border-slate-800 bg-slate-950/40 px-2 overflow-x-auto no-scrollbar scroll-smooth">
-            {tabs.map((tab) => {
-              const Icon = tab.icon;
-              const isActive = activeTab === tab.id;
-              return (
-                <button
-                  key={tab.id}
-                  id={`settings-tab-${tab.id}`}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-2 px-4 py-3 text-xs sm:text-sm font-medium whitespace-nowrap transition-colors border-b-2 min-h-[44px] ${
-                    isActive
-                      ? 'border-indigo-500 text-indigo-400 bg-indigo-500/5 font-semibold'
-                      : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-700'
-                  }`}
+          {/* High-Visibility Tab Navigation Header */}
+          <div className="bg-slate-950 border-b border-slate-800 p-2 sm:p-3 sticky top-[65px] z-10 shadow-md">
+            {/* Mobile Viewport Select Dropdown */}
+            <div className="block sm:hidden">
+              <div className="relative">
+                <select
+                  id="settings-tab-mobile-select"
+                  value={activeTab}
+                  onChange={(e) => setActiveTab(e.target.value as TabType)}
+                  className="w-full bg-slate-900 border-2 border-indigo-500/80 rounded-xl px-3.5 py-2.5 text-xs font-bold text-white shadow-lg focus:outline-none focus:ring-2 focus:ring-indigo-400 appearance-none pr-8 min-h-[44px]"
                 >
-                  <Icon className={`w-4 h-4 ${isActive ? 'text-indigo-400' : 'text-slate-400'}`} />
-                  <span>{tab.label}</span>
-                </button>
-              );
-            })}
+                  {tabs.map((tab) => (
+                    <option key={tab.id} value={tab.id}>
+                      {tab.id === 'keys' ? '🔑 ' : tab.id === 'models' ? '⚡ ' : tab.id === 'performance' ? '🚀 ' : tab.id === 'appearance' ? '🎨 ' : '💾 '}
+                      {tab.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-indigo-400">
+                  <ChevronDown className="w-4 h-4" />
+                </div>
+              </div>
+            </div>
+
+            {/* Desktop & Tablet Segmented Pill Navigation Bar */}
+            <div className="hidden sm:flex items-center gap-1.5 overflow-x-auto p-1 bg-slate-900/90 rounded-xl border border-slate-800 scrollbar-thin">
+              {tabs.map((tab) => {
+                const Icon = tab.icon;
+                const isActive = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    id={`settings-tab-${tab.id}`}
+                    type="button"
+                    onClick={() => setActiveTab(tab.id)}
+                    className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs sm:text-sm font-bold whitespace-nowrap transition-all shrink-0 min-h-[40px] cursor-pointer ${
+                      isActive
+                        ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/30 ring-1 ring-indigo-400/50'
+                        : 'bg-transparent text-slate-300 hover:text-white hover:bg-slate-800/80 border border-transparent hover:border-slate-700/60'
+                    }`}
+                  >
+                    <Icon className={`w-4 h-4 shrink-0 ${isActive ? 'text-white' : 'text-slate-400'}`} />
+                    <span>{tab.label}</span>
+                    {isActive && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse ml-0.5" />
+                    )}
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           {/* Scrollable Tab Content */}
@@ -467,7 +513,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                       </div>
                       <div className="w-full h-1.5 bg-slate-800 rounded-full mt-2 overflow-hidden">
                         <div
-                          className={`h-full ${primaryRpmColor.bg} transition-all duration-300`}
+                          className={`h-full ${primaryRpmColor.barBg} transition-all duration-300`}
                           style={{ width: `${Math.min((primaryRpm / GEMINI_FREE_TIER_RPM) * 100, 100)}%` }}
                         />
                       </div>
@@ -484,10 +530,60 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                       </div>
                       <div className="w-full h-1.5 bg-slate-800 rounded-full mt-2 overflow-hidden">
                         <div
-                          className={`h-full ${primaryRpdColor.bg} transition-all duration-300`}
+                          className={`h-full ${primaryRpdColor.barBg} transition-all duration-300`}
                           style={{ width: `${Math.min((primaryRpd / GEMINI_FREE_TIER_RPD) * 100, 100)}%` }}
                         />
                       </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Default Gemini AI Model Selection & Fallback Queue Quick-Selector */}
+                <div className="p-4 rounded-xl bg-slate-950/80 border border-indigo-500/30 space-y-3.5">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="w-4 h-4 text-indigo-400" />
+                      <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">
+                        Default AI Model (Google AI Free Tier API)
+                      </span>
+                    </div>
+                    <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-bold border border-indigo-500/30">
+                      Active Engine
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label htmlFor="default-model-tab1-select" className="text-[11px] font-medium text-slate-400 block mb-1">
+                        Choose Default Primary Model:
+                      </label>
+                      <select
+                        id="default-model-tab1-select"
+                        value={selectedModel}
+                        onChange={(e) => setSelectedModel(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-100 font-bold focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 min-h-[40px]"
+                      >
+                        {GEMINI_MODELS_DESCENDING.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.name} ({m.category})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="text-[11px] font-medium text-slate-400 block mb-1">
+                        Fallback Queue Sequence (429 Failover):
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('models')}
+                        className="w-full bg-slate-900 border border-slate-700 hover:border-slate-600 rounded-xl px-3 py-2 text-xs text-slate-300 hover:text-white transition-colors flex items-center justify-between font-mono min-h-[40px]"
+                        title="Click to customize fallback queue order"
+                      >
+                        <span className="truncate text-[11px]">{fallbackModelQueue.join(' ➔ ')}</span>
+                        <ChevronRight className="w-4 h-4 text-slate-400 shrink-0 ml-1" />
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -687,11 +783,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                               </div>
                             )}
 
-                            {/* RPM Bar */}
-                            <div className="mt-2 pt-2 border-t border-slate-800/80 flex items-center justify-between text-[10px] text-slate-400">
-                              <span>RPM: {item.rpmCount} / 15</span>
-                              <span>RPD: {item.rpdCount} / 1500</span>
-                            </div>
+                            {/* RPM & RPD Progress Bars */}
+                            {(() => {
+                              const fRpmColor = getUsageColor(item.rpmCount, GEMINI_FREE_TIER_RPM, item.status === 'Quota Exhausted');
+                              const fRpdColor = getUsageColor(item.rpdCount, GEMINI_FREE_TIER_RPD);
+                              return (
+                                <div className="mt-2 pt-2 border-t border-slate-800/80 space-y-1.5">
+                                  <div className="flex items-center justify-between text-[10px] text-slate-400">
+                                    <span>RPM: <strong className="text-slate-200">{item.rpmCount} / 15</strong></span>
+                                    <span>RPD: <strong className="text-slate-200">{item.rpdCount} / 1500</strong></span>
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <div className="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full ${fRpmColor.barBg} transition-all duration-300`}
+                                        style={{ width: `${Math.min((item.rpmCount / GEMINI_FREE_TIER_RPM) * 100, 100)}%` }}
+                                      />
+                                    </div>
+                                    <div className="w-full h-1 bg-slate-800 rounded-full overflow-hidden">
+                                      <div
+                                        className={`h-full ${fRpdColor.barBg} transition-all duration-300`}
+                                        style={{ width: `${Math.min((item.rpdCount / GEMINI_FREE_TIER_RPD) * 100, 100)}%` }}
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })()}
                           </div>
                         );
                       })}
@@ -748,32 +866,39 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
               </div>
             )}
 
-            {/* TAB 2: AI MODEL SELECTION */}
+            {/* TAB: LOAD BALANCER & AUTO-PING */}
+            {activeTab === 'loadbalancer' && (
+              <div className="animate-in fade-in duration-150">
+                <LoadBalancerDashboard onStateChange={refreshUsageMetrics} />
+              </div>
+            )}
+
+            {/* TAB 2: AI MODEL SELECTION & FALLBACK QUEUE */}
             {activeTab === 'models' && (
-              <div className="space-y-5 animate-in fade-in duration-150">
+              <div className="space-y-6 animate-in fade-in duration-150">
                 <div>
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-bold uppercase tracking-wider text-slate-200">
-                      Select AI Model Engine
+                      AI Model Routing & Fallback Queue
                     </h3>
                     <span className="text-xs px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-400 font-semibold border border-emerald-500/30">
-                      Free Tier Compatible
+                      Free Tier Tier-Safe
                     </span>
                   </div>
                   <p className="text-xs text-slate-400 mt-1">
-                    Choose which Gemini model to use for all AI extraction and paper generation tasks across the site. Models are listed in descending order of capability.
+                    Select your primary default model and customize the priority queue order for automatic rate-limit failover.
                   </p>
                 </div>
 
-                {/* Currently Selected Model Summary Banner */}
+                {/* Active Model Summary Banner */}
                 <div className="p-4 rounded-xl bg-indigo-950/40 border border-indigo-500/30 flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 font-bold">
+                    <div className="w-10 h-10 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400 font-bold text-lg">
                       ⚡
                     </div>
                     <div>
                       <div className="text-xs font-semibold text-indigo-300 uppercase tracking-wider">
-                        Currently Active AI Model
+                        Default Primary Engine
                       </div>
                       <div className="text-base font-bold text-slate-100 flex items-center gap-2 mt-0.5">
                         {activeModelInfo.name}
@@ -785,68 +910,176 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                   </div>
                   <div className="text-right">
                     <span className="text-xs text-indigo-300 font-bold block">
-                      Capability Rank #{activeModelInfo.rank}
+                      Category: {activeModelInfo.category}
                     </span>
                     <span className="text-[11px] text-slate-400 block font-mono mt-0.5">
-                      {activeModelInfo.id}
+                      ID: {activeModelInfo.id}
                     </span>
                   </div>
                 </div>
 
-                {/* Models List in Descending Capability Order */}
+                {/* SECTION 1: Default Model Picker */}
                 <div className="space-y-3">
-                  {GEMINI_MODELS_DESCENDING.map((model) => {
-                    const isSelected = selectedModel === model.id;
-                    return (
-                      <div
-                        key={model.id}
-                        onClick={() => setSelectedModel(model.id)}
-                        className={`p-4 rounded-xl border transition-all cursor-pointer min-h-[44px] flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-                          isSelected
-                            ? 'bg-indigo-600/15 border-indigo-500 ring-1 ring-indigo-500/50 text-slate-100 shadow-lg'
-                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-300 hover:bg-slate-900/60'
-                        }`}
-                      >
-                        <div className="space-y-1.5 flex-1">
-                          <div className="flex items-center gap-2.5 flex-wrap">
-                            <span className="w-6 h-6 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-bold text-slate-300 shrink-0">
-                              #{model.rank}
-                            </span>
-                            <span className="text-sm font-bold text-slate-100">{model.name}</span>
-                            <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border ${model.badgeColor}`}>
-                              {model.badge}
-                            </span>
-                            {model.isFreeTierCompatible && (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">
-                                Free Key OK
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
+                      <Cpu className="w-4 h-4 text-indigo-400" />
+                      1. Select Default Primary Model
+                    </h4>
+                    <span className="text-[11px] text-slate-400">Default: gemini-3.5-flash</span>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-2.5">
+                    {GEMINI_MODELS_DESCENDING.map((model) => {
+                      const isSelected = selectedModel === model.id;
+                      return (
+                        <div
+                          key={model.id}
+                          onClick={() => setSelectedModel(model.id)}
+                          className={`p-3.5 rounded-xl border transition-all cursor-pointer flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                            isSelected
+                              ? 'bg-indigo-600/15 border-indigo-500 ring-1 ring-indigo-500/50 text-slate-100 shadow-md'
+                              : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-300 hover:bg-slate-900/60'
+                          }`}
+                        >
+                          <div className="space-y-1 flex-1">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className="text-sm font-bold text-slate-100">{model.name}</span>
+                              <span className={`text-[11px] px-2 py-0.5 rounded-full font-semibold border ${model.badgeColor}`}>
+                                {model.category}
                               </span>
+                              {model.id === 'gemini-3.5-flash' && (
+                                <span className="text-[10px] px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-bold border border-indigo-500/40">
+                                  Recommended Default
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-400 leading-relaxed">{model.description}</p>
+                            <div className="text-[11px] font-mono text-slate-500">ID: {model.id}</div>
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            {isSelected ? (
+                              <span className="inline-flex items-center gap-1 px-3 py-1 rounded-lg bg-indigo-600 text-white text-xs font-bold shadow">
+                                <Check className="w-3.5 h-3.5" /> Primary Default
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedModel(model.id);
+                                }}
+                                className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors"
+                              >
+                                Set as Primary
+                              </button>
                             )}
                           </div>
-                          <p className="text-xs text-slate-400 leading-relaxed">{model.description}</p>
-                          <div className="text-[11px] font-mono text-slate-500">Model ID: {model.id}</div>
                         </div>
+                      );
+                    })}
+                  </div>
+                </div>
 
-                        <div className="flex items-center gap-2 self-start sm:self-center">
-                          {isSelected ? (
-                            <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 text-white text-xs font-bold shadow-md shadow-indigo-600/30">
-                              <Check className="w-4 h-4" /> Selected
+                {/* SECTION 2: Custom Fallback Queue Order */}
+                <div className="pt-3 border-t border-slate-800/80 space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div>
+                      <h4 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
+                        <ArrowUpDown className="w-4 h-4 text-emerald-400" />
+                        2. Set Fallback Model Queue Order
+                      </h4>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        When primary encounters 429 quota or 503 errors, failover moves sequentially down this queue.
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => resetFallbackModelQueue()}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors flex items-center gap-1.5"
+                    >
+                      <RefreshCw className="w-3 h-3 text-slate-400" />
+                      Reset Queue Order
+                    </button>
+                  </div>
+
+                  {/* Fallback Queue Items */}
+                  <div className="space-y-2">
+                    {fallbackModelQueue.map((modelId, idx) => {
+                      const modelInfo = GEMINI_MODELS_DESCENDING.find((m) => m.id === modelId) || {
+                        id: modelId,
+                        name: modelId,
+                        category: 'Flash',
+                        badgeColor: 'bg-slate-800 text-slate-300 border-slate-700',
+                        description: '',
+                      };
+
+                      return (
+                        <div
+                          key={modelId}
+                          className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 flex items-center justify-between gap-3"
+                        >
+                          <div className="flex items-center gap-3 flex-1 min-w-0">
+                            <span className="w-6 h-6 rounded-lg bg-slate-800 border border-slate-700 flex items-center justify-center text-xs font-bold text-slate-300 shrink-0">
+                              #{idx + 1}
                             </span>
-                          ) : (
+                            <div className="min-w-0 space-y-0.5">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="text-xs font-bold text-slate-200 truncate">{modelInfo.name}</span>
+                                <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold border ${modelInfo.badgeColor}`}>
+                                  {modelInfo.category}
+                                </span>
+                              </div>
+                              <div className="text-[11px] font-mono text-slate-400 truncate">{modelId}</div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1 shrink-0">
                             <button
                               type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedModel(model.id);
-                              }}
-                              className="px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors min-h-[36px]"
+                              disabled={idx === 0}
+                              onClick={() => reorderFallbackModelQueue(idx, idx - 1)}
+                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 text-slate-300 transition-colors"
+                              title="Move UP in priority"
                             >
-                              Select Model
+                              <ChevronUp className="w-4 h-4" />
                             </button>
-                          )}
+                            <button
+                              type="button"
+                              disabled={idx === fallbackModelQueue.length - 1}
+                              onClick={() => reorderFallbackModelQueue(idx, idx + 1)}
+                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 text-slate-300 transition-colors"
+                              title="Move DOWN in priority"
+                            >
+                              <ChevronDown className="w-4 h-4" />
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
+                  </div>
+
+                  {/* Dynamic Failover Flow Pipeline Preview */}
+                  <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                    <div className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                      <Zap className="w-3.5 h-3.5 text-amber-400" />
+                      Live Failover Routing Chain:
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-wrap text-xs">
+                      <span className="px-2 py-1 rounded-md bg-indigo-600/30 text-indigo-300 font-bold border border-indigo-500/40">
+                        PRIMARY: {selectedModel}
+                      </span>
+                      {fallbackModelQueue.map((m, i) => (
+                        <React.Fragment key={m}>
+                          <span className="text-slate-500 font-bold">➔</span>
+                          <span className="px-2 py-1 rounded-md bg-slate-800 text-slate-300 font-mono text-[11px] border border-slate-700">
+                            #{i + 1}: {m}
+                          </span>
+                        </React.Fragment>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}

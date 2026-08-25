@@ -51,7 +51,15 @@ import {
   setStoredPrimaryStatus,
   ToastNotification,
 } from '../utils/geminiKeyManager';
-import { getStoredSelectedModel, setStoredSelectedModel } from '../utils/aiModelConfig';
+import {
+  DEFAULT_GEMINI_MODEL,
+  GEMINI_MODELS_DESCENDING,
+  getStoredFallbackModelQueue,
+  getStoredSelectedModel,
+  setStoredFallbackModelQueue,
+  setStoredSelectedModel,
+  SUPPORTED_GEMINI_MODELS,
+} from '../utils/aiModelConfig';
 
 interface HistoryEntry {
   archive: QuestionPaperArchive;
@@ -116,6 +124,10 @@ interface CbtStoreState {
   primaryExhaustedUntil?: number;
   selectedModel: string;
   setSelectedModel: (model: string) => void;
+  fallbackModelQueue: string[];
+  setFallbackModelQueue: (queue: string[]) => void;
+  reorderFallbackModelQueue: (fromIndex: number, toIndex: number) => void;
+  resetFallbackModelQueue: () => void;
   toasts: ToastNotification[];
 
   activeBackgroundTask: BackgroundTaskState | null;
@@ -332,8 +344,32 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
     selectedModel: getStoredSelectedModel(),
     setSelectedModel: (model: string) => {
       setStoredSelectedModel(model);
-      set({ selectedModel: model });
-      get().addToast('AI Model Updated', `Active model set to ${model}. All AI tasks will now use this model.`, 'success');
+      const currentQueue = get().fallbackModelQueue;
+      const filteredQueue = currentQueue.filter((m) => m !== model);
+      setStoredFallbackModelQueue(filteredQueue);
+      set({ selectedModel: model, fallbackModelQueue: filteredQueue });
+      get().addToast('AI Model Updated', `Active primary model set to ${model}.`, 'success');
+    },
+    fallbackModelQueue: getStoredFallbackModelQueue(),
+    setFallbackModelQueue: (queue: string[]) => {
+      setStoredFallbackModelQueue(queue);
+      set({ fallbackModelQueue: queue });
+    },
+    reorderFallbackModelQueue: (fromIndex: number, toIndex: number) => {
+      const current = get().fallbackModelQueue;
+      if (fromIndex < 0 || fromIndex >= current.length || toIndex < 0 || toIndex >= current.length) return;
+      const updated = [...current];
+      const [moved] = updated.splice(fromIndex, 1);
+      updated.splice(toIndex, 0, moved);
+      setStoredFallbackModelQueue(updated);
+      set({ fallbackModelQueue: updated });
+    },
+    resetFallbackModelQueue: () => {
+      const selected = get().selectedModel;
+      const defaultOrder = SUPPORTED_GEMINI_MODELS.filter((m) => m !== selected);
+      setStoredFallbackModelQueue(defaultOrder);
+      set({ fallbackModelQueue: defaultOrder });
+      get().addToast('Fallback Queue Reset', 'Restored default model capability sequence.', 'info');
     },
     toasts: [],
 
@@ -480,6 +516,20 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
         fallbackApiKeys: snapshot.fallbackKeys,
         activeKeyId: snapshot.activeKeyId,
       });
+      if (typeof window !== 'undefined') {
+        (window as any).__cbt_refresh_metrics__ = () => {
+          const s = getKeyUsageSnapshot();
+          set({
+            geminiApiKey: s.primaryKey,
+            primaryStatus: s.primaryKeyStatus,
+            primaryRpm: s.primaryRpm,
+            primaryRpd: s.primaryRpd,
+            primaryExhaustedUntil: s.primaryExhaustedUntil,
+            fallbackApiKeys: s.fallbackKeys,
+            activeKeyId: s.activeKeyId,
+          });
+        };
+      }
     },
 
     addToast: (

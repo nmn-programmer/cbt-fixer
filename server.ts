@@ -144,11 +144,119 @@ CRITICAL DIRECTIVE ON MARKING SCHEME EXTRACTION:
   }
 });
 
+// Stream B: API Route for Gemini Multi-modal Answer Key extraction
+app.post('/api/extract-answer-key', async (req, res) => {
+  try {
+    const { images, text, manifest, model: requestedModel } = req.body;
+    if ((!images || !images.length) && !text) {
+      return res.status(400).json({ error: 'Answer key page images or text is required' });
+    }
+
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
+
+    const answerKeySchema: Schema = {
+      type: Type.OBJECT,
+      properties: {
+        totalExpectedQuestions: { type: Type.INTEGER, description: "Total count of answer key entries present (e.g. 90, 180, 200)" },
+        testTitle: { type: Type.STRING, description: "Test title if printed on answer key sheet" },
+        answerKeys: {
+          type: Type.ARRAY,
+          description: "Structured list of all question numbers and official correct options or numerical values",
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              qNo: { type: Type.INTEGER, description: "Question number (e.g., 1, 2, 3...)" },
+              answer: { type: Type.STRING, description: "Official answer: option letter 'A'/'B'/'C'/'D', multiple 'A,B', or NAT value e.g. '4.5'" },
+              natValue: { type: Type.NUMBER, description: "Numeric decimal value if numerical/NAT type" },
+              subject: { type: Type.STRING, description: "Subject if listed (Physics, Chemistry, Math, etc.)" },
+              type: { type: Type.STRING, description: "Inferred type: MCQ, MSQ, NAT, MSM" }
+            },
+            required: ["qNo", "answer"]
+          }
+        },
+        sections: {
+          type: Type.ARRAY,
+          description: "Subject ranges inferred from answer key grid headers if present",
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              subjectName: { type: Type.STRING },
+              fromQNo: { type: Type.INTEGER },
+              toQNo: { type: Type.INTEGER }
+            },
+            required: ["subjectName", "fromQNo", "toQNo"]
+          }
+        }
+      },
+      required: ["answerKeys"]
+    };
+
+    let prompt = `You are an Answer Key & Ground-Truth Extraction Specialist.
+Examine the provided Answer Key table, grid, OMR key, or solutions pages carefully.
+
+CRITICAL INSTRUCTIONS:
+1. Extract EVERY question number (1, 2, 3...) and its official correct answer option (A, B, C, D, 1, 2, 3, 4, or numerical value).
+2. For Numerical / NAT questions, extract the exact numeric decimal answer (e.g., "40.5", "3.14") into both "answer" and "natValue".
+3. For Multiple Choice with multiple options (e.g. A and C), format as "A,C".
+4. Count total expected questions in the answer key.
+5. If subject headers (Physics, Chemistry, Mathematics) are present above answer key columns, extract section ranges.`;
+
+    if (manifest) {
+      prompt += `\n\nGLOBAL BLUEPRINT MANIFEST:
+- Test Title: ${manifest.testTitle || 'N/A'}
+- Total Expected Questions: ${manifest.totalExpectedQuestions || 'N/A'}
+- Subject Section Ranges: ${JSON.stringify(manifest.sections || [])}
+Use this blueprint to map question numbers accurately to subjects and verify expected answer key entries.`;
+    }
+
+    const contents: any[] = [];
+    if (images && Array.isArray(images)) {
+      images.forEach((base64: string) => {
+        const isJpeg = base64.startsWith('data:image/jpeg');
+        contents.push({
+          inlineData: {
+            data: base64.replace(/^data:image\/\w+;base64,/, ''),
+            mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+          }
+        });
+      });
+    }
+    if (text) {
+      contents.push({ text: `Answer Key Text:\n${text}` });
+    }
+    contents.push({ text: prompt });
+
+    const keyResult = await executeGeminiWithFallback(ai, {
+      contents,
+      schema: answerKeySchema,
+      temperature: 0.1,
+      preferredModel: requestedModel,
+      label: 'Server Extract Answer Key (Stream B)'
+    });
+
+    res.json(keyResult);
+  } catch (error: any) {
+    console.error('Error extracting answer key:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
+
 // API Route for Gemini Multi-modal PDF analysis
 app.post('/api/extract-pdf-structure', async (req, res) => {
   try {
     const { images, pageOffset = 0, options = {}, model: requestedModel } = req.body;
-    const { hasAnswerKey = true, extractEnglishOnly = false } = options;
+    const { hasAnswerKey = true, extractEnglishOnly = false, manifest = null, targetQNos = null } = options;
     
     if (!images || !images.length) {
       return res.status(400).json({ error: 'No images provided' });
@@ -299,6 +407,16 @@ CRITICAL BOUNDING BOX & COLUMN PROTOCOL:
      * Attach it as Part 2 to the preceding question in "splitParts", or if outputting as a block, mark "isOrphanContinuation": true and "continuationForQNo": <previous_question_number>.
 
 ${extractEnglishOnly ? 'BILINGUAL PAPER: Extract ONLY the English version of questions and options.' : ''}
+
+${manifest ? `GLOBAL BLUEPRINT MANIFEST DIRECTIVE:
+- Total Expected Questions: ${manifest.totalExpectedQuestions || 'Unknown'}
+- Subject Section Ranges: ${JSON.stringify(manifest.sections || [])}
+- Marking Rules Summary: ${JSON.stringify(manifest.markingSchemeSummary || manifest.rules || 'Standard JEE/NEET')}
+Strictly enforce subject categorization (Physics/Chemistry/Mathematics/Biology/General) and question ranges for each extracted question based on this blueprint.` : ''}
+
+${targetQNos && Array.isArray(targetQNos) && targetQNos.length > 0 ? `PINPOINT RESCAN DIRECTIVE:
+Specifically search for missing question(s) Q${targetQNos.join(', Q')}.
+Focus on column margins, top/bottom boundaries, or unnumbered diagrams to locate and extract these specific question numbers!` : ''}
 
 Output normalized bounding box [ymin, xmin, ymax, xmax] between 0.0 and 1.0 for each question.
 ${hasAnswerKey ? 'Extract printed answer key table if present on these pages.' : ''}`;

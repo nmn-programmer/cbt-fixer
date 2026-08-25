@@ -1,10 +1,12 @@
 import { GoogleGenAI, Schema } from '@google/genai';
 
 export const SELECTED_MODEL_STORAGE_KEY = 'user_gemini_selected_model';
+export const FALLBACK_MODEL_QUEUE_STORAGE_KEY = 'user_gemini_fallback_model_queue';
 
 export interface GeminiModelInfo {
   id: string;
   name: string;
+  category: string;
   badge: string;
   badgeColor: string;
   description: string;
@@ -13,73 +15,109 @@ export interface GeminiModelInfo {
 }
 
 /**
- * Standard, supported Gemini models listed in descending order of capability:
- * 1. gemini-3.1-pro-preview (Pro Tier: Advanced reasoning, complex STEM & dense document analysis)
- * 2. gemini-3.7-flash (Flagship Flash: Next-gen speed, vision accuracy & reasoning balance)
- * 3. gemini-2.5-flash (High Speed Vision: High-precision document OCR & bounding box default)
- * 4. gemini-3.1-flash-lite (Ultra Fast Lite: Low latency lightweight engine with separate quota)
- * 5. gemini-2.5-flash-lite (Lightweight Fallback: Fast secondary lightweight model)
+ * Supported Google AI Studio Free Tier Gemini models:
+ * 1. gemini-3.5-flash (Flash: Fast & Reasoning)
+ * 2. gemini-3.5-flash-lite (Flash: Subagent & High Throughput)
+ * 3. gemini-3.1-flash-lite (Flash: Lightweight Tasks)
+ * 4. gemini-2.5-flash (Flash: Standard Low Latency)
+ * 5. gemini-2.5-pro (Pro: Complex Reasoning & STEM)
  */
 export const GEMINI_MODELS_DESCENDING: GeminiModelInfo[] = [
   {
-    id: 'gemini-3.1-pro-preview',
-    name: 'Gemini 3.1 Pro',
-    badge: 'Pro Reasoning',
-    badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/30',
-    description: 'Most capable model for multi-step reasoning, complex STEM math formulas, and dense multi-column question papers.',
+    id: 'gemini-3.5-flash',
+    name: 'Gemini 3.5 Flash',
+    category: 'Flash (Fast & Reasoning)',
+    badge: 'Fast & Reasoning',
+    badgeColor: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
+    description: 'Flagship model for high-speed multi-step reasoning, dense question papers, and high multimodal vision precision.',
     isFreeTierCompatible: true,
     rank: 1,
   },
   {
-    id: 'gemini-3.7-flash',
-    name: 'Gemini 3.7 Flash',
-    badge: 'Flagship Flash',
-    badgeColor: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
-    description: 'Next-gen flagship Flash model combining superior multimodal vision precision, fast response, and balanced reasoning.',
+    id: 'gemini-3.5-flash-lite',
+    name: 'Gemini 3.5 Flash-Lite',
+    category: 'Flash (Subagent & High Throughput)',
+    badge: 'High Throughput',
+    badgeColor: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+    description: 'Subagent-optimized high throughput model designed for parallel swarm extraction and low-latency OCR.',
     isFreeTierCompatible: true,
     rank: 2,
   },
   {
-    id: 'gemini-2.5-flash',
-    name: 'Gemini 2.5 Flash',
-    badge: 'High Speed Vision',
+    id: 'gemini-3.1-flash-lite',
+    name: 'Gemini 3.1 Flash-Lite',
+    category: 'Flash (Lightweight Tasks)',
+    badge: 'Lightweight Tasks',
     badgeColor: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
-    description: 'High-speed multimodal vision engine with excellent document OCR and question bounding box accuracy.',
+    description: 'Fast lightweight engine with separate quota headroom for quick structure and layout parsing.',
     isFreeTierCompatible: true,
     rank: 3,
   },
   {
-    id: 'gemini-3.1-flash-lite',
-    name: 'Gemini 3.1 Flash Lite',
-    badge: 'Ultra Fast Lite',
-    badgeColor: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
-    description: 'Low-latency lightweight Flash Lite engine with separate RPM/RPD capacity headroom.',
+    id: 'gemini-2.5-flash',
+    name: 'Gemini 2.5 Flash',
+    category: 'Flash (Standard Low Latency)',
+    badge: 'Standard Low Latency',
+    badgeColor: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+    description: 'Reliable standard multimodal vision model with high document OCR accuracy and robust bounding box detection.',
     isFreeTierCompatible: true,
     rank: 4,
   },
   {
-    id: 'gemini-2.5-flash-lite',
-    name: 'Gemini 2.5 Flash Lite',
-    badge: 'Lightweight Fallback',
-    badgeColor: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-    description: 'Fast lightweight fallback model for basic document structure extraction during peak traffic.',
+    id: 'gemini-2.5-pro',
+    name: 'Gemini 2.5 Pro',
+    category: 'Pro (Complex Reasoning & STEM)',
+    badge: 'Pro Reasoning & STEM',
+    badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/30',
+    description: 'Pro tier engine specializing in complex mathematical reasoning, advanced STEM formulas, and dense documents.',
     isFreeTierCompatible: true,
     rank: 5,
   },
 ];
 
 export const SUPPORTED_GEMINI_MODELS = GEMINI_MODELS_DESCENDING.map((m) => m.id);
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash';
 
 export type SupportedGeminiModel = string;
 
 export function getStoredSelectedModel(): string {
-  if (typeof window === 'undefined') return 'gemini-2.5-flash';
-  return localStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || 'gemini-2.5-flash';
+  if (typeof window === 'undefined') return DEFAULT_GEMINI_MODEL;
+  const stored = localStorage.getItem(SELECTED_MODEL_STORAGE_KEY);
+  if (stored && SUPPORTED_GEMINI_MODELS.includes(stored)) {
+    return stored;
+  }
+  return DEFAULT_GEMINI_MODEL;
 }
 
 export function setStoredSelectedModel(modelId: string): void {
   if (typeof window === 'undefined') return;
   localStorage.setItem(SELECTED_MODEL_STORAGE_KEY, modelId);
+}
+
+export function getStoredFallbackModelQueue(): string[] {
+  const defaultQueue = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro'];
+  if (typeof window === 'undefined') return defaultQueue;
+  try {
+    const raw = localStorage.getItem(FALLBACK_MODEL_QUEUE_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const valid = parsed.filter((id) => SUPPORTED_GEMINI_MODELS.includes(id));
+        SUPPORTED_GEMINI_MODELS.forEach((id) => {
+          if (!valid.includes(id)) valid.push(id);
+        });
+        return valid;
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+  return defaultQueue;
+}
+
+export function setStoredFallbackModelQueue(queue: string[]): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(FALLBACK_MODEL_QUEUE_STORAGE_KEY, JSON.stringify(queue));
 }
 
 export interface AiGenerateOptions {
@@ -166,7 +204,7 @@ export function formatAiErrorMessage(err: any): string {
 
 /**
  * Executes a Gemini request prioritizing the user's selected model,
- * with graceful failover down the descending capability model chain.
+ * with graceful failover down the user-configured fallback model queue.
  */
 export async function executeGeminiWithFallback<T = any>(
   ai: GoogleGenAI,
@@ -175,18 +213,28 @@ export async function executeGeminiWithFallback<T = any>(
   const { contents, schema, temperature = 0.1, systemInstruction, label = 'AI Operation', preferredModel } = options;
   let lastError: any = null;
 
-  // Build model execution chain starting with user's preferred/selected model
+  // Primary model selected by user (or passed in)
   const primaryModel = preferredModel || getStoredSelectedModel();
-  const modelChain: string[] = [];
+  const fallbackQueue = getStoredFallbackModelQueue();
 
-  if (primaryModel) {
+  const modelChain: string[] = [];
+  if (primaryModel && SUPPORTED_GEMINI_MODELS.includes(primaryModel)) {
     modelChain.push(primaryModel);
+  } else {
+    modelChain.push(DEFAULT_GEMINI_MODEL);
   }
 
-  // Append remaining models in descending order of capability
-  GEMINI_MODELS_DESCENDING.forEach((m) => {
-    if (!modelChain.includes(m.id)) {
-      modelChain.push(m.id);
+  // Append user's fallback queue order
+  fallbackQueue.forEach((m) => {
+    if (!modelChain.includes(m) && SUPPORTED_GEMINI_MODELS.includes(m)) {
+      modelChain.push(m);
+    }
+  });
+
+  // Append remaining supported models if any missing
+  SUPPORTED_GEMINI_MODELS.forEach((m) => {
+    if (!modelChain.includes(m)) {
+      modelChain.push(m);
     }
   });
 
@@ -272,3 +320,4 @@ export async function executeGeminiWithFallback<T = any>(
 
   throw new Error(formatAiErrorMessage(lastError));
 }
+

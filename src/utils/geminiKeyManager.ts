@@ -303,11 +303,13 @@ export function filterAndCalculateUsage(timestamps: number[]): {
 /**
  * Record a request execution for a key (primary or fallback)
  */
-export function recordRequestUsage(keyId: string): void {
+export function recordRequestUsage(keyId: string, count: number = 1): void {
   const now = Date.now();
-  if (keyId === 'primary') {
+  if (keyId === 'primary' || keyId === 'env_default') {
     const timestamps = getStoredPrimaryTimestamps();
-    timestamps.push(now);
+    for (let i = 0; i < count; i++) {
+      timestamps.push(now);
+    }
     const { filtered } = filterAndCalculateUsage(timestamps);
     setStoredPrimaryTimestamps(filtered);
   } else {
@@ -315,7 +317,9 @@ export function recordRequestUsage(keyId: string): void {
     const updated = fallbacks.map((f) => {
       if (f.id === keyId) {
         const ts = f.requestTimestamps || [];
-        ts.push(now);
+        for (let i = 0; i < count; i++) {
+          ts.push(now);
+        }
         const { rpm, rpd, filtered } = filterAndCalculateUsage(ts);
         return {
           ...f,
@@ -329,6 +333,15 @@ export function recordRequestUsage(keyId: string): void {
     });
     setStoredFallbackKeys(updated);
   }
+
+  // Trigger live store update if available
+  if (typeof window !== 'undefined' && (window as any).__cbt_refresh_metrics__) {
+    try {
+      (window as any).__cbt_refresh_metrics__();
+    } catch (e) {
+      // ignore
+    }
+  }
 }
 
 /**
@@ -338,16 +351,19 @@ export function getKeyUsageSnapshot(): KeyUsageMetrics {
   const now = Date.now();
   const primaryKey = getStoredPrimaryApiKey();
   const primaryTs = getStoredPrimaryTimestamps();
-  const { rpm: primaryRpm, rpd: primaryRpd, filtered: primaryFiltered } = filterAndCalculateUsage(primaryTs);
+  let { rpm: primaryRpm, rpd: primaryRpd, filtered: primaryFiltered } = filterAndCalculateUsage(primaryTs);
   setStoredPrimaryTimestamps(primaryFiltered);
 
   const { status: savedPrimaryStatus, exhaustedUntil: primaryExhaustedUntil } = getStoredPrimaryStatus();
   let primaryKeyStatus: ApiKeyStatus = savedPrimaryStatus;
 
-  // Reset expired cooldowns
+  // Reset expired cooldowns or force max RPM if exhausted
   if (primaryExhaustedUntil && now >= primaryExhaustedUntil) {
     primaryKeyStatus = 'Ready';
     setStoredPrimaryStatus('Ready');
+  } else if (primaryKeyStatus === 'Quota Exhausted' || (primaryExhaustedUntil && now < primaryExhaustedUntil)) {
+    primaryKeyStatus = 'Quota Exhausted';
+    primaryRpm = Math.max(primaryRpm, GEMINI_FREE_TIER_RPM);
   } else if (primaryRpm >= GEMINI_FREE_TIER_RPM || primaryRpd >= GEMINI_FREE_TIER_RPD) {
     primaryKeyStatus = 'Quota Exhausted';
   }
@@ -357,11 +373,14 @@ export function getKeyUsageSnapshot(): KeyUsageMetrics {
   let primaryIsUsable = primaryKey.trim().length > 0 && primaryKeyStatus !== 'Quota Exhausted' && primaryKeyStatus !== 'Invalid';
 
   const fallbackKeys: FallbackKeyItem[] = rawFallbacks.map((f) => {
-    const { rpm, rpd, filtered } = filterAndCalculateUsage(f.requestTimestamps || []);
+    let { rpm, rpd, filtered } = filterAndCalculateUsage(f.requestTimestamps || []);
     let fStatus: ApiKeyStatus = f.status || 'Ready';
 
     if (f.exhaustedUntil && now >= f.exhaustedUntil) {
       fStatus = 'Ready';
+    } else if (fStatus === 'Quota Exhausted' || (f.exhaustedUntil && now < f.exhaustedUntil)) {
+      fStatus = 'Quota Exhausted';
+      rpm = Math.max(rpm, GEMINI_FREE_TIER_RPM);
     } else if (rpm >= GEMINI_FREE_TIER_RPM || rpd >= GEMINI_FREE_TIER_RPD) {
       fStatus = 'Quota Exhausted';
     }
@@ -410,6 +429,7 @@ export function getKeyUsageSnapshot(): KeyUsageMetrics {
 export function getUsageColor(count: number, limit: number, isExhausted: boolean = false): {
   color: string;
   bg: string;
+  barBg: string;
   border: string;
   percentage: number;
   badge: string;
@@ -417,7 +437,8 @@ export function getUsageColor(count: number, limit: number, isExhausted: boolean
   if (isExhausted) {
     return {
       color: 'text-rose-400',
-      bg: 'bg-rose-500/20',
+      bg: 'bg-rose-500/15',
+      barBg: 'bg-rose-500',
       border: 'border-rose-500/30',
       percentage: 100,
       badge: 'Exhausted',
@@ -429,7 +450,8 @@ export function getUsageColor(count: number, limit: number, isExhausted: boolean
   if (percentage >= 90) {
     return {
       color: 'text-rose-400',
-      bg: 'bg-rose-500/20',
+      bg: 'bg-rose-500/15',
+      barBg: 'bg-rose-500',
       border: 'border-rose-500/30',
       percentage,
       badge: 'High Usage',
@@ -437,7 +459,8 @@ export function getUsageColor(count: number, limit: number, isExhausted: boolean
   } else if (percentage >= 70) {
     return {
       color: 'text-amber-400',
-      bg: 'bg-amber-500/20',
+      bg: 'bg-amber-500/15',
+      barBg: 'bg-amber-500',
       border: 'border-amber-500/30',
       percentage,
       badge: 'Moderate',
@@ -445,12 +468,251 @@ export function getUsageColor(count: number, limit: number, isExhausted: boolean
   } else {
     return {
       color: 'text-emerald-400',
-      bg: 'bg-emerald-500/20',
+      bg: 'bg-emerald-500/15',
+      barBg: 'bg-emerald-500',
       border: 'border-emerald-500/30',
       percentage,
       badge: 'Optimal',
     };
   }
+}
+
+/**
+ * Helper to mask sensitive API key string (e.g. AIzaSyD...8xQ)
+ */
+export interface LatencyPoint {
+  timestamp: number;
+  latencyMs: number;
+  success: boolean;
+  statusText?: string;
+}
+
+export interface KeyHealthMetrics {
+  keyId: string;
+  label: string;
+  keyMasked: string;
+  role?: string;
+  status: ApiKeyStatus;
+  rpmCount: number;
+  rpdCount: number;
+  latencyMs?: number;
+  averageLatencyMs: number;
+  latencyHistory: LatencyPoint[];
+  nearThreshold: boolean;
+  isAutoPingActive: boolean;
+  lastPingAt?: number;
+}
+
+const LATENCY_HISTORY_STORAGE = 'user_gemini_latency_history';
+const AUTO_PING_SETTING_STORAGE = 'user_gemini_auto_ping_enabled';
+
+// In-memory latency cache (persisted to localStorage)
+let inMemoryLatencyHistory: Record<string, LatencyPoint[]> = {};
+
+/**
+ * Get stored latency history per key
+ */
+export function getStoredLatencyHistory(): Record<string, LatencyPoint[]> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(LATENCY_HISTORY_STORAGE);
+    if (!raw) return {};
+    return JSON.parse(raw) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+/**
+ * Save latency point for a key
+ */
+export function recordKeyLatency(keyId: string, latencyMs: number, success: boolean = true, statusText?: string): void {
+  const history = getStoredLatencyHistory();
+  const points = history[keyId] || [];
+  const newPoint: LatencyPoint = {
+    timestamp: Date.now(),
+    latencyMs,
+    success,
+    statusText
+  };
+  // Keep last 15 data points
+  const updatedPoints = [...points, newPoint].slice(-15);
+  history[keyId] = updatedPoints;
+  inMemoryLatencyHistory = history;
+
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.setItem(LATENCY_HISTORY_STORAGE, JSON.stringify(history));
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // Notify listeners
+  if (typeof window !== 'undefined' && (window as any).__cbt_refresh_metrics__) {
+    try {
+      (window as any).__cbt_refresh_metrics__();
+    } catch (e) {}
+  }
+}
+
+/**
+ * Get average latency for a key in ms
+ */
+export function getKeyAverageLatency(keyId: string): number {
+  const history = getStoredLatencyHistory();
+  const points = history[keyId] || [];
+  const valid = points.filter(p => p.success && p.latencyMs > 0);
+  if (valid.length === 0) return 0;
+  const sum = valid.reduce((acc, curr) => acc + curr.latencyMs, 0);
+  return Math.round(sum / valid.length);
+}
+
+/**
+ * Get auto-ping enabled status
+ */
+export function isAutoPingEnabled(): boolean {
+  if (typeof window === 'undefined') return true;
+  const val = localStorage.getItem(AUTO_PING_SETTING_STORAGE);
+  return val === null ? true : val === 'true';
+}
+
+/**
+ * Set auto-ping enabled status
+ */
+export function setAutoPingEnabled(enabled: boolean): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(AUTO_PING_SETTING_STORAGE, String(enabled));
+  if (enabled) {
+    startHealthAutoPingLoop();
+  } else {
+    stopHealthAutoPingLoop();
+  }
+}
+
+let autoPingIntervalTimer: any = null;
+
+/**
+ * Run health audit pings for all configured keys in fleet
+ */
+export async function runHealthPingAuditAllKeys(): Promise<KeyHealthMetrics[]> {
+  const snapshot = getKeyUsageSnapshot();
+  const latencyMap = getStoredLatencyHistory();
+
+  const keysToAudit: { id: string; label: string; key: string }[] = [];
+  if (snapshot.primaryKey.trim()) {
+    keysToAudit.push({ id: 'primary', label: 'Primary API Key', key: snapshot.primaryKey.trim() });
+  }
+  snapshot.fallbackKeys.forEach((f) => {
+    if (f.key && f.key.trim()) {
+      keysToAudit.push({ id: f.id, label: f.label, key: f.key.trim() });
+    }
+  });
+
+  const results: KeyHealthMetrics[] = [];
+
+  for (const item of keysToAudit) {
+    const start = Date.now();
+    const res = await validateApiKey(item.key);
+    const latency = Date.now() - start;
+
+    if (res.valid) {
+      recordKeyLatency(item.id, latency, true, 'Healthy');
+    } else {
+      recordKeyLatency(item.id, latency, false, res.error || 'Check Failed');
+    }
+  }
+
+  // Return fresh health metrics snapshot
+  return getFleetHealthSnapshot();
+}
+
+/**
+ * Start health auto ping loop (runs every 45s if enabled)
+ */
+export function startHealthAutoPingLoop(intervalMs: number = 45000): void {
+  if (typeof window === 'undefined') return;
+  stopHealthAutoPingLoop();
+
+  if (!isAutoPingEnabled()) return;
+
+  // Run initial audit after 3 seconds, then on interval
+  setTimeout(() => {
+    runHealthPingAuditAllKeys().catch(() => {});
+  }, 3000);
+
+  autoPingIntervalTimer = setInterval(() => {
+    if (isAutoPingEnabled()) {
+      runHealthPingAuditAllKeys().catch(() => {});
+    }
+  }, intervalMs);
+}
+
+/**
+ * Stop health auto ping loop
+ */
+export function stopHealthAutoPingLoop(): void {
+  if (autoPingIntervalTimer) {
+    clearInterval(autoPingIntervalTimer);
+    autoPingIntervalTimer = null;
+  }
+}
+
+/**
+ * Get fleet health metrics snapshot
+ */
+export function getFleetHealthSnapshot(): KeyHealthMetrics[] {
+  const snapshot = getKeyUsageSnapshot();
+  const history = getStoredLatencyHistory();
+  const autoPingOn = isAutoPingEnabled();
+
+  const metrics: KeyHealthMetrics[] = [];
+
+  if (snapshot.primaryKey.trim()) {
+    const keyId = 'primary';
+    const pts = history[keyId] || [];
+    const avg = getKeyAverageLatency(keyId);
+    const lastPt = pts[pts.length - 1];
+    metrics.push({
+      keyId,
+      label: 'Primary API Key',
+      keyMasked: maskApiKey(snapshot.primaryKey),
+      status: snapshot.primaryKeyStatus,
+      rpmCount: snapshot.primaryRpm,
+      rpdCount: snapshot.primaryRpd,
+      latencyMs: lastPt?.latencyMs,
+      averageLatencyMs: avg,
+      latencyHistory: pts,
+      nearThreshold: snapshot.primaryRpm >= 12,
+      isAutoPingActive: autoPingOn,
+      lastPingAt: lastPt?.timestamp
+    });
+  }
+
+  snapshot.fallbackKeys.forEach((f) => {
+    if (f.key && f.key.trim()) {
+      const pts = history[f.id] || [];
+      const avg = getKeyAverageLatency(f.id);
+      const lastPt = pts[pts.length - 1];
+      metrics.push({
+        keyId: f.id,
+        label: f.label,
+        keyMasked: maskApiKey(f.key),
+        role: f.role,
+        status: f.status,
+        rpmCount: f.rpmCount,
+        rpdCount: f.rpdCount,
+        latencyMs: lastPt?.latencyMs,
+        averageLatencyMs: avg,
+        latencyHistory: pts,
+        nearThreshold: f.rpmCount >= 12,
+        isAutoPingActive: autoPingOn,
+        lastPingAt: lastPt?.timestamp
+      });
+    }
+  });
+
+  return metrics;
 }
 
 /**
@@ -721,6 +983,7 @@ export async function fetchWithGeminiFallback(
     label: string;
     key: string;
     status: ApiKeyStatus;
+    rpmCount: number;
     exhaustedUntil?: number;
   }
 
@@ -732,6 +995,7 @@ export async function fetchWithGeminiFallback(
       label: 'Primary API Key',
       key: primaryKey.trim(),
       status: snapshot.primaryKeyStatus,
+      rpmCount: snapshot.primaryRpm,
       exhaustedUntil: snapshot.primaryExhaustedUntil,
     });
   }
@@ -743,6 +1007,7 @@ export async function fetchWithGeminiFallback(
         label: f.label || `Fallback Key ${idx + 1}`,
         key: f.key.trim(),
         status: f.status,
+        rpmCount: f.rpmCount,
         exhaustedUntil: f.exhaustedUntil,
       });
     }
@@ -771,8 +1036,12 @@ export async function fetchWithGeminiFallback(
     }
   }
 
-  // Load Balance: Rotate starting candidate to distribute RPM load evenly across free tier keys
-  if (usableCandidates.length > 1) {
+  // Smart Pre-emptive Load Balancer:
+  // Sort usable candidates by lowest current RPM usage first, so keys nearing 15 RPM (>= 12 RPM) are routed away from!
+  usableCandidates.sort((a, b) => a.rpmCount - b.rpmCount);
+
+  // Rotate tie-breakers with equal RPMs
+  if (usableCandidates.length > 1 && usableCandidates[0].rpmCount === usableCandidates[1].rpmCount) {
     const startIdx = currentKeyRotationIndex % usableCandidates.length;
     currentKeyRotationIndex++;
     usableCandidates = [
@@ -796,6 +1065,7 @@ export async function fetchWithGeminiFallback(
 
     let res: Response | null = null;
     const maxAttempts = 2;
+    const reqStart = Date.now();
 
     // Attempt request with exponential backoff for 500/503 errors
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -813,6 +1083,13 @@ export async function fetchWithGeminiFallback(
           await sleep(attempt * 500);
         }
       }
+    }
+
+    const latencyMs = Date.now() - reqStart;
+    if (res) {
+      recordKeyLatency(candidate.id, latencyMs, res.ok, res.ok ? 'HTTP 200' : `HTTP ${res.status}`);
+    } else {
+      recordKeyLatency(candidate.id, latencyMs, false, 'Network Error');
     }
 
     if (!res) {

@@ -514,12 +514,10 @@ export async function auditDiagramBounds(
   }
 
   let [ymin, xmin, ymax, xmax] = box;
-  if (hasDiagramHint) {
-    // Expand boundary by 3% margin to ensure full diagram axes and labels are included
-    ymin = Math.max(0, ymin - 0.02);
-    ymax = Math.min(1.0, ymax + 0.03);
-    xmin = Math.max(0, xmin - 0.015);
-    xmax = Math.min(1.0, xmax + 0.02);
-  }
+  // Apply +3% safety padding margin to guarantee full diagram axes, symbols, and labels are included without clipping
+  ymin = Math.max(0, ymin - 0.03);
+  ymax = Math.min(1.0, ymax + 0.03);
+  xmin = Math.max(0, xmin - 0.03);
+  xmax = Math.min(1.0, xmax + 0.03);
   return [ymin, xmin, ymax, xmax];
 }
