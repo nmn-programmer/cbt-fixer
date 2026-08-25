@@ -300,31 +300,37 @@ export const AnswerKeyStudioModal: React.FC = () => {
         modalType: 'answer_key_studio',
       });
 
-      let base64Image = '';
+      let images: string[] = [];
 
-      if (file.type.includes('pdf') || file.name.endsWith('.pdf')) {
-        // Render PDF first page or prompt
-        const pdfjsLib = await getPdfjsLib();
+      if (file.name.toLowerCase().endsWith('.pdf') || file.type.includes('pdf')) {
         const arrayBuffer = await file.arrayBuffer();
+        const pdfjsLib = await getPdfjsLib();
         const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-        const page = await pdfDoc.getPage(1);
-        const viewport = page.getViewport({ scale: 2.0 });
-        const canvas = document.createElement('canvas');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) throw new Error('Could not get canvas 2d context');
+        const numPages = Math.min(pdfDoc.numPages, 10);
 
-        await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
-        base64Image = canvas.toDataURL('image/jpeg', 0.9);
+        for (let i = 1; i <= numPages; i++) {
+          const page = await pdfDoc.getPage(i);
+          const viewport = page.getViewport({ scale: 2.0 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) throw new Error('Could not get canvas 2d context');
+
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          await page.render({ canvasContext: ctx, viewport } as any).promise;
+          images.push(canvas.toDataURL('image/jpeg', 0.85));
+        }
       } else {
         // Image file
-        base64Image = await new Promise<string>((resolve, reject) => {
+        const base64Image = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result as string);
           reader.onerror = reject;
           reader.readAsDataURL(file);
         });
+        images.push(base64Image);
       }
 
       updateBackgroundTask({
@@ -335,12 +341,12 @@ export const AnswerKeyStudioModal: React.FC = () => {
       });
 
       const response = await fetchWithGeminiFallback(
-        '/api/extract-answer-key-page',
+        '/api/extract-answer-key-pdf',
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            image: base64Image,
+            images,
             options: { enableDoublePass: enableDoublePassRescan },
           }),
         },

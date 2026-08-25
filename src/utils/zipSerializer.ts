@@ -72,13 +72,12 @@ export async function serializeZipArchive(
 
       const subjectJson = {
         testConfig: {
-          title: `${archive.title} - ${subject.name}`,
           pdfFileHash: archive.metadata.pdfFileHash || '',
           additionalData: archive.metadata.additionalData || {},
         },
         pdfCropperData: subjectPdfCropperData,
-        appVersion: archive.metadata.appVersion || '2.6.0',
-        generatedBy: 'CBTQuestionPaperStudio',
+        appVersion: archive.metadata.appVersion || '2.5.0',
+        generatedBy: 'pdfCropperPage',
       };
 
       subjectFolder.file('data.json', JSON.stringify(subjectJson, null, 2));
@@ -139,13 +138,12 @@ export async function serializeZipArchive(
 
     const rootJson = {
       testConfig: {
-        title: archive.title,
         pdfFileHash: archive.metadata.pdfFileHash || '',
         additionalData: archive.metadata.additionalData || {},
       },
       pdfCropperData,
-      appVersion: archive.metadata.appVersion || '2.6.0',
-      generatedBy: 'CBTQuestionPaperStudio',
+      appVersion: archive.metadata.appVersion || '2.5.0',
+      generatedBy: 'pdfCropperPage',
     };
 
     zip.file('data.json', JSON.stringify(rootJson, null, 2));
@@ -198,13 +196,12 @@ export function serializeDataJson(
 
   const rootJson = {
     testConfig: {
-      title: archive.title,
       pdfFileHash: archive.metadata.pdfFileHash || '',
       additionalData: archive.metadata.additionalData || {},
     },
     pdfCropperData,
-    appVersion: archive.metadata.appVersion || '2.6.0',
-    generatedBy: 'CBTQuestionPaperStudio',
+    appVersion: archive.metadata.appVersion || '2.5.0',
+    generatedBy: 'pdfCropperPage',
   };
 
   const jsonString = JSON.stringify(rootJson, null, 2);
@@ -216,27 +213,21 @@ export function serializeDataJson(
 
 function serializeQuestion(
   q: QuestionData,
-  sectionName: string,
-  sanitizeFilenames: boolean
+  _sectionName: string,
+  _sanitizeFilenames: boolean
 ): any {
-  // Build pdfData
-  const pdfData = q.pdfData.map((part, idx) => {
-    const ext = part.filename ? getFileExtension(part.filename) : 'png';
-    const filename = sanitizeFilenames
-      ? buildImageFileName(sectionName, q.que, idx + 1, ext)
-      : part.filename || buildImageFileName(sectionName, q.que, idx + 1, ext);
-
+  // Build pdfData with exact requested coordinates structure: page, x1, x2, y1, y2
+  const pdfData = q.pdfData.map((part) => {
     return {
       page: part.page ?? 1,
       x1: part.x1 ?? 0,
-      y1: part.y1 ?? 0,
       x2: part.x2 ?? 100,
+      y1: part.y1 ?? 0,
       y2: part.y2 ?? 100,
-      filename,
     };
   });
 
-  return {
+  const questionObj: Record<string, any> = {
     que: q.que,
     type: q.type,
     marks: {
@@ -245,9 +236,14 @@ function serializeQuestion(
       ...(q.marks.pm !== undefined && q.marks.pm !== 0 ? { pm: q.marks.pm } : {}),
       ...(q.marks.max !== undefined ? { max: q.marks.max } : {}),
     },
-    answerOptions: q.answerOptions || '',
     pdfData,
   };
+
+  if (q.answerOptions && q.answerOptions.trim() !== '') {
+    questionObj.answerOptions = q.answerOptions.trim();
+  }
+
+  return questionObj;
 }
 
 async function getImageBinary(

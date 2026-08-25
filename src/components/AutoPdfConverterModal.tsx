@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { useCbtStore } from '../store/useCbtStore';
-import { fetchWithGeminiFallback } from '../utils/geminiKeyManager';
+import { fetchWithGeminiFallback, ratePaceDelay } from '../utils/geminiKeyManager';
+import JSZip from 'jszip';
 import { BlueprintSectionRange, QuestionType } from '../types/cbt';
 import {
   FileText,
@@ -176,7 +177,7 @@ export const AutoPdfConverterModal: React.FC = () => {
     if (e.target.files && e.target.files[0]) {
       const selected = e.target.files[0];
       setFile(selected);
-      setTestTitle(selected.name.replace(/\.pdf$/i, ''));
+      setTestTitle(selected.name.replace(/\.(pdf|zip)$/i, ''));
       setError('');
       setPercent(0);
       setStatus('');
@@ -185,35 +186,96 @@ export const AutoPdfConverterModal: React.FC = () => {
       setIsLoadingThumbnails(true);
 
       try {
-        const arrayBuffer = await selected.arrayBuffer();
-        const pdfjsLib = await getPdfjsLib();
-        const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-        const numPages = pdfDoc.numPages;
-
-        const generatedThumbnails = [];
+        const isZip = selected.name.toLowerCase().endsWith('.zip') || selected.type.includes('zip');
+        let pdfDataBuffer: ArrayBuffer | null = null;
+        const generatedThumbnails: { url: string; index: number }[] = [];
         const initialSelected = new Set<number>();
 
-        for (let i = 1; i <= numPages; i++) {
-          initialSelected.add(i);
-          const page = await pdfDoc.getPage(i);
-          const viewport = page.getViewport({ scale: 0.25 });
-          const canvas = document.createElement('canvas');
-          const context = canvas.getContext('2d');
-          if (context) {
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
-            await page.render({ canvasContext: context, viewport } as any).promise;
-            generatedThumbnails.push({
-              url: canvas.toDataURL('image/jpeg', 0.6),
-              index: i,
-            });
+        if (isZip) {
+          const zip = new JSZip();
+          const loadedZip = await zip.loadAsync(selected);
+          
+          // Check if ZIP contains an embedded PDF
+          const pdfEntryName = Object.keys(loadedZip.files).find(
+            (fn) => fn.toLowerCase().endsWith('.pdf') && !loadedZip.files[fn].dir
+          );
+
+          if (pdfEntryName) {
+            pdfDataBuffer = await loadedZip.files[pdfEntryName].async('arraybuffer');
+          } else {
+            // ZIP contains image files (e.g. page_1.png, page_2.jpg)
+            const imgEntries = Object.entries(loadedZip.files)
+              .filter(([fn, entry]) => !entry.dir && /\.(png|jpe?g|webp|bmp)$/i.test(fn))
+              .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+
+            if (imgEntries.length === 0) {
+              throw new Error('ZIP archive contains no readable PDF or image pages.');
+            }
+
+            for (let i = 0; i < imgEntries.length; i++) {
+              const [, entry] = imgEntries[i];
+              const imgBlob = await entry.async('blob');
+              const imgUrl = URL.createObjectURL(imgBlob);
+
+              const imgElem = new Image();
+              imgElem.src = imgUrl;
+              await new Promise((res) => { imgElem.onload = res; imgElem.onerror = res; });
+
+              const thumbCanvas = document.createElement('canvas');
+              const scale = 0.25;
+              thumbCanvas.width = Math.max(100, Math.round(imgElem.naturalWidth * scale));
+              thumbCanvas.height = Math.max(140, Math.round(imgElem.naturalHeight * scale));
+              const tCtx = thumbCanvas.getContext('2d');
+              if (tCtx) {
+                tCtx.fillStyle = '#ffffff';
+                tCtx.fillRect(0, 0, thumbCanvas.width, thumbCanvas.height);
+                tCtx.drawImage(imgElem, 0, 0, thumbCanvas.width, thumbCanvas.height);
+              }
+
+              const pageIdx = i + 1;
+              initialSelected.add(pageIdx);
+              generatedThumbnails.push({
+                url: thumbCanvas.toDataURL('image/jpeg', 0.6),
+                index: pageIdx,
+              });
+            }
+
+            setThumbnails(generatedThumbnails);
+            setSelectedPages(initialSelected);
+            setIsLoadingThumbnails(false);
+            return;
           }
+        } else {
+          pdfDataBuffer = await selected.arrayBuffer();
         }
-        setThumbnails(generatedThumbnails);
-        setSelectedPages(initialSelected);
+
+        if (pdfDataBuffer) {
+          const pdfjsLib = await getPdfjsLib();
+          const pdfDoc = await pdfjsLib.getDocument({ data: pdfDataBuffer }).promise;
+          const numPages = pdfDoc.numPages;
+
+          for (let i = 1; i <= numPages; i++) {
+            initialSelected.add(i);
+            const page = await pdfDoc.getPage(i);
+            const viewport = page.getViewport({ scale: 0.25 });
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            if (context) {
+              canvas.width = viewport.width;
+              canvas.height = viewport.height;
+              await page.render({ canvasContext: context, viewport } as any).promise;
+              generatedThumbnails.push({
+                url: canvas.toDataURL('image/jpeg', 0.6),
+                index: i,
+              });
+            }
+          }
+          setThumbnails(generatedThumbnails);
+          setSelectedPages(initialSelected);
+        }
       } catch (err: any) {
         console.error('Thumbnail generation error', err);
-        setError('Failed to load PDF preview: ' + err.message);
+        setError('Failed to load document preview: ' + err.message);
       } finally {
         setIsLoadingThumbnails(false);
       }
@@ -245,27 +307,68 @@ export const AutoPdfConverterModal: React.FC = () => {
     setBlueprintRanges((prev) => prev.filter((r) => r.id !== id));
   };
 
-  // AI Scan Instructions Page from the uploaded PDF (typically Page 1)
+  // AI Scan Instructions Page from the uploaded PDF/ZIP (typically Page 1)
   const handleScanInstructionsFromPdf = async () => {
     if (!file) return;
     try {
       setIsScanningInstructions(true);
       setInstructionsScanStatus('Rendering instruction page...');
 
-      const arrayBuffer = await file.arrayBuffer();
-      const pdfjsLib = await getPdfjsLib();
-      const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const page = await pdfDoc.getPage(1);
-      const viewport = page.getViewport({ scale: 2.0 });
+      let base64Image = '';
+      const isZip = file.name.toLowerCase().endsWith('.zip') || file.type.includes('zip');
 
-      const canvas = document.createElement('canvas');
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) throw new Error('Canvas context error');
+      if (isZip) {
+        const zip = new JSZip();
+        const loadedZip = await zip.loadAsync(file);
+        const pdfEntryName = Object.keys(loadedZip.files).find(
+          (fn) => fn.toLowerCase().endsWith('.pdf') && !loadedZip.files[fn].dir
+        );
 
-      await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
-      const base64Image = canvas.toDataURL('image/jpeg', 0.9);
+        if (pdfEntryName) {
+          const pdfBuf = await loadedZip.files[pdfEntryName].async('arraybuffer');
+          const pdfjsLib = await getPdfjsLib();
+          const pdfDoc = await pdfjsLib.getDocument({ data: pdfBuf }).promise;
+          const page = await pdfDoc.getPage(1);
+          const viewport = page.getViewport({ scale: 2.0 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) throw new Error('Canvas context error');
+          await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
+          base64Image = canvas.toDataURL('image/jpeg', 0.85);
+        } else {
+          const imgEntries = Object.entries(loadedZip.files)
+            .filter(([fn, entry]) => !entry.dir && /\.(png|jpe?g|webp|bmp)$/i.test(fn))
+            .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+
+          if (imgEntries.length > 0) {
+            const firstBlob = await imgEntries[0][1].async('blob');
+            base64Image = await new Promise<string>((resolve) => {
+              const reader = new FileReader();
+              reader.onloadend = () => resolve(reader.result as string);
+              reader.readAsDataURL(firstBlob);
+            });
+          }
+        }
+      } else {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdfjsLib = await getPdfjsLib();
+        const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        const page = await pdfDoc.getPage(1);
+        const viewport = page.getViewport({ scale: 2.0 });
+
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('Canvas context error');
+
+        await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
+        base64Image = canvas.toDataURL('image/jpeg', 0.85);
+      }
+
+      if (!base64Image) throw new Error('Unable to render page 1 for blueprint extraction');
 
       setInstructionsScanStatus('Analyzing General Instructions & question ranges with Gemini Vision...');
 
@@ -340,13 +443,33 @@ export const AutoPdfConverterModal: React.FC = () => {
     setPercent(2);
 
     try {
-      setStatus('Reading PDF file buffer...');
-      setProgressDetail('Loading document buffer into memory...');
-      const arrayBuffer = await file.arrayBuffer();
-      const pdfjsLib = await getPdfjsLib();
-      const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const numPages = pdfDoc.numPages;
-      if (numPages === 0) throw new Error('PDF has no readable pages');
+      setStatus('Reading document buffer...');
+      setProgressDetail('Loading document into memory...');
+
+      const isZip = file.name.toLowerCase().endsWith('.zip') || file.type.includes('zip');
+      let pdfDoc: any = null;
+      let zipImageEntries: [string, any][] = [];
+
+      if (isZip) {
+        const zip = new JSZip();
+        const loadedZip = await zip.loadAsync(file);
+        const pdfEntryName = Object.keys(loadedZip.files).find(
+          (fn) => fn.toLowerCase().endsWith('.pdf') && !loadedZip.files[fn].dir
+        );
+        if (pdfEntryName) {
+          const pdfBuf = await loadedZip.files[pdfEntryName].async('arraybuffer');
+          const pdfjsLib = await getPdfjsLib();
+          pdfDoc = await pdfjsLib.getDocument({ data: pdfBuf }).promise;
+        } else {
+          zipImageEntries = Object.entries(loadedZip.files)
+            .filter(([fn, entry]) => !entry.dir && /\.(png|jpe?g|webp|bmp)$/i.test(fn))
+            .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+        }
+      } else {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdfjsLib = await getPdfjsLib();
+        pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      }
 
       const base64Images: string[] = [];
       const canvasImages: HTMLCanvasElement[] = [];
@@ -354,7 +477,7 @@ export const AutoPdfConverterModal: React.FC = () => {
       const pagesToProcess: number[] = Array.from<number>(selectedPages).sort((a, b) => a - b);
       if (pagesToProcess.length === 0) throw new Error('No pages selected for processing');
 
-      setStatus(`Rendering ${pagesToProcess.length} selected pages at ultra-crisp resolution...`);
+      setStatus(`Rendering ${pagesToProcess.length} selected pages...`);
       setPercent(5);
 
       startBackgroundTask({
@@ -367,30 +490,47 @@ export const AutoPdfConverterModal: React.FC = () => {
 
       for (let i = 0; i < pagesToProcess.length; i++) {
         const pageNum = pagesToProcess[i];
-        const page = await pdfDoc.getPage(pageNum);
-        const viewport = page.getViewport({ scale: 2.6 }); // Ultra-crisp 2.6x scale (185-200 DPI for high-DPI text & math clarity)
-
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         if (!context) throw new Error('Canvas context null');
 
-        canvas.width = Math.round(viewport.width);
-        canvas.height = Math.round(viewport.height);
+        if (pdfDoc) {
+          const page = await pdfDoc.getPage(pageNum);
+          const viewport = page.getViewport({ scale: 2.0 }); // 2.0x scale (150 DPI) for optimal balance of math clarity & speed
 
-        context.imageSmoothingEnabled = true;
-        context.imageSmoothingQuality = 'high';
-        context.fillStyle = '#ffffff';
-        context.fillRect(0, 0, canvas.width, canvas.height);
+          canvas.width = Math.round(viewport.width);
+          canvas.height = Math.round(viewport.height);
 
-        await page.render({ canvasContext: context, viewport } as any).promise;
+          context.imageSmoothingEnabled = true;
+          context.imageSmoothingQuality = 'high';
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
 
-        const base64ForAi = canvas.toDataURL('image/jpeg', 0.85);
+          await page.render({ canvasContext: context, viewport } as any).promise;
+        } else if (zipImageEntries.length > 0) {
+          const entry = zipImageEntries[pageNum - 1];
+          if (entry) {
+            const imgBlob = await entry[1].async('blob');
+            const imgUrl = URL.createObjectURL(imgBlob);
+            const imgElem = new Image();
+            imgElem.src = imgUrl;
+            await new Promise((res) => { imgElem.onload = res; imgElem.onerror = res; });
+
+            canvas.width = imgElem.naturalWidth;
+            canvas.height = imgElem.naturalHeight;
+            context.fillStyle = '#ffffff';
+            context.fillRect(0, 0, canvas.width, canvas.height);
+            context.drawImage(imgElem, 0, 0);
+          }
+        }
+
+        const base64ForAi = canvas.toDataURL('image/jpeg', 0.82);
         base64Images.push(base64ForAi);
         canvasImages.push(canvas);
 
         const pagePercent = Math.min(35, Math.round(5 + ((i + 1) / pagesToProcess.length) * 30));
         setPercent(pagePercent);
-        setProgressDetail(`Rendered page ${pageNum} (${i + 1}/${pagesToProcess.length}) at 2.6x resolution`);
+        setProgressDetail(`Rendered page ${pageNum} (${i + 1}/${pagesToProcess.length})`);
         updateBackgroundTask({
           percent: pagePercent,
           statusText: `Rendering page ${pageNum} (${i + 1}/${pagesToProcess.length})...`,
@@ -410,7 +550,14 @@ export const AutoPdfConverterModal: React.FC = () => {
       setPercent(36);
       updateBackgroundTask({ percent: 36, statusText: passStatusMsg });
 
+      let lastBatchError = '';
+
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+        if (batchIdx > 0) {
+          // Gentle rate-pacing delay to respect 15 RPM free tier limits
+          await ratePaceDelay(700);
+        }
+
         const startPage = batchIdx * BATCH_SIZE;
         const endPage = Math.min(pagesToProcess.length, startPage + BATCH_SIZE);
         const chunkImages = base64Images.slice(startPage, endPage);
@@ -426,7 +573,7 @@ export const AutoPdfConverterModal: React.FC = () => {
         setStatus(batchStatus);
 
         setPercent(batchStartPercent);
-        setProgressDetail(`Parsing column layouts & question sequence for Pages ${realStartPage}-${realEndPage}...`);
+        setProgressDetail(`Analyzing Pages ${realStartPage}-${realEndPage} (Found ${allExtractedQuestions.length} questions so far)...`);
         updateBackgroundTask({
           percent: batchStartPercent,
           statusText: `Batch ${batchIdx + 1}/${totalBatches}: ${batchStatus}`,
@@ -462,10 +609,22 @@ export const AutoPdfConverterModal: React.FC = () => {
             if (batchResponse.answerKeys && Array.isArray(batchResponse.answerKeys)) {
               allAnswerKeys.push(...batchResponse.answerKeys);
             }
+          } else {
+            const errData = await res.json().catch(() => ({}));
+            lastBatchError = errData.error || `Batch ${batchIdx + 1} returned status ${res.status}`;
+            console.warn(`[AutoConverter] Batch ${batchIdx + 1} extraction failed:`, lastBatchError);
           }
-        } catch (batchErr) {
+        } catch (batchErr: any) {
+          lastBatchError = batchErr?.message || `Batch ${batchIdx + 1} failed`;
           console.warn(`Batch ${batchIdx + 1} extraction error:`, batchErr);
         }
+      }
+
+      if (allExtractedQuestions.length === 0) {
+        throw new Error(
+          lastBatchError ||
+          'No questions were detected across the selected pages. Please verify your Gemini API Key in Settings and ensure the document contains clear printed questions.'
+        );
       }
 
       setActiveBatchInfo('');
@@ -853,10 +1012,25 @@ export const AutoPdfConverterModal: React.FC = () => {
                 rawBlob: cropResult.blob,
               });
 
+              const pNum = pagesToProcess[cropResult.pIdx] || 1;
+              const yminVal = part.box[0];
+              const xminVal = part.box[1];
+              const ymaxVal = part.box[2];
+              const xmaxVal = part.box[3];
+
               pdfDataParts.push({
                 filename: partImgName,
-                pageNumber: pagesToProcess[cropResult.pIdx] || 1,
-                bounds: [part.box[1], part.box[0], part.box[3] - part.box[1], part.box[2] - part.box[0]],
+                page: pNum,
+                pageNumber: pNum,
+                ymin: yminVal,
+                xmin: xminVal,
+                ymax: ymaxVal,
+                xmax: xmaxVal,
+                x1: Math.round(xminVal * 1000),
+                y1: Math.round(yminVal * 1000),
+                x2: Math.round(xmaxVal * 1000),
+                y2: Math.round(ymaxVal * 1000),
+                bounds: [xminVal, yminVal, xmaxVal - xminVal, ymaxVal - yminVal],
               });
             }
           });
@@ -890,10 +1064,25 @@ export const AutoPdfConverterModal: React.FC = () => {
               rawBlob: cropResult.blob,
             });
 
+            const pNum = pagesToProcess[cropResult.pIdx] || 1;
+            const yminVal = q.box[0];
+            const xminVal = q.box[1];
+            const ymaxVal = q.box[2];
+            const xmaxVal = q.box[3];
+
             pdfDataParts.push({
               filename: imgName,
-              pageNumber: pagesToProcess[cropResult.pIdx] || 1,
-              bounds: [q.box[1], q.box[0], q.box[3] - q.box[1], q.box[2] - q.box[0]],
+              page: pNum,
+              pageNumber: pNum,
+              ymin: yminVal,
+              xmin: xminVal,
+              ymax: ymaxVal,
+              xmax: xmaxVal,
+              x1: Math.round(xminVal * 1000),
+              y1: Math.round(yminVal * 1000),
+              x2: Math.round(xmaxVal * 1000),
+              y2: Math.round(ymaxVal * 1000),
+              bounds: [xminVal, yminVal, xmaxVal - xminVal, ymaxVal - yminVal],
             });
           }
         }
@@ -1037,19 +1226,19 @@ export const AutoPdfConverterModal: React.FC = () => {
               className="border-2 border-dashed border-slate-700 hover:border-indigo-500 bg-slate-800/30 hover:bg-indigo-950/20 rounded-2xl p-10 flex flex-col items-center justify-center text-center cursor-pointer transition-all duration-200 min-h-[300px]"
             >
               <UploadCloud className="w-14 h-14 text-indigo-400 mb-4 animate-bounce" />
-              <h3 className="text-base font-bold text-slate-200">Upload Test Paper PDF</h3>
+              <h3 className="text-base font-bold text-slate-200">Upload Test Paper (PDF or Image ZIP)</h3>
               <p className="text-xs text-slate-400 mt-2 max-w-md leading-relaxed">
-                Upload your question paper. The system will crop questions in sequence, handle split
-                columns, and assign subjects strictly matching your booklet instructions.
+                Upload your question paper as a PDF or a ZIP archive of scanned page images. The AI will detect layout, resolve split
+                columns, and extract questions sequentially strictly matching your blueprint.
               </p>
               <div className="mt-6 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl shadow-md transition-colors">
-                Select PDF File
+                Select PDF or ZIP File
               </div>
               <input
                 type="file"
                 ref={fileInputRef}
                 onChange={handleFileChange}
-                accept="application/pdf"
+                accept=".pdf,application/pdf,.zip,application/zip,application/x-zip-compressed"
                 className="hidden"
               />
             </div>
@@ -1510,51 +1699,90 @@ export const AutoPdfConverterModal: React.FC = () => {
             </div>
           )}
 
-          {/* STEP 3: Active Processing State */}
-          {step === 'processing' && isProcessing && (
+          {/* STEP 3: Active Processing State & Error Fallback */}
+          {step === 'processing' && (
             <div className="bg-slate-950 border border-slate-800 rounded-xl p-5 space-y-4 shadow-inner">
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex items-center gap-2.5 text-indigo-400 min-w-0">
-                  <Loader2 className="w-5 h-5 animate-spin shrink-0 text-indigo-400" />
-                  <div className="min-w-0">
-                    <span className="text-sm font-semibold text-slate-100 block truncate">
-                      {status}
-                    </span>
-                    {activeBatchInfo && (
-                      <span className="text-[11px] text-indigo-300 font-mono block">
-                        {activeBatchInfo} • Time Elapsed: <strong>{elapsedSec}s</strong>
+              {isProcessing ? (
+                <>
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-2.5 text-indigo-400 min-w-0">
+                      <Loader2 className="w-5 h-5 animate-spin shrink-0 text-indigo-400" />
+                      <div className="min-w-0">
+                        <span className="text-sm font-semibold text-slate-100 block truncate">
+                          {status}
+                        </span>
+                        {activeBatchInfo && (
+                          <span className="text-[11px] text-indigo-300 font-mono block">
+                            {activeBatchInfo} • Time Elapsed: <strong>{elapsedSec}s</strong>
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-2xl font-black text-indigo-400 font-mono tracking-tight mr-1">
+                        {percent}%
                       </span>
-                    )}
+                      <button
+                        onClick={minimizeBackgroundTask}
+                        className="px-3 py-1.5 bg-indigo-950 hover:bg-indigo-900 border border-indigo-700/60 text-indigo-200 hover:text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all shadow-md"
+                        title="Minimize window into floating draggable widget"
+                      >
+                        <Minimize2 className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>Run in Background</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Progress Bar */}
+                  <div className="w-full bg-slate-900 border border-slate-800 rounded-full h-3 p-0.5 overflow-hidden">
+                    <div
+                      className="bg-gradient-to-r from-indigo-500 via-purple-500 to-emerald-400 h-full rounded-full transition-all duration-300 relative"
+                      style={{ width: `${Math.max(2, Math.min(100, percent))}%` }}
+                    />
+                  </div>
+
+                  {/* Detail message */}
+                  <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-lg text-xs font-mono text-indigo-300 flex items-center justify-between">
+                    <span className="truncate">{progressDetail}</span>
+                    <span className="shrink-0 text-slate-500 text-[10px]">{elapsedSec}s</span>
+                  </div>
+                </>
+              ) : error ? (
+                <div className="space-y-4 py-2">
+                  <div className="flex items-start gap-3 p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300">
+                    <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5 text-rose-400" />
+                    <div className="space-y-1 min-w-0">
+                      <h4 className="text-sm font-bold text-rose-200">Extraction Notice</h4>
+                      <p className="text-xs text-rose-300/90 leading-relaxed break-words">{error}</p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+                    <button
+                      onClick={() => setStep('pages')}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-semibold transition-colors"
+                    >
+                      Back to Page Selection
+                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => window.dispatchEvent(new CustomEvent('open-settings'))}
+                        className="px-4 py-2 bg-indigo-950 hover:bg-indigo-900 border border-indigo-700/60 text-indigo-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                      >
+                        <Settings className="w-3.5 h-3.5" />
+                        <span>Settings & API Keys</span>
+                      </button>
+                      <button
+                        onClick={processPDF}
+                        className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold shadow-md transition-colors flex items-center gap-1.5"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>Retry Extraction</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="text-2xl font-black text-indigo-400 font-mono tracking-tight mr-1">
-                    {percent}%
-                  </span>
-                  <button
-                    onClick={minimizeBackgroundTask}
-                    className="px-3 py-1.5 bg-indigo-950 hover:bg-indigo-900 border border-indigo-700/60 text-indigo-200 hover:text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all shadow-md"
-                    title="Minimize window into floating draggable widget"
-                  >
-                    <Minimize2 className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Run in Background</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Progress Bar */}
-              <div className="w-full bg-slate-900 border border-slate-800 rounded-full h-3 p-0.5 overflow-hidden">
-                <div
-                  className="bg-gradient-to-r from-indigo-500 via-purple-500 to-emerald-400 h-full rounded-full transition-all duration-300 relative"
-                  style={{ width: `${Math.max(2, Math.min(100, percent))}%` }}
-                />
-              </div>
-
-              {/* Detail message */}
-              <div className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-lg text-xs font-mono text-indigo-300 flex items-center justify-between">
-                <span className="truncate">{progressDetail}</span>
-                <span className="shrink-0 text-slate-500 text-[10px]">{elapsedSec}s</span>
-              </div>
+              ) : null}
             </div>
           )}
         </div>

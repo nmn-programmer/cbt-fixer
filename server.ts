@@ -24,7 +24,7 @@ function getErrorStatusCode(err: any): number {
 // API Route to extract test paper instructions blueprint & question ranges from Cover / Instructions page
 app.post('/api/extract-test-blueprint', async (req, res) => {
   try {
-    const { image, text } = req.body;
+    const { image, text, model: requestedModel } = req.body;
     if (!image && !text) {
       return res.status(400).json({ error: 'Instruction page image or text is required' });
     }
@@ -133,6 +133,7 @@ CRITICAL DIRECTIVE ON MARKING SCHEME EXTRACTION:
       contents,
       schema: blueprintSchema,
       temperature: 0.1,
+      preferredModel: requestedModel,
       label: 'Server Extract Test Blueprint'
     });
 
@@ -146,7 +147,7 @@ CRITICAL DIRECTIVE ON MARKING SCHEME EXTRACTION:
 // API Route for Gemini Multi-modal PDF analysis
 app.post('/api/extract-pdf-structure', async (req, res) => {
   try {
-    const { images, pageOffset = 0, options = {} } = req.body;
+    const { images, pageOffset = 0, options = {}, model: requestedModel } = req.body;
     const { hasAnswerKey = true, extractEnglishOnly = false } = options;
     
     if (!images || !images.length) {
@@ -306,13 +307,13 @@ ${hasAnswerKey ? 'Extract printed answer key table if present on these pages.' :
       contents: [...contents, { text: prompt }],
       schema: responseSchema,
       temperature: 0.1,
+      preferredModel: requestedModel,
       label: 'Server Extract PDF Structure (Pass 1)'
     });
 
     // PASS 2 GAP-FILL & SEQUENCE AUDIT RESCAN (NON-DESTRUCTIVE)
     if (options.enableDoublePass !== false && parsed.questions && parsed.questions.length > 0) {
       try {
-        console.log(`Executing Pass 2 Gap-Fill & Sequence Audit for ${parsed.questions.length} detected questions...`);
         const detectedQNums = parsed.questions.map((q: any) => q.qNo).filter(Boolean);
         const rescanPrompt = `PASS 2 AUDIT & GAP-FILL RESCAN:
 Pass 1 detected questions: [${detectedQNums.join(', ')}].
@@ -327,6 +328,7 @@ Return the complete audited list including any recovered missing questions.`;
           contents: [...contents, { text: rescanPrompt }],
           schema: responseSchema,
           temperature: 0.0,
+          preferredModel: requestedModel,
           label: 'Server Pass 2 Audit'
         });
 
@@ -341,8 +343,6 @@ Return the complete audited list including any recovered missing questions.`;
             if (!auditedQ || auditedQ.qNo == null) return;
             const existing = pass1Map.get(auditedQ.qNo);
             if (!existing) {
-              // Recovered missing question from Pass 2!
-              console.log(`Pass 2 recovered missing Question Q${auditedQ.qNo}`);
               parsed.questions.push(auditedQ);
               pass1Map.set(auditedQ.qNo, auditedQ);
             } else {
@@ -389,7 +389,7 @@ Return the complete audited list including any recovered missing questions.`;
 // API Route to detect the precise bounding box of a single question on a page image
 app.post('/api/detect-question-box', async (req, res) => {
   try {
-    const { image, qNo, promptHint = '' } = req.body;
+    const { image, qNo, promptHint = '', model: requestedModel } = req.body;
     if (!image) {
       return res.status(400).json({ error: 'Page image is required' });
     }
@@ -439,6 +439,7 @@ Output the precise normalized bounding box [ymin, xmin, ymax, xmax] (0.0 to 1.0)
       contents: [{ inlineData }, { text: prompt }],
       schema: detectSchema,
       temperature: 0.1,
+      preferredModel: requestedModel,
       label: 'Server Detect Question Box'
     });
 
@@ -452,8 +453,9 @@ Output the precise normalized bounding box [ymin, xmin, ymax, xmax] (0.0 to 1.0)
 // API Route to analyze & repair a question image slice (OCR, Question Type, Answer Key, Marking Scheme)
 app.post('/api/analyze-question-image', async (req, res) => {
   try {
-    const { images, currentQuestion = {} } = req.body;
-    if (!images || !images.length) {
+    const { images, image, currentQuestion = {}, qNo, currentType, model: requestedModel } = req.body;
+    const rawImages = images && Array.isArray(images) && images.length > 0 ? images : (image ? [image] : []);
+    if (!rawImages.length) {
       return res.status(400).json({ error: 'Question image is required' });
     }
 
@@ -470,7 +472,7 @@ app.post('/api/analyze-question-image', async (req, res) => {
       httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
     });
 
-    const contents = images.map((base64: string) => {
+    const contents = rawImages.map((base64: string) => {
       const isJpeg = base64.startsWith('data:image/jpeg');
       return {
         inlineData: {
@@ -516,9 +518,11 @@ app.post('/api/analyze-question-image', async (req, res) => {
       required: ["detectedType", "marks", "latexSummary", "isClean"]
     };
 
+    const targetContext = { ...currentQuestion, qNo: qNo || currentQuestion.que, currentType: currentType || currentQuestion.type };
+
     const prompt = `You are a senior exam paper reviewer and OCR specialist for JEE Advanced / NEET / CBT exams.
 Examine this question slice carefully.
-Current question metadata: ${JSON.stringify(currentQuestion)}.
+Current question metadata: ${JSON.stringify(targetContext)}.
 
 Perform a thorough diagnostic:
 1. Determine the EXACT Question Type:
@@ -534,6 +538,7 @@ Perform a thorough diagnostic:
       contents: [...contents, { text: prompt }],
       schema: repairSchema,
       temperature: 0.1,
+      preferredModel: requestedModel,
       label: 'Server Analyze Question Image'
     });
 
@@ -547,7 +552,7 @@ Perform a thorough diagnostic:
 // API Route to extract Answer Key table & verify types from single or multi-page Answer Key PDF images
 app.post('/api/extract-answer-key-pdf', async (req, res) => {
   try {
-    const { images, text = '', context = {} } = req.body;
+    const { images, text = '', context = {}, model: requestedModel } = req.body;
     if ((!images || !images.length) && !text) {
       return res.status(400).json({ error: 'Answer key page image or text is required' });
     }
@@ -636,13 +641,13 @@ ${context?.subjects ? `Expected Subjects: ${JSON.stringify(context.subjects)}.` 
       contents,
       schema: keySchema,
       temperature: 0.1,
+      preferredModel: requestedModel,
       label: 'Server Extract Answer Key PDF'
     });
 
     // PASS 2: VERIFICATION RESCAN AUDIT PASS FOR HIGH ACCURACY
     if (req.body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
       try {
-        console.log(`Executing Pass 2 Answer Key Verification Audit Rescan on ${resultData.answers.length} extracted items...`);
         const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
 Below is the initial raw answer key extracted from Pass 1:
 ${JSON.stringify(resultData.answers.slice(0, 150))}
@@ -666,11 +671,11 @@ Return the complete, audited and verified answer key mapping.`;
           contents: auditContents,
           schema: keySchema,
           temperature: 0.0,
+          preferredModel: requestedModel,
           label: 'Server Pass 2 Answer Key Audit'
         });
 
         if (audited && audited.answers && audited.answers.length >= resultData.answers.length) {
-          console.log(`Pass 2 Verification Audit successful. Items verified: ${audited.answers.length}`);
           resultData = audited;
         }
       } catch (e) {
@@ -688,7 +693,7 @@ Return the complete, audited and verified answer key mapping.`;
 // API Route to extract Answer Key table from a dedicated page
 app.post('/api/extract-answer-key-page', async (req, res) => {
   try {
-    const { image } = req.body;
+    const { image, model: requestedModel } = req.body;
     if (!image) {
       return res.status(400).json({ error: 'Page image is required' });
     }
@@ -741,6 +746,7 @@ Support multi-column tables, grids, and matrix match keys. Output complete and a
       contents: [{ inlineData }, { text: prompt }],
       schema: keySchema,
       temperature: 0.1,
+      preferredModel: requestedModel,
       label: 'Server Extract Answer Key Page'
     });
 
@@ -757,6 +763,7 @@ Verify that NO question numbers are missing, fix OCR typos, and return the audit
           contents: [{ inlineData }, { text: auditPrompt }],
           schema: keySchema,
           temperature: 0.0,
+          preferredModel: requestedModel,
           label: 'Server Pass 2 Answer Key Page Audit'
         });
 
@@ -771,6 +778,41 @@ Verify that NO question numbers are missing, fix OCR typos, and return the audit
     res.json(resultData);
   } catch (error: any) {
     console.error('Error in extract-answer-key-page:', error);
+    res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
+  }
+});
+
+// API Route for generic Gemini generation requests
+app.post('/api/gemini/generate', async (req, res) => {
+  try {
+    const { contents, config, model: requestedModel } = req.body;
+    if (!contents || !contents.length) {
+      return res.status(400).json({ error: 'Contents are required' });
+    }
+
+    const authHeader = req.headers.authorization;
+    const clientApiKey = authHeader ? authHeader.replace('Bearer ', '').trim() : null;
+    const apiKey = clientApiKey || process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
+      return res.status(401).json({ error: 'Gemini API key is required. Please set it in Settings.' });
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+    });
+
+    const resultText = await executeGeminiWithFallback(ai, {
+      contents,
+      temperature: config?.temperature ?? 0.1,
+      preferredModel: requestedModel,
+      label: 'Server Gemini Generate'
+    });
+
+    res.json({ text: resultText, candidates: [{ content: { parts: [{ text: resultText }] } }] });
+  } catch (error: any) {
+    console.error('Error in /api/gemini/generate:', error);
     res.status(getErrorStatusCode(error)).json({ error: formatAiErrorMessage(error) });
   }
 });

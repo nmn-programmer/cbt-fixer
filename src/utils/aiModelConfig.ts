@@ -1,19 +1,76 @@
 import { GoogleGenAI, Schema } from '@google/genai';
 
-/**
- * Standard, supported Gemini models in order of priority:
- * 1. gemini-2.5-flash (Primary default high-speed multimodal vision engine)
- * 2. gemini-3.1-flash-lite (Fast official Flash Lite fallback with separate capacity)
- * 3. gemini-2.5-flash-lite (Secondary lightweight fallback)
- * Note: gemini-3.7-flash and legacy heavy models are strictly excluded.
- */
-export const SUPPORTED_GEMINI_MODELS = [
-  'gemini-2.5-flash',
-  'gemini-3.1-flash-lite',
-  'gemini-2.5-flash-lite',
-] as const;
+export const SELECTED_MODEL_STORAGE_KEY = 'user_gemini_selected_model';
 
-export type SupportedGeminiModel = (typeof SUPPORTED_GEMINI_MODELS)[number];
+export interface GeminiModelInfo {
+  id: string;
+  name: string;
+  badge: string;
+  badgeColor: string;
+  description: string;
+  isFreeTierCompatible: boolean;
+  rank: number;
+}
+
+/**
+ * Standard, supported Gemini models listed in descending order of capability & speed:
+ * 1. gemini-2.0-flash (Flagship Flash: Next-gen speed, superior multimodal OCR, layout & bounding box precision)
+ * 2. gemini-1.5-flash (High Speed Workhorse: Ultra-reliable, fast document parsing with high free-tier headroom)
+ * 3. gemini-1.5-pro (Pro Reasoning: Advanced reasoning for complex STEM math formulas and dense multi-column papers)
+ * 4. gemini-2.0-flash-lite (Ultra Fast Lite: Low latency lightweight engine with separate quota capacity)
+ */
+export const GEMINI_MODELS_DESCENDING: GeminiModelInfo[] = [
+  {
+    id: 'gemini-2.0-flash',
+    name: 'Gemini 2.0 Flash',
+    badge: 'Flagship Flash',
+    badgeColor: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
+    description: 'Google’s flagship Flash engine. Ultra-fast multimodal OCR, superior question layout parsing, and robust math equation recognition.',
+    isFreeTierCompatible: true,
+    rank: 1,
+  },
+  {
+    id: 'gemini-1.5-flash',
+    name: 'Gemini 1.5 Flash',
+    badge: 'High Speed Workhorse',
+    badgeColor: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
+    description: 'Highly reliable, fast multimodal workhorse model with high throughput and high free-tier rate headroom.',
+    isFreeTierCompatible: true,
+    rank: 2,
+  },
+  {
+    id: 'gemini-1.5-pro',
+    name: 'Gemini 1.5 Pro',
+    badge: 'Pro STEM Reasoning',
+    badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/30',
+    description: 'Advanced reasoning engine for complex STEM formulas, dense multi-column question papers, and intricate table structures.',
+    isFreeTierCompatible: true,
+    rank: 3,
+  },
+  {
+    id: 'gemini-2.0-flash-lite',
+    name: 'Gemini 2.0 Flash Lite',
+    badge: 'Ultra Fast Lite',
+    badgeColor: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
+    description: 'Lightweight high-throughput engine with separate quota capacity for low-latency batch processing.',
+    isFreeTierCompatible: true,
+    rank: 4,
+  },
+];
+
+export const SUPPORTED_GEMINI_MODELS = GEMINI_MODELS_DESCENDING.map((m) => m.id);
+
+export type SupportedGeminiModel = string;
+
+export function getStoredSelectedModel(): string {
+  if (typeof window === 'undefined') return 'gemini-2.0-flash';
+  return localStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || 'gemini-2.0-flash';
+}
+
+export function setStoredSelectedModel(modelId: string): void {
+  if (typeof window === 'undefined') return;
+  localStorage.setItem(SELECTED_MODEL_STORAGE_KEY, modelId);
+}
 
 export interface AiGenerateOptions {
   contents: any[];
@@ -21,6 +78,7 @@ export interface AiGenerateOptions {
   temperature?: number;
   systemInstruction?: string;
   label?: string;
+  preferredModel?: string;
 }
 
 /**
@@ -85,10 +143,10 @@ export function formatAiErrorMessage(err: any): string {
   const status = err?.status || err?.code || err?.statusCode;
   const is503 = status === 503 || msg.includes('503') || msg.includes('high demand') || msg.includes('unavailable') || msg.includes('overloaded');
   if (is503) {
-    return 'Google Gemini service is temporarily experiencing high demand (503). Retrying shortly or try adding a fallback key in Settings.';
+    return 'Google Gemini service is temporarily experiencing high demand (503). Retrying shortly or try switching models in Settings.';
   }
   if (isTransientError(err)) {
-    return 'Gemini API quota reached (429). Please add a fallback key in Settings or wait a moment.';
+    return 'Gemini API quota reached (429). Please select a different model or add a fallback key in Settings.';
   }
   if (msg.includes('JSON')) {
     return 'Failed to parse structured response from AI model. Please try again.';
@@ -97,19 +155,34 @@ export function formatAiErrorMessage(err: any): string {
 }
 
 /**
- * Executes a Gemini request with model fallback across active, supported models.
- * Includes exponential backoff retries for transient 503/429 demand spikes.
+ * Executes a Gemini request prioritizing the user's selected model,
+ * with graceful failover down the descending capability model chain.
  */
 export async function executeGeminiWithFallback<T = any>(
   ai: GoogleGenAI,
   options: AiGenerateOptions
 ): Promise<T> {
-  const { contents, schema, temperature = 0.1, systemInstruction, label = 'AI Operation' } = options;
+  const { contents, schema, temperature = 0.1, systemInstruction, label = 'AI Operation', preferredModel } = options;
   let lastError: any = null;
 
-  for (let mIdx = 0; mIdx < SUPPORTED_GEMINI_MODELS.length; mIdx++) {
-    const model = SUPPORTED_GEMINI_MODELS[mIdx];
-    const isLastModel = mIdx === SUPPORTED_GEMINI_MODELS.length - 1;
+  // Build model execution chain starting with user's preferred/selected model
+  const primaryModel = preferredModel || getStoredSelectedModel();
+  const modelChain: string[] = [];
+
+  if (primaryModel) {
+    modelChain.push(primaryModel);
+  }
+
+  // Append remaining models in descending order of capability
+  GEMINI_MODELS_DESCENDING.forEach((m) => {
+    if (!modelChain.includes(m.id)) {
+      modelChain.push(m.id);
+    }
+  });
+
+  for (let mIdx = 0; mIdx < modelChain.length; mIdx++) {
+    const model = modelChain[mIdx];
+    const isLastModel = mIdx === modelChain.length - 1;
 
     // Up to 2 attempts per model for transient errors
     const maxAttemptsPerModel = 2;
@@ -155,11 +228,11 @@ export async function executeGeminiWithFallback<T = any>(
           throw new Error(formatAiErrorMessage(err));
         }
 
-        // Check if error is 404 (model not available for current API version)
+        // Check if error is 404 (model not available for current API key/version)
         const is404 = err?.status === 404 || String(err?.message || '').includes('404') || String(err?.message || '').includes('not found');
         if (is404) {
-          console.warn(`[AI Engine] ${label} - Model ${model} returned 404/Not Found. Trying fallback model...`);
-          break; // move to next model
+          console.warn(`[AI Engine] ${label} - Model ${model} returned 404/Not Found. Trying fallback model in chain...`);
+          break; // move to next model in chain
         }
 
         const isTransient = isTransientError(err);
@@ -182,7 +255,7 @@ export async function executeGeminiWithFallback<T = any>(
         if (!isLastModel && isTransient) {
           await new Promise((resolve) => setTimeout(resolve, 800));
         }
-        break; // move to next model
+        break; // move to next model in chain
       }
     }
   }

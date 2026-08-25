@@ -120,16 +120,21 @@ export async function parseZipArchive(
         const answerOptions: string = normalizeAnswerOptions(qVal.answerOptions);
 
         const pdfDataParts: PdfDataPart[] = Array.isArray(qVal.pdfData)
-          ? qVal.pdfData.map((part: any, idx: number) => ({
-              page: part.page ?? 1,
-              x1: part.x1 ?? 0,
-              y1: part.y1 ?? 0,
-              x2: part.x2 ?? 100,
-              y2: part.y2 ?? 100,
-              filename:
-                part.filename ||
-                buildImageFileName(sectionName, qNumber, idx + 1, 'png'),
-            }))
+          ? qVal.pdfData.map((part: any, idx: number) => {
+              const pPage = part.page ?? part.pageNumber ?? part.pageIndex ?? 1;
+              return {
+                ...part,
+                page: pPage,
+                pageNumber: pPage,
+                x1: part.x1 ?? (part.xmin !== undefined ? Math.round(part.xmin * 1000) : 0),
+                y1: part.y1 ?? (part.ymin !== undefined ? Math.round(part.ymin * 1000) : 0),
+                x2: part.x2 ?? (part.xmax !== undefined ? Math.round(part.xmax * 1000) : 1000),
+                y2: part.y2 ?? (part.ymax !== undefined ? Math.round(part.ymax * 1000) : 1000),
+                filename:
+                  part.filename ||
+                  buildImageFileName(sectionName, qNumber, idx + 1, 'png'),
+              };
+            })
           : [];
 
         // Match images in archive
@@ -271,16 +276,21 @@ async function parseUltimateNestedZip(
             const answerOptions = normalizeAnswerOptions(qVal.answerOptions);
 
             const pdfDataParts: PdfDataPart[] = Array.isArray(qVal.pdfData)
-              ? qVal.pdfData.map((part: any, idx: number) => ({
-                  page: part.page ?? 1,
-                  x1: part.x1 ?? 0,
-                  y1: part.y1 ?? 0,
-                  x2: part.x2 ?? 100,
-                  y2: part.y2 ?? 100,
-                  filename:
-                    part.filename ||
-                    buildImageFileName(secName, qNumber, idx + 1, 'png'),
-                }))
+              ? qVal.pdfData.map((part: any, idx: number) => {
+                  const pPage = part.page ?? part.pageNumber ?? part.pageIndex ?? 1;
+                  return {
+                    ...part,
+                    page: pPage,
+                    pageNumber: pPage,
+                    x1: part.x1 ?? (part.xmin !== undefined ? Math.round(part.xmin * 1000) : 0),
+                    y1: part.y1 ?? (part.ymin !== undefined ? Math.round(part.ymin * 1000) : 0),
+                    x2: part.x2 ?? (part.xmax !== undefined ? Math.round(part.xmax * 1000) : 1000),
+                    y2: part.y2 ?? (part.ymax !== undefined ? Math.round(part.ymax * 1000) : 1000),
+                    filename:
+                      part.filename ||
+                      buildImageFileName(secName, qNumber, idx + 1, 'png'),
+                  };
+                })
               : [];
 
             const images: ImageAttachment[] = [];

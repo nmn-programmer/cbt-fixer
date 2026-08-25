@@ -394,8 +394,16 @@ export const QuestionEditor: React.FC = () => {
                   que: currentQuestion.que,
                   type: currentQuestion.type,
                   marks: currentQuestion.marks,
-                  answerOptions: currentQuestion.answerOptions,
-                  pdfData: currentQuestion.pdfData,
+                  pdfData: currentQuestion.pdfData.map((part) => ({
+                    page: part.page ?? 1,
+                    x1: part.x1 ?? 0,
+                    x2: part.x2 ?? 100,
+                    y1: part.y1 ?? 0,
+                    y2: part.y2 ?? 100,
+                  })),
+                  ...(currentQuestion.answerOptions && currentQuestion.answerOptions.trim() !== ''
+                    ? { answerOptions: currentQuestion.answerOptions.trim() }
+                    : {}),
                 },
                 null,
                 2

@@ -1,4 +1,5 @@
 import { executeGeminiClientSide } from './aiDirectEngine';
+import { getStoredSelectedModel } from './aiModelConfig';
 
 export type ApiKeyStatus = 'Ready' | 'Active' | 'Quota Exhausted' | 'Invalid';
 
@@ -323,6 +324,85 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+let currentKeyRotationIndex = 0;
+
+/**
+ * Enforces a small rate-pacing delay to prevent free-tier bursts exceeding 15 RPM
+ */
+export function ratePaceDelay(ms: number = 600): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Validates whether a Gemini API key is active and functional with a quick ping
+ */
+export async function validateApiKey(
+  apiKey: string,
+  model?: string
+): Promise<{ valid: boolean; error?: string; modelUsed?: string }> {
+  if (!apiKey || !apiKey.trim()) {
+    return { valid: false, error: 'API key is empty' };
+  }
+
+  const modelToTest = model || getStoredSelectedModel();
+
+  try {
+    const res = await fetch('/api/gemini/generate', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey.trim()}`,
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'ping' }] }],
+        model: modelToTest,
+        config: { temperature: 0.1 },
+      }),
+    });
+
+    if (res.ok) {
+      return { valid: true, modelUsed: modelToTest };
+    }
+
+    // If server is 404/405, test client-side
+    if (res.status === 404 || res.status === 405) {
+      const clientRes = await executeGeminiClientSide(
+        '/api/gemini/generate',
+        {
+          contents: [{ parts: [{ text: 'ping' }] }],
+          model: modelToTest,
+        },
+        apiKey.trim()
+      );
+      if (clientRes && clientRes.text) {
+        return { valid: true, modelUsed: modelToTest };
+      }
+    }
+
+    const errData = await res.json().catch(() => ({}));
+    const errMsg = errData.error || `HTTP ${res.status}`;
+    return { valid: false, error: errMsg };
+  } catch (err: any) {
+    // Try client-side direct validation
+    try {
+      const clientRes = await executeGeminiClientSide(
+        '/api/gemini/generate',
+        {
+          contents: [{ parts: [{ text: 'ping' }] }],
+          model: modelToTest,
+        },
+        apiKey.trim()
+      );
+      if (clientRes && clientRes.text) {
+        return { valid: true, modelUsed: modelToTest };
+      }
+    } catch (cErr: any) {
+      return { valid: false, error: cErr.message || err.message || 'Key validation failed' };
+    }
+    return { valid: false, error: err.message || 'Key validation failed' };
+  }
+}
+
 /**
  * Executes a fetch request to Gemini proxy endpoint with key failover, retries, exponential backoff, and toasts
  */
@@ -332,6 +412,21 @@ export async function fetchWithGeminiFallback(
   notifyToast?: (title: string, description?: string, type?: 'info' | 'success' | 'warning' | 'error') => void,
   onStateUpdate?: () => void
 ): Promise<Response> {
+  // Ensure selected model is injected into request body for POST requests if not specified
+  const selectedModel = getStoredSelectedModel();
+  let modifiedOptions = { ...options };
+  if (options.body && typeof options.body === 'string') {
+    try {
+      const parsed = JSON.parse(options.body);
+      if (!parsed.model) {
+        parsed.model = selectedModel;
+        modifiedOptions.body = JSON.stringify(parsed);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
   const snapshot = getKeyUsageSnapshot();
   const primaryKey = snapshot.primaryKey;
   const fallbacks = snapshot.fallbackKeys;
@@ -344,10 +439,10 @@ export async function fetchWithGeminiFallback(
     exhaustedUntil?: number;
   }
 
-  const candidates: KeyCandidate[] = [];
+  const allConfiguredCandidates: KeyCandidate[] = [];
 
   if (primaryKey.trim().length > 0) {
-    candidates.push({
+    allConfiguredCandidates.push({
       id: 'primary',
       label: 'Primary API Key',
       key: primaryKey.trim(),
@@ -358,7 +453,7 @@ export async function fetchWithGeminiFallback(
 
   fallbacks.forEach((f, idx) => {
     if (f.key && f.key.trim().length > 0) {
-      candidates.push({
+      allConfiguredCandidates.push({
         id: f.id,
         label: f.label || `Fallback Key ${idx + 1}`,
         key: f.key.trim(),
@@ -368,9 +463,9 @@ export async function fetchWithGeminiFallback(
     }
   });
 
-  if (candidates.length === 0) {
-    // No client keys configured - try server
-    const res = await fetch(url, options);
+  if (allConfiguredCandidates.length === 0) {
+    // No client keys configured - try server default environment
+    const res = await fetch(url, modifiedOptions);
     if (res.status === 404 || res.status === 405) {
       throw new Error('Server returned 404 (Endpoint Not Found). Please configure a Gemini API Key in Settings to run AI extraction directly on client side.');
     }
@@ -379,16 +474,26 @@ export async function fetchWithGeminiFallback(
 
   const now = Date.now();
   // Filter out invalid keys and keys currently in cooldown, unless ALL are in cooldown
-  let usableCandidates = candidates.filter(
+  let usableCandidates = allConfiguredCandidates.filter(
     (c) => c.status !== 'Invalid' && (!c.exhaustedUntil || now >= c.exhaustedUntil)
   );
 
   if (usableCandidates.length === 0) {
-    // If all keys are in cooldown, reset cooldowns and try primary
-    usableCandidates = candidates.filter((c) => c.status !== 'Invalid');
+    // If all keys are in cooldown, reset cooldowns and try all non-invalid keys
+    usableCandidates = allConfiguredCandidates.filter((c) => c.status !== 'Invalid');
     if (usableCandidates.length === 0) {
-      usableCandidates = candidates;
+      usableCandidates = allConfiguredCandidates;
     }
+  }
+
+  // Load Balance: Rotate starting candidate to distribute RPM load evenly across free tier keys
+  if (usableCandidates.length > 1) {
+    const startIdx = currentKeyRotationIndex % usableCandidates.length;
+    currentKeyRotationIndex++;
+    usableCandidates = [
+      ...usableCandidates.slice(startIdx),
+      ...usableCandidates.slice(0, startIdx),
+    ];
   }
 
   let lastError: any = null;
@@ -401,26 +506,26 @@ export async function fetchWithGeminiFallback(
     recordRequestUsage(candidate.id);
     onStateUpdate?.();
 
-    const headers = new Headers(options.headers || {});
+    const headers = new Headers(modifiedOptions.headers || {});
     headers.set('Authorization', `Bearer ${candidate.key}`);
 
     let res: Response | null = null;
-    const maxAttempts = 3;
+    const maxAttempts = 2;
 
     // Attempt request with exponential backoff for 500/503 errors
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        res = await fetch(url, { ...options, headers });
+        res = await fetch(url, { ...modifiedOptions, headers });
 
         if ((res.status === 500 || res.status === 503 || res.status === 502) && attempt < maxAttempts) {
-          await sleep(attempt * 600);
+          await sleep(attempt * 500);
           continue;
         }
         break;
       } catch (err: any) {
         lastError = err;
         if (attempt < maxAttempts) {
-          await sleep(attempt * 600);
+          await sleep(attempt * 500);
         }
       }
     }
@@ -429,8 +534,8 @@ export async function fetchWithGeminiFallback(
       if (!isLastCandidate) {
         const next = usableCandidates[cIdx + 1];
         notifyToast?.(
-          'Network Error / Server Retry',
-          `${candidate.label} failed. Failing over to ${next.label}...`,
+          'Network Retry',
+          `${candidate.label} encountered network error. Failing over to ${next.label}...`,
           'warning'
         );
         continue;
@@ -491,8 +596,8 @@ export async function fetchWithGeminiFallback(
     }
 
     if (isQuotaExhausted) {
-      // Mark candidate as Quota Exhausted with 5-min cooldown
-      const cooldownUntil = Date.now() + 5 * 60 * 1000;
+      // Mark candidate as Quota Exhausted with a short 60s adaptive cooldown
+      const cooldownUntil = Date.now() + 60 * 1000;
       if (candidate.id === 'primary') {
         setStoredPrimaryStatus('Quota Exhausted', cooldownUntil);
       } else {
@@ -508,15 +613,15 @@ export async function fetchWithGeminiFallback(
       if (!isLastCandidate) {
         const next = usableCandidates[cIdx + 1];
         notifyToast?.(
-          'Quota Exhausted (429)',
+          'Rate Limit Cooldown (429)',
           `${candidate.label} rate limit reached. Auto-switching to ${next.label}.`,
           'warning'
         );
         continue; // Failover retry with next key in loop
       } else {
         notifyToast?.(
-          'All API Keys Quota Exhausted',
-          'All primary and fallback Gemini API keys have reached their quota limits. Please add a new fallback key or wait a few minutes.',
+          'All API Keys Rate Limited',
+          'All configured Gemini API keys have temporarily reached their RPM/TPM quota. Please wait a few seconds or add a new key in Settings.',
           'error'
         );
         return res;

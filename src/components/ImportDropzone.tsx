@@ -35,17 +35,31 @@ export const ImportDropzone: React.FC = () => {
 
     const zipFiles: File[] = [];
     const keyFiles: File[] = [];
+    const pdfFiles: File[] = [];
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      if (file.name.endsWith('.zip') || file.type.includes('zip')) {
+      if (file.name.toLowerCase().endsWith('.pdf') || file.type.includes('pdf')) {
+        pdfFiles.push(file);
+      } else if (file.name.toLowerCase().endsWith('.zip') || file.type.includes('zip')) {
         zipFiles.push(file);
-      } else if (file.name.endsWith('.json') || file.name.endsWith('.csv') || file.name.endsWith('.txt')) {
+      } else if (file.name.toLowerCase().endsWith('.json') || file.name.toLowerCase().endsWith('.csv') || file.name.toLowerCase().endsWith('.txt')) {
         keyFiles.push(file);
       }
     }
 
     try {
+      if (pdfFiles.length > 0) {
+        // PDF dropped: open Auto PDF Converter Modal
+        useCbtStore.getState().setPdfConverterModalOpen(true);
+        addToast({
+          title: 'PDF Detected',
+          description: 'Opening Auto PDF Converter. Select your file in the modal to begin.',
+          type: 'info',
+        });
+        return;
+      }
+
       // Case 1: Both ZIP and Answer Key files dropped together!
       if (zipFiles.length > 0 && keyFiles.length > 0) {
         for (const zipFile of zipFiles) {
@@ -121,7 +135,7 @@ export const ImportDropzone: React.FC = () => {
         type="file"
         ref={fileInputRef}
         onChange={handleFileInput}
-        accept=".zip,.json,.csv,.txt"
+        accept=".zip,.pdf,.json,.csv,.txt,application/pdf,application/zip"
         multiple
         className="hidden"
       />

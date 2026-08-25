@@ -31,9 +31,22 @@ export async function executeGeminiClientSide(
     return handleExtractAnswerKeyPdf(ai, body);
   } else if (endpoint.endsWith('/api/extract-answer-key-page')) {
     return handleExtractAnswerKeyPage(ai, body);
+  } else if (endpoint.endsWith('/api/gemini/generate')) {
+    return handleGeminiGenerate(ai, body);
   } else {
     throw new Error(`Unsupported client-side AI endpoint: ${endpoint}`);
   }
+}
+
+async function handleGeminiGenerate(ai: GoogleGenAI, body: any) {
+  const { contents, config, model } = body;
+  const resultText = await executeGeminiWithFallback(ai, {
+    contents,
+    temperature: config?.temperature ?? 0.1,
+    preferredModel: model,
+    label: 'Client Direct Gemini Generate'
+  });
+  return { text: resultText, candidates: [{ content: { parts: [{ text: resultText }] } }] };
 }
 
 async function handleExtractTestBlueprint(ai: GoogleGenAI, body: any) {
@@ -261,64 +274,107 @@ Text context: "${questionText ? questionText.slice(0, 150) : ''}"`;
 }
 
 async function handleAnalyzeQuestionImage(ai: GoogleGenAI, body: any) {
-  const { image, questionContext } = body;
-  if (!image) throw new Error('Image is required');
+  const { images, image, currentQuestion = {}, qNo, currentType, model: requestedModel } = body;
+  const rawImages = images && Array.isArray(images) && images.length > 0 ? images : (image ? [image] : []);
+  if (!rawImages.length) throw new Error('Question image is required');
 
-  const schema: Schema = {
+  const repairSchema: Schema = {
     type: Type.OBJECT,
     properties: {
-      qualityScore: { type: Type.NUMBER },
-      isClipped: { type: Type.BOOLEAN },
-      recommendedAction: { type: Type.STRING },
-      suggestsCropAdjustment: {
+      detectedType: { 
+        type: Type.STRING, 
+        description: "Strictly one of: mcq (Single Correct), msq (Multiple Correct), nat (Numerical / Integer), msm (Matrix Match)" 
+      },
+      detectedQNo: { type: Type.INTEGER, description: "Question sequence number if visible" },
+      detectedAnswer: { type: Type.STRING, description: "Detected answer key or options if discernible, else empty string" },
+      marks: {
         type: Type.OBJECT,
         properties: {
-          topPaddingPx: { type: Type.NUMBER },
-          bottomPaddingPx: { type: Type.NUMBER },
-          leftPaddingPx: { type: Type.NUMBER },
-          rightPaddingPx: { type: Type.NUMBER }
-        }
+          cm: { type: Type.NUMBER, description: "Correct marks (e.g. 4 or 3)" },
+          im: { type: Type.NUMBER, description: "Negative marks (e.g. -1 or -2)" },
+          pm: { type: Type.NUMBER, description: "Partial marks per option" },
+          max: { type: Type.NUMBER, description: "Max marks" }
+        },
+        required: ["cm", "im"]
       },
-      summary: { type: Type.STRING }
+      latexSummary: { type: Type.STRING, description: "Clean LaTeX / text representation of the question statement and formulas" },
+      optionsList: {
+        type: Type.ARRAY,
+        description: "List of options (A, B, C, D) if MCQ/MSQ",
+        items: { type: Type.STRING }
+      },
+      qualityIssues: {
+        type: Type.ARRAY,
+        description: "Any detected quality problems",
+        items: { type: Type.STRING }
+      },
+      isClean: { type: Type.BOOLEAN, description: "Whether the question image is complete and clear" },
+      recommendations: { type: Type.STRING, description: "Helpful recommendations for the editor" }
     },
-    required: ["qualityScore", "isClipped", "recommendedAction", "summary"]
+    required: ["detectedType", "marks", "latexSummary", "isClean"]
   };
 
-  const inlineData = {
-    data: image.replace(/^data:image\/\w+;base64,/, ''),
-    mimeType: image.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png'
-  };
+  const contents = rawImages.map((base64: string) => {
+    const isJpeg = base64.startsWith('data:image/jpeg');
+    return {
+      inlineData: {
+        data: base64.replace(/^data:image\/\w+;base64,/, ''),
+        mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+      }
+    };
+  });
 
-  const prompt = `Analyze this cropped question image for clarity, clipping, and completeness.
-Context: "${questionContext || ''}"`;
+  const targetContext = { ...currentQuestion, qNo: qNo || currentQuestion.que, currentType: currentType || currentQuestion.type };
+
+  const prompt = `You are a senior exam paper reviewer and OCR specialist for JEE Advanced / NEET / CBT exams.
+Examine this question slice carefully.
+Current question metadata: ${JSON.stringify(targetContext)}.
+
+Perform a thorough diagnostic:
+1. Determine the EXACT Question Type ('mcq', 'msq', 'nat', 'msm').
+2. Transcribe question & options into crisp LaTeX.
+3. Check for flaws or clippings.
+4. Recommend standard marking scheme.`;
 
   return executeGeminiWithFallback(ai, {
-    contents: [{ inlineData }, { text: prompt }],
-    schema,
+    contents: [...contents, { text: prompt }],
+    schema: repairSchema,
     temperature: 0.1,
-    label: 'Analyze Question Image'
+    preferredModel: requestedModel,
+    label: 'Client Direct Analyze Question Image'
   });
 }
 
 async function handleExtractAnswerKeyPdf(ai: GoogleGenAI, body: any) {
-  const { pdfText, images, options = {} } = body;
+  const { pdfText, text = '', images, options = {}, context = {}, model: requestedModel } = body;
+  const rawText = text || pdfText || '';
+
   const keySchema: Schema = {
     type: Type.OBJECT,
     properties: {
       answers: {
         type: Type.ARRAY,
+        description: "Extracted question-to-answer mappings with verified question types",
         items: {
           type: Type.OBJECT,
           properties: {
-            qNo: { type: Type.INTEGER },
-            answer: { type: Type.STRING },
-            subject: { type: Type.STRING }
+            qNo: { type: Type.INTEGER, description: "Question sequence number (1, 2, 3...)" },
+            answer: { type: Type.STRING, description: "Raw answer string as printed (e.g. 'A', 'B,D', '32', '3.14', 'A->P; B->Q')" },
+            normalizedAnswer: { type: Type.STRING, description: "Standard CBT answer string: 1-based index for MCQ ('1','2','3','4'), comma-separated indices for MSQ ('1,3'), exact numerical for NAT ('32'), or mapping for MSM ('A->P; B->Q')" },
+            letterAnswer: { type: Type.STRING, description: "Standard letter format (e.g. 'A', 'A,C', '32', 'A->P; B->Q')" },
+            inferredType: { 
+              type: Type.STRING, 
+              description: "Question type inferred from answer: 'mcq' (Single option A/B/C/D or 1/2/3/4), 'msq' (Multiple options e.g. A,C or 1,3), 'nat' (Numerical integer/decimal value e.g. 24 or 3.14), 'msm' (Matrix match mapping e.g. A->P; B->Q)" 
+            },
+            subject: { type: Type.STRING, description: "Subject name (Physics, Chemistry, Mathematics, Biology) if indicated" },
+            confidence: { type: Type.NUMBER, description: "Detection confidence score between 0 and 100" }
           },
-          required: ["qNo", "answer"]
+          required: ["qNo", "answer", "normalizedAnswer", "inferredType"]
         }
       },
-      sourcePage: { type: Type.INTEGER },
-      confidence: { type: Type.NUMBER }
+      tableName: { type: Type.STRING, description: "Title or header of the answer key table" },
+      totalQuestionsDetected: { type: Type.INTEGER, description: "Total number of answer entries identified" },
+      summary: { type: Type.STRING, description: "Concise summary of detected subjects, total answers, and type breakdown" }
     },
     required: ["answers"]
   };
@@ -326,26 +382,32 @@ async function handleExtractAnswerKeyPdf(ai: GoogleGenAI, body: any) {
   const contents: any[] = [];
   if (images && Array.isArray(images)) {
     images.forEach((img: string) => {
+      const isJpeg = img.startsWith('data:image/jpeg');
       contents.push({
         inlineData: {
           data: img.replace(/^data:image\/\w+;base64,/, ''),
-          mimeType: img.startsWith('data:image/jpeg') ? 'image/jpeg' : 'image/png'
+          mimeType: isJpeg ? 'image/jpeg' : 'image/png'
         }
       });
     });
   }
-  if (pdfText) {
-    contents.push({ text: `Raw Answer Key Text:\n${pdfText}` });
+  if (rawText) {
+    contents.push({ text: `Raw Answer Key Text / OCR:\n${rawText}` });
   }
 
-  const prompt = `Extract all question-to-answer mappings from this document.`;
+  const prompt = `You are an expert exam key parser and question type validator for JEE Advanced, JEE Main, NEET, and CBT exam papers.
+Analyze this Answer Key document / page images thoroughly.
+Extract ALL question numbers and their corresponding answer keys with inferred types.
+${context?.totalQuestions ? `Expected Question Count: ${context.totalQuestions}.` : ''}`;
+
   contents.push({ text: prompt });
 
   return executeGeminiWithFallback(ai, {
     contents,
     schema: keySchema,
     temperature: 0.1,
-    label: 'Extract Answer Key PDF'
+    preferredModel: requestedModel,
+    label: 'Client Direct Extract Answer Key PDF'
   });
 }
 

@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { useCbtStore } from '../store/useCbtStore';
 import { fetchWithGeminiFallback } from '../utils/geminiKeyManager';
 import {
@@ -25,7 +25,12 @@ import {
   ArrowLeft,
   ArrowRight,
   Loader2,
-  FileText
+  FileText,
+  ListOrdered,
+  ArrowRightCircle,
+  ImagePlus,
+  CheckCheck,
+  HelpCircle
 } from 'lucide-react';
 import { getPdfjsLib } from '../utils/pdfWorkerConfig';
 
@@ -34,6 +39,97 @@ interface BoxCoord {
   xmin: number;
   ymax: number;
   xmax: number;
+}
+
+export function extractBoxFromPdfDataPart(part: any): BoxCoord | null {
+  if (!part) return null;
+
+  let ymin: number | undefined;
+  let xmin: number | undefined;
+  let ymax: number | undefined;
+  let xmax: number | undefined;
+
+  // 1. Check bounds array: [xmin, ymin, width, height] or [ymin, xmin, ymax, xmax] or [xmin, ymin, xmax, ymax]
+  if (Array.isArray(part.bounds) && part.bounds.length === 4) {
+    const [b0, b1, b2, b3] = part.bounds.map((v: any) => Number(v) || 0);
+    if (b2 <= 1 && b3 <= 1 && b0 + b2 <= 1.05 && b1 + b3 <= 1.05) {
+      // [xmin, ymin, width, height] normalized 0..1
+      xmin = b0;
+      ymin = b1;
+      xmax = b0 + b2;
+      ymax = b1 + b3;
+    } else if (b2 > 1 && b3 > 1 && b0 + b2 <= 1000 && b1 + b3 <= 1000) {
+      // [xmin, ymin, width, height] in 0..1000 per-mil
+      xmin = b0 / 1000;
+      ymin = b1 / 1000;
+      xmax = (b0 + b2) / 1000;
+      ymax = (b1 + b3) / 1000;
+    } else {
+      // Treat as [xmin, ymin, xmax, ymax] or [ymin, xmin, ymax, xmax]
+      xmin = Math.min(b0, b2);
+      xmax = Math.max(b0, b2);
+      ymin = Math.min(b1, b3);
+      ymax = Math.max(b1, b3);
+    }
+  }
+
+  // 2. Check explicit ymin, xmin, ymax, xmax
+  if (ymin === undefined && part.ymin !== undefined && part.xmin !== undefined) {
+    ymin = Number(part.ymin);
+    xmin = Number(part.xmin);
+    ymax = Number(part.ymax ?? part.ymin + 0.3);
+    xmax = Number(part.xmax ?? part.xmin + 0.9);
+  }
+
+  // 3. Check x1, y1, x2, y2 (or y1, x1, y2, x2)
+  if (ymin === undefined && (part.x1 !== undefined || part.y1 !== undefined)) {
+    const rawX1 = Number(part.x1 ?? 0);
+    const rawY1 = Number(part.y1 ?? 0);
+    const rawX2 = Number(part.x2 ?? 1000);
+    const rawY2 = Number(part.y2 ?? 1000);
+
+    xmin = Math.min(rawX1, rawX2);
+    xmax = Math.max(rawX1, rawX2);
+    ymin = Math.min(rawY1, rawY2);
+    ymax = Math.max(rawY1, rawY2);
+  }
+
+  // 4. Check box or bbox array
+  if (ymin === undefined && Array.isArray(part.box) && part.box.length === 4) {
+    const [b0, b1, b2, b3] = part.box.map((v: any) => Number(v) || 0);
+    ymin = Math.min(b0, b2);
+    ymax = Math.max(b0, b2);
+    xmin = Math.min(b1, b3);
+    xmax = Math.max(b1, b3);
+  }
+
+  if (ymin === undefined || xmin === undefined || ymax === undefined || xmax === undefined) {
+    return null;
+  }
+
+  // Normalize scale:
+  const maxVal = Math.max(ymin, xmin, ymax, xmax);
+  if (maxVal > 100) {
+    // 0..1000 scale (per mil)
+    ymin /= 1000;
+    xmin /= 1000;
+    ymax /= 1000;
+    xmax /= 1000;
+  } else if (maxVal > 1.05) {
+    // 0..100 percentage scale
+    ymin /= 100;
+    xmin /= 100;
+    ymax /= 100;
+    xmax /= 100;
+  }
+
+  // Clamp safely to [0, 1]
+  ymin = Math.max(0, Math.min(1, ymin));
+  xmin = Math.max(0, Math.min(1, xmin));
+  ymax = Math.max(ymin + 0.01, Math.min(1, ymax));
+  xmax = Math.max(xmin + 0.01, Math.min(1, xmax));
+
+  return { ymin, xmin, ymax, xmax };
 }
 
 export const PdfRecropModal: React.FC = () => {
@@ -47,10 +143,52 @@ export const PdfRecropModal: React.FC = () => {
     attachSourcePdfToArchive,
     geminiApiKey,
     addToast,
-    refreshUsageMetrics,
+    updateQuestion,
+    reassignQuestionSection,
   } = useCbtStore();
 
   const activeArchive = archives.find((a) => a.id === activeArchiveId);
+
+  // Flatten all questions in current archive in strictly sorted order by Q-number
+  const allQuestionsList = useMemo(() => {
+    if (!activeArchive) return [];
+    const list: {
+      id: string;
+      que: number;
+      subjectId: string;
+      sectionId: string;
+      subjectName: string;
+      sectionName: string;
+      type: 'mcq' | 'msq' | 'nat' | 'msm';
+      imagesCount: number;
+      pdfData?: any[];
+      images?: any[];
+    }[] = [];
+
+    activeArchive.subjects.forEach((sub) => {
+      sub.sections.forEach((sec) => {
+        sec.questions.forEach((q) => {
+          list.push({
+            id: q.id,
+            que: q.que,
+            subjectId: sub.id,
+            sectionId: sec.id,
+            subjectName: sub.name,
+            sectionName: sec.name,
+            type: q.type as any,
+            imagesCount: q.images ? q.images.length : 0,
+            pdfData: q.pdfData,
+            images: q.images,
+          });
+        });
+      });
+    });
+
+    return list.sort((a, b) => a.que - b.que);
+  }, [activeArchive]);
+
+  // Active question index in allQuestionsList
+  const [activeQIndex, setActiveQIndex] = useState<number>(0);
 
   // PDF Document State
   const [pdfFile, setPdfFile] = useState<File | Blob | null>(null);
@@ -72,7 +210,7 @@ export const PdfRecropModal: React.FC = () => {
 
   // Mouse / Touch Dragging State
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
-  const [dragMode, setDragMode] = useState<string | null>(null); // 'create' | 'move' | 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se'
+  const [dragMode, setDragMode] = useState<string | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [initialBox, setInitialBox] = useState<BoxCoord>({ ymin: 0, xmin: 0, ymax: 0, xmax: 0 });
 
@@ -91,8 +229,11 @@ export const PdfRecropModal: React.FC = () => {
     que: 1,
     type: 'mcq' as 'mcq' | 'msq' | 'nat' | 'msm',
     subjectId: '',
-    sectionId: ''
+    sectionId: '',
+    answerOptions: ''
   });
+
+  const [jumpQ, setJumpQ] = useState<string>('');
 
   // Previews
   const [previewUrlA, setPreviewUrlA] = useState<string>('');
@@ -104,7 +245,73 @@ export const PdfRecropModal: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeRenderTaskRef = useRef<any>(null);
 
-  // Initialize Target State
+  // Load question properties & crop coordinates for a given index
+  const selectQuestionByIndex = useCallback((idx: number) => {
+    if (idx < 0 || idx >= allQuestionsList.length) return;
+    setActiveQIndex(idx);
+    const q = allQuestionsList[idx];
+    if (!q) return;
+
+    // We also need the actual question object to get its current answer options
+    let currentAnswerOptions = '';
+    const archive = useCbtStore.getState().archives.find(a => a.id === useCbtStore.getState().activeArchiveId);
+    if (archive) {
+      for (const sub of archive.subjects) {
+        for (const sec of sub.sections) {
+          const found = sec.questions.find(x => x.id === q.id);
+          if (found) {
+            currentAnswerOptions = found.answerOptions;
+            break;
+          }
+        }
+      }
+    }
+
+    setNewQProps({
+      que: q.que,
+      type: q.type,
+      subjectId: q.subjectId,
+      sectionId: q.sectionId,
+      answerOptions: currentAnswerOptions
+    });
+
+    // Reset region to A
+    setActiveRegion('A');
+
+    // Check pdfData or images for page & crop box
+    if (q.pdfData && q.pdfData.length > 0) {
+      const p1 = q.pdfData[0];
+      const pNum = p1.page || p1.pageNumber || (p1 as any).pageIndex || 1;
+      setCurrentPage(pNum);
+
+      const box1 = extractBoxFromPdfDataPart(p1);
+      if (box1) {
+        setBoxA(box1);
+      } else {
+        setBoxA({ ymin: 0.1, xmin: 0.05, ymax: 0.4, xmax: 0.95 });
+      }
+
+      if (q.pdfData.length >= 2) {
+        setIsMultiRegion(true);
+        const p2 = q.pdfData[1];
+        setPageB(p2.page || p2.pageNumber || (p2 as any).pageIndex || pNum);
+        const box2 = extractBoxFromPdfDataPart(p2);
+        if (box2) {
+          setBoxB(box2);
+        } else {
+          setBoxB({ ymin: 0.45, xmin: 0.05, ymax: 0.75, xmax: 0.95 });
+        }
+      } else {
+        setIsMultiRegion(false);
+      }
+    } else {
+      // Default initial box if no pdfData found
+      setBoxA({ ymin: 0.1, xmin: 0.05, ymax: 0.4, xmax: 0.95 });
+      setIsMultiRegion(false);
+    }
+  }, [allQuestionsList]);
+
+  // Initialize Target State when modal opens
   useEffect(() => {
     if (!isPdfRecropModalOpen) return;
 
@@ -118,48 +325,17 @@ export const PdfRecropModal: React.FC = () => {
     }
 
     if (activeArchive) {
-      // Find default question or subject/section
-      let curQNo = 1;
-      let curSubjId = activeArchive.subjects[0]?.id || '';
-      let curSecId = activeArchive.subjects[0]?.sections[0]?.id || '';
-
-      let targetPage = recropTarget?.pageNumber || 1;
-
+      // Find matching question index
+      let targetIdx = 0;
       if (recropTarget?.questionId) {
-        activeArchive.subjects.forEach((sub) => {
-          sub.sections.forEach((sec) => {
-            const q = sec.questions.find((item) => item.id === recropTarget.questionId);
-            if (q) {
-              curQNo = q.que;
-              curSubjId = sub.id;
-              curSecId = sec.id;
-              if (q.pdfData && q.pdfData.length > 0 && q.pdfData[0].pageNumber) {
-                targetPage = q.pdfData[0].pageNumber;
-              } else if (q.images && q.images.length > 0) {
-                const partIdx = recropTarget.partIndex ? recropTarget.partIndex - 1 : 0;
-                const img = q.images[partIdx] || q.images[0];
-                if (img && (img as any).pageNumber) {
-                  targetPage = (img as any).pageNumber;
-                }
-              }
-            }
-          });
-        });
+        const foundIdx = allQuestionsList.findIndex((q) => q.id === recropTarget.questionId);
+        if (foundIdx !== -1) targetIdx = foundIdx;
       } else if (recropTarget?.defaultQNo) {
-        curQNo = recropTarget.defaultQNo;
+        const foundIdx = allQuestionsList.findIndex((q) => q.que === recropTarget.defaultQNo);
+        if (foundIdx !== -1) targetIdx = foundIdx;
       }
 
-      setNewQProps({
-        que: curQNo,
-        type: 'mcq',
-        subjectId: curSubjId,
-        sectionId: curSecId
-      });
-
-      // Jump to target page if PDF document is already loaded
-      if (pdfDoc && targetPage) {
-        setCurrentPage(Math.min(Math.max(1, targetPage), pdfDoc.numPages));
-      }
+      selectQuestionByIndex(targetIdx);
 
       // Detect if source PDF already exists in archive rawFiles
       let foundPdf: Blob | null = null;
@@ -205,7 +381,7 @@ export const PdfRecropModal: React.FC = () => {
         const initPage = recropTarget?.pageNumber ? Math.min(Math.max(1, recropTarget.pageNumber), loaded.numPages) : 1;
         setCurrentPage(initPage);
 
-        // Generate small thumbnails for the first 15 pages asynchronously
+        // Generate small thumbnails for pages asynchronously
         const thumbs: { url: string; page: number }[] = [];
         const thumbPages = Math.min(loaded.numPages, 30);
         for (let i = 1; i <= thumbPages; i++) {
@@ -238,48 +414,156 @@ export const PdfRecropModal: React.FC = () => {
     };
   }, [pdfFile]);
 
+  // Fast Live Crop Preview generator from active rendered canvas
+  const generateLivePreview = useCallback(() => {
+    if (!canvasRef.current) return;
+    const canvas = canvasRef.current;
+    if (canvas.width === 0 || canvas.height === 0) return;
+
+    const extractRegion = (box: BoxCoord) => {
+      const ymin = Math.max(0, Math.min(1, Math.min(box.ymin, box.ymax)));
+      const ymax = Math.max(0, Math.min(1, Math.max(box.ymin, box.ymax)));
+      const xmin = Math.max(0, Math.min(1, Math.min(box.xmin, box.xmax)));
+      const xmax = Math.max(0, Math.min(1, Math.max(box.xmin, box.xmax)));
+
+      const pxX = Math.floor(xmin * canvas.width);
+      const pxY = Math.floor(ymin * canvas.height);
+      const pxW = Math.max(10, Math.ceil((xmax - xmin) * canvas.width));
+      const pxH = Math.max(10, Math.ceil((ymax - ymin) * canvas.height));
+
+      const cropCanvas = document.createElement('canvas');
+      cropCanvas.width = pxW;
+      cropCanvas.height = pxH;
+      const ctx = cropCanvas.getContext('2d');
+      if (!ctx) return null;
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, pxW, pxH);
+      ctx.drawImage(canvas, pxX, pxY, pxW, pxH, 0, 0, pxW, pxH);
+
+      if (autoWhiten || sharpenText) {
+        try {
+          const imgData = ctx.getImageData(0, 0, pxW, pxH);
+          const data = imgData.data;
+          for (let i = 0; i < data.length; i += 4) {
+            const avg = (data[i] + data[i + 1] + data[i + 2]) / 3;
+            if (autoWhiten && avg > 210) {
+              const factor = Math.min(1, (avg - 210) / 42);
+              data[i] = Math.min(255, Math.round(data[i] + (255 - data[i]) * factor));
+              data[i + 1] = Math.min(255, Math.round(data[i + 1] + (255 - data[i + 1]) * factor));
+              data[i + 2] = Math.min(255, Math.round(data[i + 2] + (255 - data[i + 2]) * factor));
+            }
+            if (sharpenText && avg < 130) {
+              const factor = (130 - avg) / 130;
+              const boost = Math.round(28 * factor);
+              data[i] = Math.max(0, data[i] - boost);
+              data[i + 1] = Math.max(0, data[i + 1] - boost);
+              data[i + 2] = Math.max(0, data[i + 2] - boost);
+            }
+          }
+          ctx.putImageData(imgData, 0, 0);
+        } catch {
+          // ignore potential canvas security errors
+        }
+      }
+      return cropCanvas;
+    };
+
+    const cA = extractRegion(boxA);
+    if (cA) {
+      setPreviewUrlA(cA.toDataURL('image/png'));
+    }
+
+    if (isMultiRegion && boxB) {
+      const cB = extractRegion(boxB);
+      if (cB) {
+        setPreviewUrlB(cB.toDataURL('image/png'));
+        if (cA) {
+          const gap = 12;
+          const stitchW = Math.max(cA.width, cB.width);
+          const stitchH = cA.height + cB.height + gap;
+          const sCanvas = document.createElement('canvas');
+          sCanvas.width = stitchW;
+          sCanvas.height = stitchH;
+          const sCtx = sCanvas.getContext('2d');
+          if (sCtx) {
+            sCtx.fillStyle = '#FFFFFF';
+            sCtx.fillRect(0, 0, stitchW, stitchH);
+            sCtx.drawImage(cA, 0, 0);
+            sCtx.drawImage(cB, 0, cA.height + gap);
+            setPreviewUrlStitched(sCanvas.toDataURL('image/png'));
+          }
+        }
+      }
+    }
+  }, [boxA, boxB, isMultiRegion, autoWhiten, sharpenText]);
+
   // Render High-DPI Page to Canvas
   const renderCurrentPage = useCallback(async () => {
     if (!pdfDoc || !canvasRef.current) return;
     setRenderingPage(true);
 
-    // Cancel any previous render task in flight on this canvas to prevent collision errors
     if (activeRenderTaskRef.current) {
       try {
         activeRenderTaskRef.current.cancel();
+        await activeRenderTaskRef.current.promise.catch(() => {});
       } catch {
-        // Ignored
+        // ignore
       }
       activeRenderTaskRef.current = null;
     }
 
     try {
-      const pageToRender = activeRegion === 'B' && isMultiRegion ? pageB : currentPage;
+      const pageToRender = activeRegion === 'A' ? currentPage : pageB;
       const page = await pdfDoc.getPage(pageToRender);
-      const viewport = page.getViewport({ scale });
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
 
+      const dpr = window.devicePixelRatio || 1.5;
+      const effectiveScale = scale * dpr;
+      const viewport = page.getViewport({ scale: effectiveScale });
+
+      const canvas = canvasRef.current;
       canvas.width = viewport.width;
       canvas.height = viewport.height;
+      canvas.style.width = `${viewport.width / dpr}px`;
+      canvas.style.height = `${viewport.height / dpr}px`;
 
-      const renderTask = page.render({ canvasContext: ctx, viewport } as any);
-      activeRenderTaskRef.current = renderTask;
-      await renderTask.promise;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const renderTask = page.render({
+          canvasContext: ctx,
+          viewport: viewport
+        } as any);
+
+        activeRenderTaskRef.current = renderTask;
+        await renderTask.promise;
+        
+        // Immediately generate live preview after page render
+        generateLivePreview();
+      }
     } catch (err: any) {
-      if (err?.name !== 'RenderingCancelledException' && !err?.message?.includes('cancelled')) {
-        console.warn('Page rendering notice:', err?.message || err);
+      if (err?.name !== 'RenderingCancelledException') {
+        console.error("Page render error:", err);
       }
     } finally {
-      activeRenderTaskRef.current = null;
       setRenderingPage(false);
     }
-  }, [pdfDoc, currentPage, pageB, activeRegion, isMultiRegion, scale]);
+  }, [pdfDoc, currentPage, pageB, activeRegion, scale, generateLivePreview]);
 
   useEffect(() => {
     renderCurrentPage();
   }, [renderCurrentPage]);
+
+  // Keep live crop preview updated whenever boxes or options change
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      generateLivePreview();
+    }, 20);
+    return () => clearTimeout(timer);
+  }, [generateLivePreview, boxA, boxB, isMultiRegion, activeRegion, currentPage, pageB, activeQIndex, autoWhiten, sharpenText]);
+
+
 
   // Helper to extract a crop box from a given page into a canvas
   const cropBoxFromPage = useCallback(
@@ -287,7 +571,7 @@ export const PdfRecropModal: React.FC = () => {
       if (!pdfDoc) return null;
       try {
         const page = await pdfDoc.getPage(pageIndex);
-        const hiScale = 2.6; // High resolution 2.6x crop for razor-sharp text & math
+        const hiScale = 2.6; // High resolution 2.6x crop
         const viewport = page.getViewport({ scale: hiScale });
         const fullCanvas = document.createElement('canvas');
         fullCanvas.width = Math.round(viewport.width);
@@ -324,7 +608,7 @@ export const PdfRecropModal: React.FC = () => {
         cropCtx.fillRect(0, 0, pxW, pxH);
         cropCtx.drawImage(fullCanvas, pxX, pxY, pxW, pxH, 0, 0, pxW, pxH);
 
-        // Apply Image Clean / Enhancement filters with continuous smooth tone-curves
+        // Apply Image Clean / Enhancement filters
         if (autoWhiten || sharpenText) {
           const imgData = cropCtx.getImageData(0, 0, pxW, pxH);
           const data = imgData.data;
@@ -335,7 +619,6 @@ export const PdfRecropModal: React.FC = () => {
             const avg = (r + g + b) / 3;
 
             if (autoWhiten) {
-              // Smooth knee-curve: brighten off-white/scanner grey backgrounds while preserving delicate font anti-aliasing
               if (avg > 210) {
                 const factor = Math.min(1, (avg - 210) / 42);
                 data[i] = Math.min(255, Math.round(r + (255 - r) * factor));
@@ -345,7 +628,6 @@ export const PdfRecropModal: React.FC = () => {
             }
 
             if (sharpenText) {
-              // Smoothly deepen dark ink contrast without introducing jagged threshold artifacts
               if (avg < 130) {
                 const factor = (130 - avg) / 130;
                 const boost = Math.round(28 * factor);
@@ -367,137 +649,73 @@ export const PdfRecropModal: React.FC = () => {
     [pdfDoc, autoWhiten, sharpenText]
   );
 
-  // Update live preview when boxes or settings change
-  useEffect(() => {
-    let active = true;
-    const updatePreviews = async () => {
-      if (!pdfDoc) return;
+  // Handle PDF Upload / Attach
+  const handlePdfUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
 
-      const cA = await cropBoxFromPage(currentPage, boxA);
-      if (!active) return;
-      if (cA) {
-        setPreviewUrlA(cA.toDataURL('image/png'));
-      }
+    setPdfFile(file);
+    setPdfFileName(file.name);
 
-      if (isMultiRegion && boxB) {
-        const cB = await cropBoxFromPage(pageB, boxB);
-        if (!active) return;
-        if (cB) {
-          setPreviewUrlB(cB.toDataURL('image/png'));
-
-          if (cA) {
-            // Create vertical stitched image with clean divider
-            const gap = 12;
-            const stitchW = Math.max(cA.width, cB.width);
-            const stitchH = cA.height + cB.height + gap;
-            const sCanvas = document.createElement('canvas');
-            sCanvas.width = stitchW;
-            sCanvas.height = stitchH;
-            const sCtx = sCanvas.getContext('2d');
-            if (sCtx) {
-              sCtx.fillStyle = '#FFFFFF';
-              sCtx.fillRect(0, 0, stitchW, stitchH);
-              sCtx.drawImage(cA, 0, 0);
-
-              // Subtle dotted divider line
-              sCtx.strokeStyle = '#CBD5E1';
-              sCtx.setLineDash([4, 4]);
-              sCtx.beginPath();
-              sCtx.moveTo(0, cA.height + gap / 2);
-              sCtx.lineTo(stitchW, cA.height + gap / 2);
-              sCtx.stroke();
-
-              sCtx.drawImage(cB, 0, cA.height + gap);
-              setPreviewUrlStitched(sCanvas.toDataURL('image/png'));
-            }
-          }
-        }
-      } else {
-        setPreviewUrlB('');
-        setPreviewUrlStitched('');
-      }
-    };
-
-    const timeout = setTimeout(updatePreviews, 200);
-    return () => {
-      active = false;
-      clearTimeout(timeout);
-    };
-  }, [pdfDoc, currentPage, pageB, boxA, boxB, isMultiRegion, cropBoxFromPage]);
-
-  // Handle PDF Upload / Replacement
-  const handlePdfUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      setPdfFile(file);
-      setPdfFileName(file.name);
-      if (activeArchive) {
-        attachSourcePdfToArchive(activeArchive.id, file);
-      }
+    if (activeArchive) {
+      await attachSourcePdfToArchive(activeArchive.id, file);
     }
   };
 
-  // AI Auto-Detect Box for the Question
+  // AI Automatic Question Box Pinpointer
   const handleAiAutoDetect = async () => {
-    if (!canvasRef.current || !pdfDoc) return;
+    if (!pdfDoc) return;
     setAiDetecting(true);
-    setAiMessage('');
+    setAiMessage(`AI analyzing Page ${currentPage} for Question ${newQProps.que}...`);
 
     try {
-      const pageToDetect = activeRegion === 'B' && isMultiRegion ? pageB : currentPage;
-      const page = await pdfDoc.getPage(pageToDetect);
-      const viewport = page.getViewport({ scale: 1.5 });
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = viewport.width;
-      tempCanvas.height = viewport.height;
-      const ctx = tempCanvas.getContext('2d');
-      if (!ctx) throw new Error('Canvas context error');
-      await page.render({ canvasContext: ctx, viewport } as any).promise;
+      const pageToDetect = activeRegion === 'A' ? currentPage : pageB;
+      const tempCanvas = await cropBoxFromPage(pageToDetect, { ymin: 0, xmin: 0, ymax: 1, xmax: 1 });
+      if (!tempCanvas) throw new Error('Failed to capture page canvas');
 
-      const pageBase64 = tempCanvas.toDataURL('image/jpeg', 0.85);
+      const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.85);
+      const base64Data = dataUrl.split(',')[1];
+
+      const promptText = `Find question Q${newQProps.que} on this exam paper.
+Return JSON ONLY:
+{
+  "detectedQNo": ${newQProps.que},
+  "box": [ymin, xmin, ymax, xmax]
+}
+Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the box comfortably encloses question number, problem stem, diagrams, and all options.`;
 
       const res = await fetchWithGeminiFallback(
-        '/api/detect-question-box',
+        `/api/gemini/generate`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            image: pageBase64,
-            qNo: newQProps.que,
-            promptHint: `Find question ${newQProps.que} with all its diagrams and options`,
-          }),
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { text: promptText },
+                  { inlineData: { mimeType: 'image/jpeg', data: base64Data } }
+                ]
+              }
+            ],
+            generationConfig: { responseMimeType: 'application/json' }
+          })
         },
-        addToast,
-        refreshUsageMetrics
+        (title, desc, type) => addToast({ title, description: desc, type })
       );
 
-      if (!res.ok) {
-        const data = await res.json();
-        throw new Error(data.error || 'Failed to detect box with AI');
-      }
+      const responseJson = await res.json();
+      const jsonText = responseJson.candidates?.[0]?.content?.parts?.[0]?.text || responseJson.text;
+      if (!jsonText) throw new Error('No AI response received');
 
-      const result = await res.json();
+      const result = JSON.parse(jsonText);
       if (result.box && Array.isArray(result.box) && result.box.length === 4) {
         let [ymin, xmin, ymax, xmax] = result.box;
-        ymin = Math.max(0, Math.min(0.98, Number(ymin) || 0));
-        xmin = Math.max(0, Math.min(0.98, Number(xmin) || 0));
-        ymax = Math.max(ymin + 0.02, Math.min(1, Number(ymax) || 1));
-        xmax = Math.max(xmin + 0.04, Math.min(1, Number(xmax) || 1));
-
-        // Intelligent column alignment
-        const isLeftCol = xmin < 0.46 && xmax <= 0.52;
-        const isRightCol = xmin >= 0.48;
-        if (isLeftCol) {
-          xmin = Math.min(xmin, 0.035);
-          xmax = Math.min(Math.max(xmax, 0.46), 0.492);
-        } else if (isRightCol) {
-          xmin = Math.max(Math.min(xmin, 0.53), 0.508);
-          xmax = Math.max(xmax, 0.965);
-        }
-
-        // Asymmetric safe margin
         ymin = Math.max(0, ymin - 0.008);
+        xmin = Math.max(0, xmin - 0.012);
         ymax = Math.min(1, ymax + 0.012);
+        xmax = Math.min(1, xmax + 0.012);
 
         const newBox: BoxCoord = { ymin, xmin, ymax, xmax };
         if (activeRegion === 'A') {
@@ -507,7 +725,7 @@ export const PdfRecropModal: React.FC = () => {
         }
         setAiMessage(`Found Question ${result.detectedQNo || newQProps.que} on Page ${pageToDetect}!`);
       } else {
-        setAiMessage('Could not pinpoint question box automatically. Please draw manually.');
+        setAiMessage('Could not pinpoint question box automatically. Please adjust manually.');
       }
     } catch (err: any) {
       console.error("AI Detect Error:", err);
@@ -538,7 +756,7 @@ export const PdfRecropModal: React.FC = () => {
     }
   };
 
-  // Pointer Down (Start Box Draw / Drag / Resize)
+  // Pointer Down
   const handlePointerDown = (e: React.MouseEvent | React.TouchEvent, mode: string = 'create') => {
     const coords = getNormCoords(e);
     if (!coords) return;
@@ -586,7 +804,6 @@ export const PdfRecropModal: React.FC = () => {
         ymax: newYmin + h
       }));
     } else {
-      // Handles resize
       setCurrentActiveBox((prev) => {
         let { xmin, ymin, xmax, ymax } = initialBox;
         if (dragMode.includes('w')) xmin = Math.min(xmax - 0.02, initialBox.xmin + dx);
@@ -639,8 +856,28 @@ export const PdfRecropModal: React.FC = () => {
     }));
   };
 
-  // Apply Action & Save Cropped Image to Question
-  const handleSaveCrop = async () => {
+  // Other questions on the current page for visual outline overlay
+  const otherQuestionsOnPage = useMemo(() => {
+    const list: { keyId: string; que: number; index: number; box: BoxCoord }[] = [];
+    allQuestionsList.forEach((q, idx) => {
+      if (idx === activeQIndex) return;
+      if (q.pdfData && q.pdfData.length > 0) {
+        q.pdfData.forEach((p, pIdx) => {
+          const pNum = p.page || p.pageNumber || (p as any).pageIndex;
+          if (pNum === currentPage) {
+            const box = extractBoxFromPdfDataPart(p);
+            if (box) {
+              list.push({ keyId: `oq-${q.id}-${pIdx}`, que: q.que, index: idx, box });
+            }
+          }
+        });
+      }
+    });
+    return list;
+  }, [allQuestionsList, activeQIndex, currentPage]);
+
+  // Save Crop logic (with optional autoAdvance)
+  const handleSaveCrop = async (autoAdvance: boolean = false) => {
     if (!pdfDoc) return;
 
     let finalCanvas: HTMLCanvasElement | null = null;
@@ -673,24 +910,33 @@ export const PdfRecropModal: React.FC = () => {
 
     if (!finalCanvas) return;
 
+    const currentQ = allQuestionsList[activeQIndex];
+    const targetQId = currentQ?.id || recropTarget?.questionId;
+
     finalCanvas.toBlob(async (blob) => {
       if (!blob) return;
 
       const pdfCoords = {
         page: targetPage,
+        pageNumber: targetPage,
         x1: Math.round(targetBox.xmin * 1000),
         y1: Math.round(targetBox.ymin * 1000),
         x2: Math.round(targetBox.xmax * 1000),
-        y2: Math.round(targetBox.ymax * 1000)
+        y2: Math.round(targetBox.ymax * 1000),
+        ymin: targetBox.ymin,
+        xmin: targetBox.xmin,
+        ymax: targetBox.ymax,
+        xmax: targetBox.xmax,
+        bounds: [targetBox.xmin, targetBox.ymin, targetBox.xmax - targetBox.xmin, targetBox.ymax - targetBox.ymin],
       };
 
       await applyCroppedImage({
-        questionId: recropTarget?.questionId,
+        questionId: targetQId,
         partIndex: recropTarget?.partIndex || 1,
         mode: targetMode,
         blob,
-        sectionId: newQProps.sectionId || recropTarget?.sectionId,
-        subjectId: newQProps.subjectId || recropTarget?.subjectId,
+        sectionId: newQProps.sectionId || currentQ?.sectionId || recropTarget?.sectionId,
+        subjectId: newQProps.subjectId || currentQ?.subjectId || recropTarget?.subjectId,
         newQuestionProps: {
           que: newQProps.que,
           type: newQProps.type,
@@ -704,38 +950,163 @@ export const PdfRecropModal: React.FC = () => {
         pdfCoords
       });
 
-      closePdfRecrop();
+      if (autoAdvance && activeQIndex < allQuestionsList.length - 1) {
+        selectQuestionByIndex(activeQIndex + 1);
+        // Silently advance without toast or aiMessage to avoid blocking UI
+      } else {
+        if (!autoAdvance) {
+          addToast({
+            title: `Saved Crop for Q${newQProps.que}`,
+            description: targetMode === 'add_part' ? 'Added extra image part to question.' : 'Question image updated successfully.',
+            type: 'success'
+          });
+          closePdfRecrop();
+        }
+      }
     }, 'image/png');
   };
 
+  // Global Keyboard Navigation (Arrow Left/Right & Ctrl+Enter to Save)
+  useEffect(() => {
+    if (!isPdfRecropModalOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const activeEl = document.activeElement;
+      if (
+        activeEl &&
+        (activeEl.tagName === 'INPUT' ||
+          activeEl.tagName === 'SELECT' ||
+          activeEl.tagName === 'TEXTAREA')
+      ) {
+        return;
+      }
+
+      if (e.shiftKey) {
+        if (e.key === 'ArrowUp') { e.preventDefault(); nudge('up'); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); nudge('down'); return; }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); nudge('left'); return; }
+        if (e.key === 'ArrowRight') { e.preventDefault(); nudge('right'); return; }
+        if (e.key === 'S' || e.key === 's') { e.preventDefault(); handleSaveCrop(true); return; }
+      }
+
+      if (e.key === 'ArrowLeft' || e.key === '[') {
+        e.preventDefault();
+        selectQuestionByIndex(activeQIndex - 1);
+      } else if (e.key === 'ArrowRight' || e.key === ']') {
+        e.preventDefault();
+        selectQuestionByIndex(activeQIndex + 1);
+      } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        handleSaveCrop(true);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isPdfRecropModalOpen, activeQIndex, selectQuestionByIndex, nudge, handleSaveCrop]);
+
   if (!isPdfRecropModalOpen) return null;
+
+  const currentQ = allQuestionsList[activeQIndex];
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-2 sm:p-4 text-slate-100 overflow-hidden">
       <div className="flex flex-col bg-slate-900 border border-slate-800 rounded-xl shadow-2xl w-full h-full max-w-7xl max-h-[96vh] overflow-hidden">
-        {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 bg-slate-950 border-b border-slate-800 shrink-0">
+        {/* Top Header Bar with Fast Question Inspection Controls */}
+        <div className="flex flex-wrap items-center justify-between px-4 py-2.5 bg-slate-950 border-b border-slate-800 shrink-0 gap-3">
+          {/* Title & Source File */}
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-indigo-600/20 border border-indigo-500/40 rounded-lg text-indigo-400">
+            <div className="p-2 bg-indigo-600/20 border border-indigo-500/40 rounded-lg text-indigo-400 shrink-0">
               <Crop className="w-5 h-5" />
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-sm sm:text-base font-bold text-white">
-                  PDF Visual Re-Cropper & Slicer
+                  PDF Visual Re-Cropper & Inspector
                 </h2>
                 <span className="px-2 py-0.5 text-[10px] font-semibold bg-indigo-900/60 border border-indigo-700/50 text-indigo-300 rounded-full">
-                  Multi-Modal Precision
+                  Fast Audit Suite
                 </span>
               </div>
-              <p className="text-xs text-slate-400 truncate max-w-sm sm:max-w-md">
-                {pdfFileName
-                  ? `Source: ${pdfFileName}`
-                  : 'Select or attach source PDF to re-crop question'}
+              <p className="text-xs text-slate-400 truncate max-w-xs sm:max-w-sm">
+                {pdfFileName ? `Source: ${pdfFileName}` : 'Select PDF to inspect and re-crop questions'}
               </p>
             </div>
           </div>
 
+          {/* QUESTION NAVIGATION BAR */}
+          {allQuestionsList.length > 0 && (
+            <div className="flex items-center gap-1.5 bg-slate-900/90 border border-slate-800 rounded-lg p-1">
+              <button
+                onClick={() => selectQuestionByIndex(activeQIndex - 1)}
+                disabled={activeQIndex <= 0}
+                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 text-slate-200 transition-colors flex items-center gap-1 text-xs font-semibold"
+                title="Previous Question (Left Arrow)"
+              >
+                <ChevronLeft className="w-4 h-4" />
+                <span className="hidden md:inline">Prev</span>
+              </button>
+
+              <div className="flex items-center bg-slate-950 border border-slate-700 rounded-md overflow-hidden h-7 focus-within:border-indigo-500 transition-colors">
+                <span className="text-slate-400 text-[10px] pl-2 uppercase font-bold tracking-wider select-none">
+                  Go Q
+                </span>
+                <input
+                  type="number"
+                  value={jumpQ}
+                  onChange={(e) => setJumpQ(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      const val = parseInt(jumpQ, 10);
+                      if (!isNaN(val)) {
+                        const idx = allQuestionsList.findIndex(q => q.que === val);
+                        if (idx !== -1) {
+                          selectQuestionByIndex(idx);
+                          setJumpQ('');
+                        } else {
+                          addToast({ title: 'Not found', description: `Question ${val} not found`, type: 'error' });
+                        }
+                      }
+                    }
+                  }}
+                  placeholder="#"
+                  className="w-10 sm:w-12 bg-transparent text-white text-xs font-mono font-bold text-center focus:outline-none"
+                  title="Type question number and press Enter to jump"
+                />
+              </div>
+
+              {/* Question Dropdown Jumper */}
+              <div className="flex items-center gap-1 border-l border-slate-800 pl-1.5 ml-0.5">
+                <ListOrdered className="w-3.5 h-3.5 text-indigo-400 hidden sm:inline" />
+                <select
+                  value={activeQIndex}
+                  onChange={(e) => selectQuestionByIndex(parseInt(e.target.value, 10))}
+                  className="bg-slate-950 border border-transparent hover:border-slate-700 rounded px-2 py-0.5 text-xs font-mono font-bold text-indigo-300 focus:outline-none cursor-pointer max-w-[120px] sm:max-w-[160px] truncate"
+                >
+                  {allQuestionsList.map((q, idx) => (
+                    <option key={q.id} value={idx}>
+                      Q{q.que} ({q.imagesCount > 0 ? `${q.imagesCount} img` : 'No img'}) - {q.sectionName}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-[10px] font-mono text-slate-500 hidden sm:inline">
+                  of {allQuestionsList.length}
+                </span>
+              </div>
+
+              <button
+                onClick={() => selectQuestionByIndex(activeQIndex + 1)}
+                disabled={activeQIndex >= allQuestionsList.length - 1}
+                className="p-1.5 rounded-md bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 text-slate-200 transition-colors flex items-center gap-1 text-xs font-semibold ml-1"
+                title="Next Question (Right Arrow)"
+              >
+                <span className="hidden md:inline">Next</span>
+                <ChevronRight className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Action Buttons */}
           <div className="flex items-center gap-2">
             <input
               type="file"
@@ -746,7 +1117,7 @@ export const PdfRecropModal: React.FC = () => {
             />
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 rounded-lg border border-slate-700 text-xs font-medium transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 text-xs font-medium transition-colors"
               title="Upload or Change PDF"
             >
               <UploadCloud className="w-3.5 h-3.5 text-indigo-400" />
@@ -764,7 +1135,6 @@ export const PdfRecropModal: React.FC = () => {
 
         {/* Content Body */}
         {!pdfFile ? (
-          /* Empty / Upload PDF Prompt */
           <div className="flex-1 flex flex-col items-center justify-center p-6 text-center">
             <div className="w-16 h-16 rounded-2xl bg-indigo-950/60 border border-indigo-800 flex items-center justify-center text-indigo-400 mb-4 shadow-lg shadow-indigo-950/50">
               <FileText className="w-8 h-8" />
@@ -773,7 +1143,7 @@ export const PdfRecropModal: React.FC = () => {
               No Source PDF Attached Yet
             </h3>
             <p className="text-xs sm:text-sm text-slate-400 max-w-md mb-6 leading-relaxed">
-              Attach the question paper PDF to visually re-crop any question, adjust bounding boxes, or stitch split columns and multi-page questions seamlessly.
+              Attach the question paper PDF to visually re-crop any question, inspect boundary overlays, or stitch split columns and multi-page questions seamlessly.
             </p>
             <button
               onClick={() => fileInputRef.current?.click()}
@@ -787,7 +1157,7 @@ export const PdfRecropModal: React.FC = () => {
           <div className="flex-1 flex flex-col lg:flex-row min-h-0 overflow-hidden">
             {/* Left/Main Column: PDF Canvas & Controls */}
             <div className="flex-1 flex flex-col min-w-0 bg-slate-950 border-r border-slate-800 overflow-hidden">
-              {/* PDF Navigation & Zoom Bar */}
+              {/* PDF Page Bar & AI Auto-Detect */}
               <div className="flex flex-wrap items-center justify-between px-3 py-2 bg-slate-900 border-b border-slate-800 gap-2 text-xs">
                 {/* Page Navigation */}
                 <div className="flex items-center gap-1.5">
@@ -942,7 +1312,6 @@ export const PdfRecropModal: React.FC = () => {
                     cursor: isDrawing ? 'crosshair' : 'default'
                   }}
                   onMouseDown={(e) => {
-                    // Only start new box if clicking on background canvas
                     if ((e.target as HTMLElement).tagName === 'CANVAS') {
                       handlePointerDown(e, 'create');
                     }
@@ -955,10 +1324,34 @@ export const PdfRecropModal: React.FC = () => {
                 >
                   <canvas ref={canvasRef} className="block" />
 
-                  {/* Render Crop Box for Active Region */}
+                  {/* Render Dotted Boundary Outlines for OTHER Questions on the Same Page */}
+                  {otherQuestionsOnPage.map((oq) => (
+                    <div
+                      key={oq.keyId}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        selectQuestionByIndex(oq.index);
+                      }}
+                      className="absolute border-2 border-dashed border-amber-500/80 bg-amber-500/10 hover:bg-amber-500/25 cursor-pointer rounded-xs transition-all z-10 group"
+                      style={{
+                        top: `${oq.box.ymin * 100}%`,
+                        left: `${oq.box.xmin * 100}%`,
+                        width: `${(oq.box.xmax - oq.box.xmin) * 100}%`,
+                        height: `${(oq.box.ymax - oq.box.ymin) * 100}%`,
+                      }}
+                      title={`Click to inspect & re-crop Question Q${oq.que}`}
+                    >
+                      <div className="absolute -top-5 left-0 px-1.5 py-0.5 bg-amber-600 text-white text-[9px] font-bold rounded shadow group-hover:scale-105 transition-transform flex items-center gap-1">
+                        <span>Q{oq.que}</span>
+                        <span className="text-[8px] opacity-80">(Switch)</span>
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* Render Active Crop Box */}
                   {canvasRef.current && (
                     <div
-                      className={`absolute border-2 transition-shadow ${
+                      className={`absolute border-2 transition-shadow z-20 ${
                         activeRegion === 'A'
                           ? 'border-indigo-500 bg-indigo-500/15 shadow-indigo-500/20'
                           : 'border-emerald-500 bg-emerald-500/15 shadow-emerald-500/20'
@@ -985,7 +1378,7 @@ export const PdfRecropModal: React.FC = () => {
                           activeRegion === 'A' ? 'bg-indigo-600' : 'bg-emerald-600'
                         }`}
                       >
-                        {isMultiRegion ? `Region ${activeRegion}` : `Question Crop`}
+                        {isMultiRegion ? `Q${newQProps.que} Region ${activeRegion}` : `Q${newQProps.que} Crop Area`}
                       </div>
 
                       {/* Resize Handles */}
@@ -1084,246 +1477,289 @@ export const PdfRecropModal: React.FC = () => {
               )}
             </div>
 
-            {/* Right Column: Fine-Tuning & Live Preview Panel */}
-            <div className="w-full lg:w-96 flex flex-col bg-slate-900 p-4 space-y-4 overflow-y-auto scrollbar-thin shrink-0">
-              {/* Tool 1: Fine-Tune Nudge & Expand Controls */}
-              <div className="bg-slate-950 rounded-lg p-3 border border-slate-800 space-y-2">
-                <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
-                  <span className="flex items-center gap-1.5">
-                    <Sliders className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Nudge & Padding</span>
+            {/* Right Column: Fast Inspection, Fine-Tuning & Save Action Panel */}
+            <div className="w-full lg:w-96 flex flex-col bg-slate-900 border-l border-slate-800 shrink-0 shadow-xl overflow-hidden">
+              
+              {/* Header inside right column */}
+              <div className="bg-slate-950 p-4 border-b border-slate-800 shrink-0">
+                <div className="flex items-center justify-between text-xs font-semibold text-slate-300 mb-2">
+                  <span className="flex items-center gap-1.5 text-indigo-400 font-bold text-sm">
+                    <ListOrdered className="w-4 h-4" />
+                    <span>Question {currentQ?.que} Settings</span>
                   </span>
-                  <button
-                    onClick={() => expandPadding(0.01)}
-                    className="text-[10px] text-indigo-400 hover:text-indigo-300 font-semibold px-2 py-0.5 bg-slate-900 rounded border border-slate-800"
-                  >
-                    +8px Margin
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-3 gap-1.5 text-xs text-center">
-                  <div />
-                  <button
-                    onClick={() => nudge('up')}
-                    className="p-1.5 bg-slate-900 hover:bg-slate-800 rounded text-slate-300 flex items-center justify-center"
-                    title="Nudge Up"
-                  >
-                    <ArrowUp className="w-4 h-4" />
-                  </button>
-                  <div />
-                  <button
-                    onClick={() => nudge('left')}
-                    className="p-1.5 bg-slate-900 hover:bg-slate-800 rounded text-slate-300 flex items-center justify-center"
-                    title="Nudge Left"
-                  >
-                    <ArrowLeft className="w-4 h-4" />
-                  </button>
-                  <button
-                    onClick={() => expandPadding(0.005)}
-                    className="p-1.5 bg-indigo-950 hover:bg-indigo-900 text-indigo-300 rounded text-[10px] font-bold"
-                    title="Expand Crop Boundary"
-                  >
-                    +Pad
-                  </button>
-                  <button
-                    onClick={() => nudge('right')}
-                    className="p-1.5 bg-slate-900 hover:bg-slate-800 rounded text-slate-300 flex items-center justify-center"
-                    title="Nudge Right"
-                  >
-                    <ArrowRight className="w-4 h-4" />
-                  </button>
-                  <div />
-                  <button
-                    onClick={() => nudge('down')}
-                    className="p-1.5 bg-slate-900 hover:bg-slate-800 rounded text-slate-300 flex items-center justify-center"
-                    title="Nudge Down"
-                  >
-                    <ArrowDown className="w-4 h-4" />
-                  </button>
-                  <div />
-                </div>
-              </div>
-
-              {/* Tool 2: Split Question Multi-Region Toggle */}
-              <div className="bg-slate-950 rounded-lg p-3 border border-slate-800 space-y-2">
-                <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
-                  <span className="flex items-center gap-1.5">
-                    <Split className="w-3.5 h-3.5 text-purple-400" />
-                    <span>Split Question Assembler</span>
+                  <span className="px-2 py-0.5 text-[10px] bg-slate-900 border border-slate-700 text-slate-400 font-mono rounded">
+                    {currentQ?.imagesCount || 0} {currentQ?.imagesCount === 1 ? 'img' : 'imgs'}
                   </span>
-                  <input
-                    type="checkbox"
-                    checked={isMultiRegion}
-                    onChange={(e) => {
-                      setIsMultiRegion(e.target.checked);
-                      if (e.target.checked && !boxB) {
-                        setBoxB({ ...boxA, ymin: boxA.ymax + 0.02, ymax: Math.min(1, boxA.ymax + 0.3) });
-                        setPageB(currentPage);
-                      }
-                    }}
-                    className="w-4 h-4 rounded text-indigo-600 bg-slate-900 border-slate-700"
-                  />
                 </div>
-                <p className="text-[11px] text-slate-400 leading-tight">
-                  Enable if the question spans across two columns or two different pages. Crop both regions and stitch them cleanly.
-                </p>
-              </div>
-
-              {/* Tool 3: Clean Scan & Enhancement Toggles */}
-              <div className="bg-slate-950 rounded-lg p-3 border border-slate-800 space-y-2">
-                <div className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-                  <Wand2 className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Scan Enhancement Filters</span>
-                </div>
-                <div className="space-y-1.5 text-xs text-slate-300">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={autoWhiten}
-                      onChange={(e) => setAutoWhiten(e.target.checked)}
-                      className="rounded text-indigo-600 bg-slate-900 border-slate-700"
-                    />
-                    <span>Clean Scan (Auto-Whiten Grey Background)</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={sharpenText}
-                      onChange={(e) => setSharpenText(e.target.checked)}
-                      className="rounded text-indigo-600 bg-slate-900 border-slate-700"
-                    />
-                    <span>Sharpen Math Formulas & Contrast</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={previewDarkMode}
-                      onChange={(e) => setPreviewDarkMode(e.target.checked)}
-                      className="rounded text-indigo-600 bg-slate-900 border-slate-700"
-                    />
-                    <span>CBT Dark Mode Test Simulator</span>
-                  </label>
+                
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className="bg-slate-900 border border-slate-800 px-2 py-0.5 rounded font-medium text-slate-300">
+                    {currentQ?.subjectName || 'Subject'}
+                  </span>
+                  <span className="bg-slate-900 border border-slate-800 px-2 py-0.5 rounded font-medium text-slate-300">
+                    {currentQ?.sectionName || 'Section'}
+                  </span>
                 </div>
               </div>
 
-              {/* Tool 4: Target Save Action & Metadata */}
-              <div className="bg-slate-950 rounded-lg p-3 border border-slate-800 space-y-3">
-                <div className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-                  <Layers className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Target Question Action</span>
-                </div>
+              {/* Scrollable Toolbox */}
+              <div className="flex-1 overflow-y-auto p-4 space-y-5 scrollbar-thin">
 
-                <div className="grid grid-cols-2 gap-1.5 text-[11px]">
-                  {[
-                    { id: 'replace_part', label: 'Replace Slice' },
-                    { id: 'add_part', label: 'Add Part 2+' },
-                    { id: 'stitch', label: 'Stitch & Replace' },
-                    { id: 'new_question', label: 'New Question' }
-                  ].map((m) => (
-                    <button
-                      key={m.id}
-                      onClick={() => setTargetMode(m.id as any)}
-                      className={`p-1.5 rounded text-left font-medium border transition-colors ${
-                        targetMode === m.id
-                          ? 'bg-indigo-600/30 border-indigo-500 text-white'
-                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      {m.label}
-                    </button>
-                  ))}
-                </div>
-
-                {targetMode === 'new_question' && (
-                  <div className="space-y-2 pt-2 border-t border-slate-800 text-xs">
-                    <div className="grid grid-cols-2 gap-2">
+                {/* Quick Edit Question Properties (The "Studio" part) */}
+                <div className="space-y-3">
+                  <div className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-pink-400" />
+                    <span>Quick Bank Edit</span>
+                  </div>
+                  
+                  {activeArchive && (
+                    <div className="grid grid-cols-2 gap-3 pb-2 border-b border-slate-800/60">
                       <div>
-                        <label className="block text-[10px] text-slate-400 mb-0.5">Q Number</label>
-                        <input
-                          type="number"
-                          value={newQProps.que}
-                          onChange={(e) =>
-                            setNewQProps((p) => ({ ...p, que: parseInt(e.target.value, 10) || 1 }))
-                          }
-                          className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-white font-mono"
-                        />
+                        <label className="block text-[10px] text-slate-400 font-semibold mb-1">Subject</label>
+                        <select
+                          value={currentQ?.subjectId || ''}
+                          onChange={(e) => {
+                            const newSubId = e.target.value;
+                            const targetSub = activeArchive.subjects.find(s => s.id === newSubId);
+                            if (currentQ && targetSub && targetSub.sections.length > 0) {
+                              reassignQuestionSection(currentQ.id, targetSub.sections[0].id);
+                              addToast({ title: 'Reassigned', description: `Moved Q${currentQ.que} to ${targetSub.name}`, type: 'info' });
+                            }
+                          }}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white text-xs focus:ring-1 focus:ring-indigo-500"
+                        >
+                          {activeArchive.subjects.map(s => (
+                            <option key={s.id} value={s.id}>{s.name}</option>
+                          ))}
+                        </select>
                       </div>
                       <div>
-                        <label className="block text-[10px] text-slate-400 mb-0.5">Type</label>
+                        <label className="block text-[10px] text-slate-400 font-semibold mb-1">Section</label>
                         <select
-                          value={newQProps.type}
-                          onChange={(e) =>
-                            setNewQProps((p) => ({ ...p, type: e.target.value as any }))
-                          }
-                          className="w-full bg-slate-900 border border-slate-800 rounded px-2 py-1 text-white text-xs"
+                          value={currentQ?.sectionId || ''}
+                          onChange={(e) => {
+                            if (currentQ) {
+                              reassignQuestionSection(currentQ.id, e.target.value);
+                              addToast({ title: 'Reassigned', description: `Moved Q${currentQ.que} to new section`, type: 'info' });
+                            }
+                          }}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white text-xs focus:ring-1 focus:ring-indigo-500"
                         >
-                          <option value="mcq">MCQ Single</option>
-                          <option value="msq">MSQ Multi</option>
-                          <option value="nat">NAT Numerical</option>
-                          <option value="msm">Matrix Match</option>
+                          {activeArchive.subjects
+                            .find(s => s.id === currentQ?.subjectId)
+                            ?.sections.map(sec => (
+                              <option key={sec.id} value={sec.id}>{sec.name}</option>
+                            )) || <option value="">No Sections</option>}
                         </select>
                       </div>
                     </div>
-                  </div>
-                )}
-              </div>
+                  )}
 
-              {/* Live Cropped Result Preview */}
-              <div className="flex-1 bg-slate-950 rounded-lg p-3 border border-slate-800 space-y-2 min-h-[160px]">
-                <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
-                  <span className="flex items-center gap-1.5">
-                    <Eye className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Live Crop Preview</span>
-                  </span>
-                  <span className="text-[10px] text-slate-500 font-mono">
-                    {isMultiRegion ? 'Stitched 2-Part Image' : `Page ${currentPage}`}
-                  </span>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[10px] text-slate-400 font-semibold mb-1">Question Type</label>
+                      <select
+                        value={newQProps.type}
+                        onChange={(e) => {
+                          const val = e.target.value as any;
+                          setNewQProps(p => ({ ...p, type: val }));
+                          if (currentQ) {
+                            const newMarks = val === 'msq' ? { cm: 4, im: -2, pm: 1, max: 4 }
+                                           : val === 'msm' ? { cm: 3, im: -1, pm: 1, max: 12 }
+                                           : { cm: 4, im: -1, pm: 0, max: 4 };
+                            updateQuestion(currentQ.id, { type: val, marks: newMarks }, 'Updated Type');
+                          }
+                        }}
+                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white text-xs focus:ring-1 focus:ring-indigo-500"
+                      >
+                        <option value="mcq">MCQ (Single)</option>
+                        <option value="msq">MSQ (Multi)</option>
+                        <option value="nat">NAT (Numeric)</option>
+                        <option value="msm">Matrix Match</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-400 font-semibold mb-1">Answer Key</label>
+                      <input
+                        type="text"
+                        value={newQProps.answerOptions}
+                        onChange={(e) => setNewQProps(p => ({ ...p, answerOptions: e.target.value }))}
+                        onBlur={() => {
+                          if (currentQ && currentQ.answerOptions !== newQProps.answerOptions) {
+                            updateQuestion(currentQ.id, { answerOptions: newQProps.answerOptions }, 'Updated Answer');
+                          }
+                        }}
+                        placeholder="e.g. 2 or 1,3"
+                        className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white text-xs font-mono focus:ring-1 focus:ring-indigo-500"
+                      />
+                    </div>
+                  </div>
                 </div>
 
-                <div
-                  className={`rounded border p-2 flex items-center justify-center max-h-56 overflow-auto transition-colors ${
-                    previewDarkMode
-                      ? 'bg-slate-950 border-slate-800'
-                      : 'bg-white border-slate-200'
-                  }`}
-                >
-                  {isMultiRegion && previewUrlStitched ? (
-                    <img
-                      src={previewUrlStitched}
-                      alt="Stitched Preview"
-                      className={`max-w-full h-auto object-contain ${
-                        previewDarkMode ? 'invert hue-rotate-180' : ''
-                      }`}
-                    />
-                  ) : previewUrlA ? (
-                    <img
-                      src={previewUrlA}
-                      alt="Preview A"
-                      className={`max-w-full h-auto object-contain ${
-                        previewDarkMode ? 'invert hue-rotate-180' : ''
-                      }`}
-                    />
-                  ) : (
-                    <span className="text-xs text-slate-400">Loading crop preview...</span>
+                <div className="h-px bg-slate-800 w-full" />
+
+                {/* Tool: Crop Mode Strategy */}
+                <div className="space-y-3">
+                  <div className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>Crop Target Strategy</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-[11px]">
+                    {[
+                      { id: 'replace_part', label: 'Replace Main Q' },
+                      { id: 'add_part', label: 'Add Image Part' },
+                      { id: 'stitch', label: 'Stitch Split Q' },
+                      { id: 'new_question', label: 'Insert New Q' }
+                    ].map((m) => (
+                      <button
+                        key={m.id}
+                        onClick={() => {
+                          setTargetMode(m.id as any);
+                          if (m.id === 'stitch') setIsMultiRegion(true);
+                          else setIsMultiRegion(false);
+                        }}
+                        className={`py-1.5 px-2 rounded-md font-medium border text-center transition-colors ${
+                          targetMode === m.id
+                            ? 'bg-cyan-900/30 border-cyan-500 text-cyan-100 shadow-sm shadow-cyan-900/50'
+                            : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {targetMode === 'new_question' && (
+                    <div className="grid grid-cols-2 gap-3 pt-2">
+                      <div>
+                        <label className="block text-[10px] text-slate-400 font-semibold mb-1">New Q Number</label>
+                        <input
+                          type="number"
+                          value={newQProps.que}
+                          onChange={(e) => setNewQProps(p => ({ ...p, que: parseInt(e.target.value, 10) || 1 }))}
+                          className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white font-mono text-xs focus:ring-1 focus:ring-indigo-500"
+                        />
+                      </div>
+                    </div>
+                  )}
+                  
+                  {isMultiRegion && (
+                    <div className="bg-purple-950/20 border border-purple-900/40 rounded-lg p-2.5 mt-2">
+                      <div className="flex items-center gap-2 text-[11px] text-purple-200 font-medium">
+                        <Split className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                        <span>Stitch Mode Active. Select Region B in main view.</span>
+                      </div>
+                    </div>
                   )}
                 </div>
+
+                <div className="h-px bg-slate-800 w-full" />
+
+                {/* Tool: Visual Adjustments (Filters & Nudge) */}
+                <div className="space-y-3">
+                  <div className="text-xs font-semibold text-slate-300 flex items-center justify-between">
+                    <div className="flex items-center gap-1.5">
+                      <Sliders className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Visual Enhancements & Nudge</span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-[11px] text-slate-300">
+                    <label className="flex items-center gap-2 cursor-pointer hover:text-white">
+                      <input
+                        type="checkbox"
+                        checked={autoWhiten}
+                        onChange={(e) => setAutoWhiten(e.target.checked)}
+                        className="rounded text-amber-600 bg-slate-900 border-slate-700"
+                      />
+                      <span>Clean Whiten</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer hover:text-white">
+                      <input
+                        type="checkbox"
+                        checked={sharpenText}
+                        onChange={(e) => setSharpenText(e.target.checked)}
+                        className="rounded text-amber-600 bg-slate-900 border-slate-700"
+                      />
+                      <span>Sharpen Text</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer hover:text-white">
+                      <input
+                        type="checkbox"
+                        checked={previewDarkMode}
+                        onChange={(e) => setPreviewDarkMode(e.target.checked)}
+                        className="rounded text-amber-600 bg-slate-900 border-slate-700"
+                      />
+                      <span>Preview Dark Mode</span>
+                    </label>
+                  </div>
+
+                  {/* Nudge controls as a compact pill */}
+                  <div className="bg-slate-950 rounded-lg border border-slate-800 p-2 flex items-center justify-between mt-2">
+                     <span className="text-[10px] text-slate-400 font-semibold px-1">Fine-tune Bounds:</span>
+                     <div className="flex items-center gap-1">
+                       <button onClick={() => nudge('up')} className="p-1 hover:bg-slate-800 rounded text-slate-300"><ArrowUp className="w-3.5 h-3.5" /></button>
+                       <button onClick={() => nudge('down')} className="p-1 hover:bg-slate-800 rounded text-slate-300"><ArrowDown className="w-3.5 h-3.5" /></button>
+                       <button onClick={() => nudge('left')} className="p-1 hover:bg-slate-800 rounded text-slate-300"><ArrowLeft className="w-3.5 h-3.5" /></button>
+                       <button onClick={() => nudge('right')} className="p-1 hover:bg-slate-800 rounded text-slate-300"><ArrowRight className="w-3.5 h-3.5" /></button>
+                       <div className="w-px h-4 bg-slate-700 mx-1" />
+                       <button onClick={() => expandPadding(0.005)} className="px-2 py-0.5 bg-indigo-900/50 hover:bg-indigo-900 text-indigo-300 rounded text-[10px] font-bold">+ Pad</button>
+                     </div>
+                  </div>
+                </div>
+
+                <div className="h-px bg-slate-800 w-full" />
+
+                {/* Live Preview Block */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
+                    <span className="flex items-center gap-1.5">
+                      <Eye className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Live Crop Result</span>
+                    </span>
+                  </div>
+
+                  <div className={`rounded-lg border flex items-center justify-center min-h-[140px] max-h-56 overflow-auto transition-colors p-2 ${
+                    previewDarkMode ? 'bg-slate-950 border-slate-800' : 'bg-white border-slate-200 shadow-inner'
+                  }`}>
+                    {isMultiRegion && previewUrlStitched ? (
+                      <img src={previewUrlStitched} alt="Stitched Preview" className={`max-w-full h-auto object-contain ${previewDarkMode ? 'invert hue-rotate-180' : ''}`} />
+                    ) : previewUrlA ? (
+                      <img src={previewUrlA} alt="Preview A" className={`max-w-full h-auto object-contain ${previewDarkMode ? 'invert hue-rotate-180' : ''}`} />
+                    ) : (
+                      <span className="text-[11px] text-slate-400 italic">Adjust bounds to generate preview...</span>
+                    )}
+                  </div>
+                </div>
+
               </div>
 
-              {/* Action Buttons */}
-              <div className="pt-2 border-t border-slate-800 flex items-center gap-2">
+              {/* Action Buttons: Stick to Bottom */}
+              <div className="bg-slate-950 p-4 border-t border-slate-800 shrink-0 flex flex-col gap-2.5">
                 <button
-                  onClick={closePdfRecrop}
-                  className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition-colors"
+                  onClick={() => handleSaveCrop(true)}
+                  disabled={activeQIndex >= allQuestionsList.length - 1}
+                  className="w-full flex items-center justify-center gap-2 py-3 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-40 text-white rounded-lg text-sm font-bold shadow-lg shadow-emerald-600/20 transition-all cursor-pointer"
                 >
-                  Cancel
+                  <ArrowRightCircle className="w-4.5 h-4.5" />
+                  <span>Save Crop & Next Q</span>
                 </button>
-                <button
-                  onClick={handleSaveCrop}
-                  className="flex-1 flex items-center justify-center gap-1.5 py-2 bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white rounded-lg text-xs font-bold shadow-lg shadow-indigo-600/30 transition-all cursor-pointer"
-                >
-                  <Check className="w-4 h-4" />
-                  <span>Apply & Save</span>
-                </button>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={closePdfRecrop}
+                    className="flex-1 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition-colors"
+                  >
+                    Done / Close
+                  </button>
+                  <button
+                    onClick={() => handleSaveCrop(false)}
+                    className="flex-1 flex items-center justify-center gap-1.5 py-2.5 bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white rounded-lg text-xs font-bold shadow-lg shadow-indigo-600/20 transition-all cursor-pointer"
+                  >
+                    <Check className="w-4 h-4" />
+                    <span>Save Crop</span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
