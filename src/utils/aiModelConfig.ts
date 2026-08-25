@@ -13,48 +13,58 @@ export interface GeminiModelInfo {
 }
 
 /**
- * Standard, supported Gemini models listed in descending order of capability & speed:
- * 1. gemini-2.0-flash (Flagship Flash: Next-gen speed, superior multimodal OCR, layout & bounding box precision)
- * 2. gemini-1.5-flash (High Speed Workhorse: Ultra-reliable, fast document parsing with high free-tier headroom)
- * 3. gemini-1.5-pro (Pro Reasoning: Advanced reasoning for complex STEM math formulas and dense multi-column papers)
- * 4. gemini-2.0-flash-lite (Ultra Fast Lite: Low latency lightweight engine with separate quota capacity)
+ * Standard, supported Gemini models listed in descending order of capability:
+ * 1. gemini-3.1-pro-preview (Pro Tier: Advanced reasoning, complex STEM & dense document analysis)
+ * 2. gemini-3.7-flash (Flagship Flash: Next-gen speed, vision accuracy & reasoning balance)
+ * 3. gemini-2.5-flash (High Speed Vision: High-precision document OCR & bounding box default)
+ * 4. gemini-3.1-flash-lite (Ultra Fast Lite: Low latency lightweight engine with separate quota)
+ * 5. gemini-2.5-flash-lite (Lightweight Fallback: Fast secondary lightweight model)
  */
 export const GEMINI_MODELS_DESCENDING: GeminiModelInfo[] = [
   {
-    id: 'gemini-2.0-flash',
-    name: 'Gemini 2.0 Flash',
-    badge: 'Flagship Flash',
-    badgeColor: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
-    description: 'Google’s flagship Flash engine. Ultra-fast multimodal OCR, superior question layout parsing, and robust math equation recognition.',
+    id: 'gemini-3.1-pro-preview',
+    name: 'Gemini 3.1 Pro',
+    badge: 'Pro Reasoning',
+    badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/30',
+    description: 'Most capable model for multi-step reasoning, complex STEM math formulas, and dense multi-column question papers.',
     isFreeTierCompatible: true,
     rank: 1,
   },
   {
-    id: 'gemini-1.5-flash',
-    name: 'Gemini 1.5 Flash',
-    badge: 'High Speed Workhorse',
-    badgeColor: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
-    description: 'Highly reliable, fast multimodal workhorse model with high throughput and high free-tier rate headroom.',
+    id: 'gemini-3.7-flash',
+    name: 'Gemini 3.7 Flash',
+    badge: 'Flagship Flash',
+    badgeColor: 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30',
+    description: 'Next-gen flagship Flash model combining superior multimodal vision precision, fast response, and balanced reasoning.',
     isFreeTierCompatible: true,
     rank: 2,
   },
   {
-    id: 'gemini-1.5-pro',
-    name: 'Gemini 1.5 Pro',
-    badge: 'Pro STEM Reasoning',
-    badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/30',
-    description: 'Advanced reasoning engine for complex STEM formulas, dense multi-column question papers, and intricate table structures.',
+    id: 'gemini-2.5-flash',
+    name: 'Gemini 2.5 Flash',
+    badge: 'High Speed Vision',
+    badgeColor: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
+    description: 'High-speed multimodal vision engine with excellent document OCR and question bounding box accuracy.',
     isFreeTierCompatible: true,
     rank: 3,
   },
   {
-    id: 'gemini-2.0-flash-lite',
-    name: 'Gemini 2.0 Flash Lite',
+    id: 'gemini-3.1-flash-lite',
+    name: 'Gemini 3.1 Flash Lite',
     badge: 'Ultra Fast Lite',
     badgeColor: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
-    description: 'Lightweight high-throughput engine with separate quota capacity for low-latency batch processing.',
+    description: 'Low-latency lightweight Flash Lite engine with separate RPM/RPD capacity headroom.',
     isFreeTierCompatible: true,
     rank: 4,
+  },
+  {
+    id: 'gemini-2.5-flash-lite',
+    name: 'Gemini 2.5 Flash Lite',
+    badge: 'Lightweight Fallback',
+    badgeColor: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+    description: 'Fast lightweight fallback model for basic document structure extraction during peak traffic.',
+    isFreeTierCompatible: true,
+    rank: 5,
   },
 ];
 
@@ -63,8 +73,8 @@ export const SUPPORTED_GEMINI_MODELS = GEMINI_MODELS_DESCENDING.map((m) => m.id)
 export type SupportedGeminiModel = string;
 
 export function getStoredSelectedModel(): string {
-  if (typeof window === 'undefined') return 'gemini-2.0-flash';
-  return localStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || 'gemini-2.0-flash';
+  if (typeof window === 'undefined') return 'gemini-2.5-flash';
+  return localStorage.getItem(SELECTED_MODEL_STORAGE_KEY) || 'gemini-2.5-flash';
 }
 
 export function setStoredSelectedModel(modelId: string): void {
