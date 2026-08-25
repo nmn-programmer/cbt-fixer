@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import { Settings,
   AlertTriangle,
+  Activity,
   BookOpen,
   CheckCircle2,
   ChevronDown,
@@ -422,6 +423,17 @@ export const Header: React.FC = () => {
             </button>
           )}
 
+          {/* AI Multi-Key Fleet & Activity Monitor */}
+          <button
+            id="header-ai-monitor-btn"
+            onClick={() => window.dispatchEvent(new CustomEvent('open-ai-monitor'))}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-purple-300 hover:text-purple-200 bg-purple-950/40 hover:bg-purple-900/50 border border-purple-800/50 rounded-md transition-colors min-h-[32px]"
+            title="AI Multi-Key Fleet & Activity Monitor"
+          >
+            <Activity className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
+            <span className="hidden xl:inline">AI Monitor</span>
+          </button>
+
           {/* Settings Button */}
           <button
             id="header-settings-btn"
@@ -504,14 +516,6 @@ export const Header: React.FC = () => {
               </div>
             );
           })}
-
-          <button
-            onClick={() => setActiveArchive(null)}
-            className="p-1 text-slate-400 hover:text-indigo-300 hover:bg-slate-800 rounded transition-colors mb-1 ml-1"
-            title="Open Homepage"
-          >
-            <Plus className="w-3.5 h-3.5" />
-          </button>
         </div>
 
         {/* Quick Close All Action */}

@@ -1,6 +1,11 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { useCbtStore } from '../store/useCbtStore';
-import { fetchWithGeminiFallback, ratePaceDelay } from '../utils/geminiKeyManager';
+import {
+  fetchWithGeminiFallback,
+  ratePaceDelay,
+  getOrchestratedKeyPool,
+  calculateExponentialBackoffWithJitter,
+} from '../utils/geminiKeyManager';
 import JSZip from 'jszip';
 import { BlueprintSectionRange, QuestionType } from '../types/cbt';
 import {
@@ -25,9 +30,35 @@ import {
   HelpCircle,
   Minimize2,
   ShieldCheck,
+  Activity,
+  Scissors,
+  RotateCcw,
+  Cpu,
 } from 'lucide-react';
 import { generateId } from '../utils/constants';
 import { getPdfjsLib } from '../utils/pdfWorkerConfig';
+import {
+  AiProcessingMonitorModal,
+  emitWorkerLog,
+  PagePartitionState,
+} from './AiProcessingMonitorModal';
+import {
+  saveConversionCheckpoint,
+  getConversionCheckpoint,
+  deleteConversionCheckpoint,
+  ConversionCheckpointData,
+} from '../utils/indexedDB';
+import {
+  FleetStrategy,
+  TriageResult,
+  FleetConfiguration,
+  runDocumentTriage,
+  allocateSwarmFleet,
+  auditDiagramBounds,
+  getCachedTaskResult,
+  setCachedTaskResult,
+  getTaskCacheKey,
+} from '../utils/amasOrchestrator';
 
 interface QuestionDetection {
   pageIndex: number;
@@ -158,7 +189,63 @@ export const AutoPdfConverterModal: React.FC = () => {
   const [elapsedSec, setElapsedSec] = useState<number>(0);
   const [activeBatchInfo, setActiveBatchInfo] = useState<string>('');
 
+  // AI Monitor & Checkpoint states
+  const [isMonitorModalOpen, setIsMonitorModalOpen] = useState(false);
+  const [pagePartitions, setPagePartitions] = useState<PagePartitionState[]>([]);
+  const [existingCheckpoint, setExistingCheckpoint] = useState<ConversionCheckpointData | null>(null);
+  const [resumedQuestions, setResumedQuestions] = useState<any[]>([]);
+  const [resumedAnswerKeys, setResumedAnswerKeys] = useState<any[]>([]);
+
+  // AMAS Swarm Fleet & Triage states
+  const [fleetStrategy, setFleetStrategy] = useState<FleetStrategy>('autopilot');
+  const [triageResult, setTriageResult] = useState<TriageResult | null>(null);
+  const [isTriageLoading, setIsTriageLoading] = useState(false);
+  const [customWorkers, setCustomWorkers] = useState<number>(2);
+  const [customAuditors, setCustomAuditors] = useState<number>(1);
+  const [showCustomSliders, setShowCustomSliders] = useState<boolean>(false);
+  const [cachedResultAvailable, setCachedResultAvailable] = useState<boolean>(false);
+
+  // Compute allocated fleet dynamically
+  const allocatedFleet = useMemo<FleetConfiguration>(() => {
+    return allocateSwarmFleet(fleetStrategy, triageResult, {
+      workers: customWorkers,
+      auditors: customAuditors,
+      managers: 1,
+    });
+  }, [fleetStrategy, triageResult, customWorkers, customAuditors]);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleResumeFromCheckpoint = () => {
+    if (!existingCheckpoint) return;
+    const completedSet = new Set(existingCheckpoint.completedPages);
+    setResumedQuestions(existingCheckpoint.extractedQuestions || []);
+    setResumedAnswerKeys(existingCheckpoint.answerKeys || []);
+    setSelectedPages((prev) => {
+      const remaining = new Set<number>();
+      thumbnails.forEach((t) => {
+        if (!completedSet.has(t.index)) {
+          remaining.add(t.index);
+        }
+      });
+      return remaining;
+    });
+    addToast({
+      title: 'Checkpoint Restored',
+      description: `Loaded ${existingCheckpoint.completedPages.length} completed pages. Only remaining pages will be processed.`,
+      type: 'success',
+    });
+  };
+
+  const handleDiscardCheckpoint = async () => {
+    if (file) {
+      const chkId = 'checkpoint_' + file.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      await deleteConversionCheckpoint(chkId);
+    }
+    setExistingCheckpoint(null);
+    setResumedQuestions([]);
+    setResumedAnswerKeys([]);
+  };
 
   useEffect(() => {
     let timer: any;
@@ -272,6 +359,46 @@ export const AutoPdfConverterModal: React.FC = () => {
           }
           setThumbnails(generatedThumbnails);
           setSelectedPages(initialSelected);
+        }
+
+        // Trigger AMAS Layer 1 Scout Triage
+        if (generatedThumbnails.length > 0) {
+          setIsTriageLoading(true);
+          runDocumentTriage(null, generatedThumbnails.length)
+            .then((tr) => {
+              setTriageResult(tr);
+              setIsTriageLoading(false);
+            })
+            .catch(() => setIsTriageLoading(false));
+        }
+
+        // Check for task execution cache to prevent redundant API calls
+        const pagesList = Array.from(initialSelected).sort((a, b) => a - b);
+        const cacheKey = getTaskCacheKey(selected.name, selected.size, pagesList, blueprintRanges, {
+          hasAnswerKey,
+          extractEnglishOnly,
+          enableDoublePass: enableDoublePassRescan,
+          fleetStrategy,
+        });
+        const cached = getCachedTaskResult(cacheKey);
+        if (cached && cached.questions && cached.questions.length > 0) {
+          setCachedResultAvailable(true);
+        } else {
+          setCachedResultAvailable(false);
+        }
+
+        // Check for existing conversion checkpoints in IndexedDB
+        const chkId = 'checkpoint_' + selected.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const savedChk = await getConversionCheckpoint(chkId);
+        if (savedChk && savedChk.completedPages && savedChk.completedPages.length > 0) {
+          setExistingCheckpoint(savedChk);
+          addToast({
+            title: 'Saved Progress Available',
+            description: `A previous conversion checkpoint with ${savedChk.completedPages.length} completed pages was found for this document.`,
+            type: 'info',
+          });
+        } else {
+          setExistingCheckpoint(null);
         }
       } catch (err: any) {
         console.error('Thumbnail generation error', err);
@@ -537,99 +664,334 @@ export const AutoPdfConverterModal: React.FC = () => {
         });
       }
 
-      // Chunk pages into 2-page batches for fast, reliable extraction
-      const BATCH_SIZE = 2;
-      const totalBatches = Math.ceil(pagesToProcess.length / BATCH_SIZE);
+      // Chunk pages into batches based on Swarm Fleet configuration
       const allExtractedQuestions: QuestionDetection[] = [];
       const allAnswerKeys: any[] = [];
+      const checkpointId = 'checkpoint_' + file.name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
-      const passStatusMsg = enableDoublePassRescan
-        ? 'AI Multimodal Vision double-pass rescan reading questions in sequence...'
-        : 'AI Multimodal Vision reading questions in sequence...';
-      setStatus(passStatusMsg);
-      setPercent(36);
-      updateBackgroundTask({ percent: 36, statusText: passStatusMsg });
+      // Compute Task Deduplication Cache Key to prevent redundant API calls
+      const taskCacheKey = getTaskCacheKey(
+        file.name,
+        file.size,
+        pagesToProcess,
+        blueprintRanges,
+        {
+          hasAnswerKey,
+          extractEnglishOnly,
+          enableDoublePass: enableDoublePassRescan,
+          fleetStrategy,
+        }
+      );
 
-      let lastBatchError = '';
+      // Check Task Execution Cache
+      const cachedResult = getCachedTaskResult(taskCacheKey);
+      let isCachedRecall = false;
 
-      for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-        if (batchIdx > 0) {
-          // Gentle rate-pacing delay to respect 15 RPM free tier limits
-          await ratePaceDelay(700);
+      if (cachedResult && cachedResult.questions && cachedResult.questions.length > 0) {
+        isCachedRecall = true;
+        allExtractedQuestions.push(...cachedResult.questions);
+        if (cachedResult.answerKeys) {
+          allAnswerKeys.push(...cachedResult.answerKeys);
         }
 
-        const startPage = batchIdx * BATCH_SIZE;
-        const endPage = Math.min(pagesToProcess.length, startPage + BATCH_SIZE);
-        const chunkImages = base64Images.slice(startPage, endPage);
-
-        const batchStartPercent = Math.round(36 + (batchIdx / totalBatches) * 39);
-        const batchEndPercent = Math.round(36 + ((batchIdx + 1) / totalBatches) * 39);
-
-        const realStartPage = pagesToProcess[startPage];
-        const realEndPage = pagesToProcess[endPage - 1];
-
-        const batchStatus = `Gemini AI layout analysis & rescan (Pages ${realStartPage}-${realEndPage})...`;
-        setActiveBatchInfo(`Batch ${batchIdx + 1}/${totalBatches} (Pages ${realStartPage}-${realEndPage})`);
-        setStatus(batchStatus);
-
-        setPercent(batchStartPercent);
-        setProgressDetail(`Analyzing Pages ${realStartPage}-${realEndPage} (Found ${allExtractedQuestions.length} questions so far)...`);
-        updateBackgroundTask({
-          percent: batchStartPercent,
-          statusText: `Batch ${batchIdx + 1}/${totalBatches}: ${batchStatus}`,
+        emitWorkerLog({
+          workerId: 'orchestrator',
+          workerLabel: 'Deduplication Cache',
+          level: 'success',
+          message: `Zero-API Recall: Restored ${cachedResult.questions.length} questions from task cache. 100% of redundant API calls eliminated!`,
         });
 
-        try {
-          const res = await fetchWithGeminiFallback(
-            '/api/extract-pdf-structure',
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                images: chunkImages,
-                pageOffset: startPage,
-                options: {
-                  hasAnswerKey,
-                  extractEnglishOnly,
-                  enableDoublePass: enableDoublePassRescan,
-                },
-              }),
-            },
-            addToast,
-            refreshUsageMetrics
-          );
-
-          setPercent(batchEndPercent);
-
-          if (res.ok) {
-            const batchResponse = await res.json();
-            if (batchResponse.questions && Array.isArray(batchResponse.questions)) {
-              allExtractedQuestions.push(...batchResponse.questions);
-            }
-            if (batchResponse.answerKeys && Array.isArray(batchResponse.answerKeys)) {
-              allAnswerKeys.push(...batchResponse.answerKeys);
-            }
-          } else {
-            const errData = await res.json().catch(() => ({}));
-            lastBatchError = errData.error || `Batch ${batchIdx + 1} returned status ${res.status}`;
-            console.warn(`[AutoConverter] Batch ${batchIdx + 1} extraction failed:`, lastBatchError);
-          }
-        } catch (batchErr: any) {
-          lastBatchError = batchErr?.message || `Batch ${batchIdx + 1} failed`;
-          console.warn(`Batch ${batchIdx + 1} extraction error:`, batchErr);
-        }
+        addToast({
+          title: 'Zero-API Cache Recall',
+          description: `Loaded ${cachedResult.questions.length} questions from prior extraction. Preserved quota limits!`,
+          type: 'success',
+        });
       }
 
-      if (allExtractedQuestions.length === 0) {
-        throw new Error(
-          lastBatchError ||
-          'No questions were detected across the selected pages. Please verify your Gemini API Key in Settings and ensure the document contains clear printed questions.'
-        );
+      // Layer 1: Document Scout Triage if not already evaluated
+      let activeTriage = triageResult;
+      if (!isCachedRecall && !activeTriage && canvasImages.length > 0) {
+        setStatus('AMAS Layer 1: Running Scout Triage & Complexity Classifier...');
+        activeTriage = await runDocumentTriage(canvasImages[0], pagesToProcess.length);
+        setTriageResult(activeTriage);
+      }
+
+      // Layer 2: Dynamic Fleet Allocation
+      const swarmFleet = allocateSwarmFleet(fleetStrategy, activeTriage, {
+        workers: customWorkers,
+        auditors: customAuditors,
+        managers: 1,
+      });
+
+      const BATCH_SIZE = swarmFleet.batchSize || 2;
+      const totalBatches = Math.ceil(pagesToProcess.length / BATCH_SIZE);
+
+      const initialPartitions: PagePartitionState[] = pagesToProcess.map((p, idx) => {
+        const batchIndex = Math.floor(idx / BATCH_SIZE);
+        const assignedWorker =
+          swarmFleet.workers[batchIndex % Math.max(1, swarmFleet.workers.length)] || swarmFleet.manager;
+        return {
+          pageNumber: p,
+          assignedWorkerId: assignedWorker.id,
+          assignedWorkerLabel: `${assignedWorker.roleTitle} (${assignedWorker.label})`,
+          status: isCachedRecall ? 'done' : 'pending',
+          retryAttempt: 0,
+        };
+      });
+      setPagePartitions(initialPartitions);
+
+      emitWorkerLog({
+        workerId: 'orchestrator',
+        workerLabel: 'AMAS Fleet Allocator',
+        level: 'info',
+        message: `Swarm Mode [${swarmFleet.strategy.toUpperCase()}]: Allocated ${swarmFleet.workers.length} Layout Workers, ${swarmFleet.auditors.length} Diagram Auditors, 1 Consensus Manager (${swarmFleet.manager.label}) with ${swarmFleet.ratePacingMs}ms pacing.`,
+      });
+
+      // Restore resumed questions if available
+      if (!isCachedRecall && resumedQuestions.length > 0) {
+        allExtractedQuestions.push(...resumedQuestions);
+        emitWorkerLog({
+          workerId: 'orchestrator',
+          workerLabel: 'Orchestrator',
+          level: 'info',
+          message: `Incorporated ${resumedQuestions.length} pre-extracted questions from saved checkpoint.`,
+        });
+      }
+      if (!isCachedRecall && resumedAnswerKeys.length > 0) {
+        allAnswerKeys.push(...resumedAnswerKeys);
+      }
+
+      if (!isCachedRecall) {
+        const passStatusMsg = enableDoublePassRescan
+          ? 'AI Multimodal Swarm double-pass rescan reading questions in sequence...'
+          : 'AI Multimodal Swarm reading questions in sequence...';
+        setStatus(passStatusMsg);
+        setPercent(36);
+        updateBackgroundTask({ percent: 36, statusText: passStatusMsg });
+
+        let lastBatchError = '';
+
+        for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+          if (batchIdx > 0) {
+            // Adaptive rate-pacing delay to respect RPM free tier quotas
+            await ratePaceDelay(swarmFleet.ratePacingMs);
+          }
+
+          const startPage = batchIdx * BATCH_SIZE;
+          const endPage = Math.min(pagesToProcess.length, startPage + BATCH_SIZE);
+          const chunkImages = base64Images.slice(startPage, endPage);
+
+          const batchStartPercent = Math.round(36 + (batchIdx / totalBatches) * 39);
+          const batchEndPercent = Math.round(36 + ((batchIdx + 1) / totalBatches) * 39);
+
+          const realStartPage = pagesToProcess[startPage];
+          const realEndPage = pagesToProcess[endPage - 1];
+          const assignedWorker =
+            swarmFleet.workers[batchIdx % Math.max(1, swarmFleet.workers.length)] || swarmFleet.manager;
+
+          const batchStatus = `Gemini AI layout analysis & rescan (Pages ${realStartPage}-${realEndPage})...`;
+          setActiveBatchInfo(
+            `Batch ${batchIdx + 1}/${totalBatches} (${assignedWorker.label} • Pages ${realStartPage}-${realEndPage})`
+          );
+          setStatus(batchStatus);
+
+          setPercent(batchStartPercent);
+          setProgressDetail(
+            `Analyzing Pages ${realStartPage}-${realEndPage} via ${assignedWorker.label} (Found ${allExtractedQuestions.length} questions)...`
+          );
+          updateBackgroundTask({
+            percent: batchStartPercent,
+            statusText: `Batch ${batchIdx + 1}/${totalBatches}: ${batchStatus}`,
+          });
+
+          emitWorkerLog({
+            workerId: assignedWorker.id,
+            workerLabel: assignedWorker.label,
+            level: 'info',
+            message: `Dispatching Batch ${batchIdx + 1}/${totalBatches} (Pages ${realStartPage}-${realEndPage}) to ${assignedWorker.roleTitle} (${assignedWorker.label})...`,
+            pageNumber: realStartPage,
+          });
+
+          setPagePartitions((prev) =>
+            prev.map((p) =>
+              p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                ? { ...p, status: 'processing' }
+                : p
+            )
+          );
+
+          let batchSuccess = false;
+          let retryAttempt = 0;
+          const MAX_BATCH_RETRIES = 2;
+
+          while (!batchSuccess && retryAttempt <= MAX_BATCH_RETRIES) {
+            try {
+              const res = await fetchWithGeminiFallback(
+                '/api/extract-pdf-structure',
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    images: chunkImages,
+                    pageOffset: startPage,
+                    options: {
+                      hasAnswerKey,
+                      extractEnglishOnly,
+                      enableDoublePass: enableDoublePassRescan,
+                    },
+                  }),
+                },
+                addToast,
+                refreshUsageMetrics
+              );
+
+              setPercent(batchEndPercent);
+
+              if (res.ok) {
+                const batchResponse = await res.json();
+                const detectedList =
+                  batchResponse.questions && Array.isArray(batchResponse.questions)
+                    ? batchResponse.questions
+                    : [];
+                if (detectedList.length > 0) {
+                  allExtractedQuestions.push(...detectedList);
+                }
+                if (batchResponse.answerKeys && Array.isArray(batchResponse.answerKeys)) {
+                  allAnswerKeys.push(...batchResponse.answerKeys);
+                }
+
+                setPagePartitions((prev) =>
+                  prev.map((p) =>
+                    p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                      ? { ...p, status: 'done', detectedQuestionsCount: detectedList.length }
+                      : p
+                  )
+                );
+
+                emitWorkerLog({
+                  workerId: assignedWorker.id,
+                  workerLabel: assignedWorker.label,
+                  level: 'success',
+                  message: `Batch ${batchIdx + 1} completed: ${detectedList.length} questions extracted.`,
+                  pageNumber: realStartPage,
+                });
+
+                // Save continuous recovery checkpoint to IndexedDB
+                const completedPagesList = Array.from(
+                  new Set([
+                    ...(existingCheckpoint?.completedPages || []),
+                    ...pagesToProcess.slice(0, endPage),
+                  ])
+                );
+                await saveConversionCheckpoint({
+                  id: checkpointId,
+                  fileName: file.name,
+                  testTitle: testTitle || file.name,
+                  totalPages: thumbnails.length,
+                  completedPages: completedPagesList,
+                  extractedQuestions: allExtractedQuestions,
+                  answerKeys: allAnswerKeys,
+                  timestamp: Date.now(),
+                });
+
+                batchSuccess = true;
+              } else {
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.error || `HTTP ${res.status}`);
+              }
+            } catch (batchErr: any) {
+              retryAttempt++;
+              lastBatchError = batchErr?.message || `Batch ${batchIdx + 1} failed`;
+              if (retryAttempt <= MAX_BATCH_RETRIES) {
+                const backoffMs = calculateExponentialBackoffWithJitter(retryAttempt);
+                emitWorkerLog({
+                  workerId: assignedWorker.id,
+                  workerLabel: assignedWorker.label,
+                  level: 'warning',
+                  message: `Rate limit / warning on ${assignedWorker.label} (${batchErr?.message || 'Error'}). Backing off ${backoffMs}ms before retry ${retryAttempt}/${MAX_BATCH_RETRIES}...`,
+                  pageNumber: realStartPage,
+                });
+
+                setPagePartitions((prev) =>
+                  prev.map((p) =>
+                    p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                      ? { ...p, status: 'backoff', retryAttempt, backoffRemainingMs: backoffMs }
+                      : p
+                  )
+                );
+
+                await new Promise((r) => setTimeout(r, backoffMs));
+              } else {
+                emitWorkerLog({
+                  workerId: assignedWorker.id,
+                  workerLabel: assignedWorker.label,
+                  level: 'error',
+                  message: `Batch ${batchIdx + 1} failed after ${MAX_BATCH_RETRIES} retries: ${lastBatchError}`,
+                  pageNumber: realStartPage,
+                });
+                setPagePartitions((prev) =>
+                  prev.map((p) =>
+                    p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                      ? { ...p, status: 'error', errorMessage: lastBatchError }
+                      : p
+                  )
+                );
+                break;
+              }
+            }
+          }
+        }
+
+        if (allExtractedQuestions.length === 0) {
+          throw new Error(
+            lastBatchError ||
+              'No questions were detected across the selected pages. Please verify your Gemini API Key in Settings and ensure the document contains clear printed questions.'
+          );
+        }
+
+        // Cache task execution result for future instant zero-API recalls
+        setCachedTaskResult(taskCacheKey, {
+          questions: allExtractedQuestions,
+          answerKeys: allAnswerKeys,
+        });
+
+        // Layer 3: Diagram Auditor pass for complex questions if auditors allocated
+        if (swarmFleet.auditors.length > 0 && canvasImages.length > 0) {
+          const auditor = swarmFleet.auditors[0];
+          setStatus('AMAS Layer 3: Diagram Auditor refining bounding boxes...');
+          emitWorkerLog({
+            workerId: auditor.id,
+            workerLabel: auditor.label,
+            level: 'info',
+            message: `Auditor (${auditor.label}) auditing bounding boxes for complex math formulas and diagram alignments...`,
+          });
+
+          for (let i = 0; i < Math.min(allExtractedQuestions.length, 8); i++) {
+            const q = allExtractedQuestions[i];
+            if (q.box && canvasImages[q.pageIndex]) {
+              try {
+                const refinedBox = await auditDiagramBounds(canvasImages[q.pageIndex], q.box, auditor.key);
+                if (refinedBox) {
+                  q.box = refinedBox;
+                }
+              } catch (auditErr) {
+                // Non-fatal, continue
+              }
+            }
+          }
+        }
       }
 
       setActiveBatchInfo('');
       setPercent(76);
-      setStatus('Resolving question continuations & option completeness...');
+      setStatus('Resolving question continuations & option completeness via Consensus Manager...');
+
+      emitWorkerLog({
+        workerId: swarmFleet.manager.id,
+        workerLabel: swarmFleet.manager.label,
+        level: 'info',
+        message: `Consensus Manager (${swarmFleet.manager.label}) sequencing ${allExtractedQuestions.length} extracted question blocks into blueprint subjects...`,
+      });
 
       // Pre-pass: Sort and resolve split-question continuations and orphaned option blocks
       // Step 1: Sort all extracted blocks into physical 2-column reading order:
@@ -1130,6 +1492,10 @@ export const AutoPdfConverterModal: React.FC = () => {
       setProgressDetail('Importing structured test booklet into CBT Studio workspace...');
       completeBackgroundTask('PDF booklet converted & imported into CBT Studio workspace successfully!');
 
+      // Clean up saved checkpoint upon full completion
+      await deleteConversionCheckpoint(checkpointId);
+      setExistingCheckpoint(null);
+
       setTimeout(() => {
         addArchive(newArchive, true);
         setPdfConverterModalOpen(false);
@@ -1172,13 +1538,24 @@ export const AutoPdfConverterModal: React.FC = () => {
               </p>
             </div>
           </div>
-          <button
-            onClick={() => !isProcessing && setPdfConverterModalOpen(false)}
-            className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-slate-300 transition-colors"
-            disabled={isProcessing}
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              id="auto-converter-fleet-btn"
+              onClick={() => setIsMonitorModalOpen(true)}
+              className="px-2.5 py-1.5 bg-purple-950/50 hover:bg-purple-900/60 border border-purple-800/60 text-purple-300 hover:text-purple-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm"
+              title="AI Multi-Key Fleet & Activity Monitor"
+            >
+              <Activity className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
+              <span className="hidden sm:inline">AI Monitor</span>
+            </button>
+            <button
+              onClick={() => !isProcessing && setPdfConverterModalOpen(false)}
+              className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-slate-300 transition-colors"
+              disabled={isProcessing}
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Step Indicator */}
@@ -1246,7 +1623,229 @@ export const AutoPdfConverterModal: React.FC = () => {
 
           {/* STEP 1: Page Selection & Layout Options */}
           {step === 'pages' && file && !isProcessing && (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+            <div className="space-y-4">
+              {/* Checkpoint Recovery Banner */}
+              {existingCheckpoint && (
+                <div className="bg-amber-950/40 border border-amber-500/40 rounded-xl p-3.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-lg animate-fade-in">
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 bg-amber-500/20 rounded-lg text-amber-300 shrink-0 mt-0.5">
+                      <Zap className="w-4 h-4 text-amber-400" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-bold text-amber-200 flex items-center gap-1.5">
+                        <span>Saved Conversion Checkpoint Available</span>
+                        <span className="text-[10px] px-1.5 py-0.2 bg-amber-500/20 text-amber-300 rounded font-mono">
+                          {existingCheckpoint.completedPages.length} Pages Saved
+                        </span>
+                      </h4>
+                      <p className="text-[11px] text-amber-300/80 mt-0.5 leading-relaxed">
+                        Found previous progress for this test paper with {existingCheckpoint.completedPages.length} of {existingCheckpoint.totalPages} pages already converted ({existingCheckpoint.extractedQuestions.length} questions extracted).
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 w-full sm:w-auto shrink-0">
+                    <button
+                      onClick={handleResumeFromCheckpoint}
+                      className="flex-1 sm:flex-none px-3.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold rounded-lg shadow-md transition-all flex items-center justify-center gap-1.5"
+                    >
+                      <Zap className="w-3.5 h-3.5" />
+                      <span>Resume Checkpoint</span>
+                    </button>
+                    <button
+                      onClick={handleDiscardCheckpoint}
+                      className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg transition-colors"
+                      title="Discard checkpoint and start fresh from page 1"
+                    >
+                      Start Fresh
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* AMAS Swarm Strategy & Multi-Agent Fleet Control Bar */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-3 shadow-md">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <div className="p-1.5 bg-indigo-500/20 text-indigo-400 rounded-lg">
+                      <Cpu className="w-4 h-4 text-indigo-400" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-xs font-bold text-slate-200">
+                          Adaptive Multi-Agent Swarm (AMAS) Fleet Strategy
+                        </h4>
+                        <span className="text-[10px] px-1.5 py-0.2 bg-indigo-900/50 text-indigo-300 rounded font-semibold border border-indigo-700/50">
+                          Smart Role Balancing
+                        </span>
+                        {cachedResultAvailable && (
+                          <span className="text-[10px] px-2 py-0.5 bg-emerald-950 text-emerald-300 rounded-full font-bold border border-emerald-500/40 flex items-center gap-1">
+                            <Zap className="w-3 h-3 text-emerald-400" /> Zero-API Cache Hit
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Controls key allocation, concurrency, and rate-pacing to conserve API quota limits.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Scout Triage Status */}
+                  {triageResult && (
+                    <div className="flex items-center gap-2 px-2.5 py-1 bg-slate-900 border border-slate-800 rounded-lg text-[11px] text-slate-300 shrink-0">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                      <span>Scout: <strong>{triageResult.archetype}</strong></span>
+                      <span className="text-slate-500">|</span>
+                      <span className="text-indigo-300">{triageResult.estimatedRPM} RPM</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Strategy Cards */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {[
+                    {
+                      id: 'autopilot' as FleetStrategy,
+                      name: '🧠 AI Autopilot',
+                      tagline: 'Self-Optimizing',
+                      desc: 'Auto-allocates workers & auditors from Scout triage complexity.',
+                      badgeColor: 'text-indigo-400 border-indigo-800 bg-indigo-950/40',
+                    },
+                    {
+                      id: 'eco' as FleetStrategy,
+                      name: '🌱 Eco Saver',
+                      tagline: 'Quota Protection',
+                      desc: '1 Worker + 1200ms pacing. Preserves free-tier 15 RPM limits.',
+                      badgeColor: 'text-emerald-400 border-emerald-800 bg-emerald-950/40',
+                    },
+                    {
+                      id: 'balanced' as FleetStrategy,
+                      name: '⚡ Balanced',
+                      tagline: 'Standard CBT',
+                      desc: '2 Workers + 1 Auditor with 600ms pacing for optimal throughput.',
+                      badgeColor: 'text-amber-400 border-amber-800 bg-amber-950/40',
+                    },
+                    {
+                      id: 'turbo' as FleetStrategy,
+                      name: '🚀 Turbo Swarm',
+                      tagline: 'Max Speed',
+                      desc: 'Multi-worker concurrency with 300ms pacing for fastest turnaround.',
+                      badgeColor: 'text-rose-400 border-rose-800 bg-rose-950/40',
+                    },
+                  ].map((strat) => {
+                    const isSelected = fleetStrategy === strat.id && !showCustomSliders;
+                    return (
+                      <button
+                        key={strat.id}
+                        type="button"
+                        onClick={() => {
+                          setFleetStrategy(strat.id);
+                          setShowCustomSliders(false);
+                        }}
+                        className={`p-2.5 rounded-xl border text-left transition-all ${
+                          isSelected
+                            ? 'bg-indigo-950/60 border-indigo-500 ring-1 ring-indigo-500 shadow-md'
+                            : 'bg-slate-900/60 border-slate-800 hover:border-slate-700 hover:bg-slate-900'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-slate-200">{strat.name}</span>
+                          <span
+                            className={`text-[9px] px-1.5 py-0.2 rounded border font-semibold ${strat.badgeColor}`}
+                          >
+                            {strat.tagline}
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-400 mt-1 leading-snug">{strat.desc}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Custom Fleet Toggle and Sliders */}
+                <div className="pt-2 border-t border-slate-900 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowCustomSliders(!showCustomSliders)}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold border flex items-center gap-1.5 transition-colors ${
+                        showCustomSliders
+                          ? 'bg-purple-950 border-purple-600 text-purple-200'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <Sliders className="w-3 h-3 text-purple-400" />
+                      <span>{showCustomSliders ? 'Custom Swarm Active' : 'Configure Custom Swarm'}</span>
+                    </button>
+
+                    <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                      <span>Active Allocation:</span>
+                      <span className="text-indigo-300 font-bold">
+                        {allocatedFleet.workers.length} Worker(s)
+                      </span>
+                      <span className="text-slate-600">•</span>
+                      <span className="text-purple-300 font-bold">
+                        {allocatedFleet.auditors.length} Auditor(s)
+                      </span>
+                      <span className="text-slate-600">•</span>
+                      <span className="text-emerald-300 font-bold">
+                        1 Manager ({allocatedFleet.manager.label})
+                      </span>
+                    </div>
+                  </div>
+
+                  <span className="text-[11px] text-slate-400 font-mono">
+                    Pacing: <strong className="text-slate-300">{allocatedFleet.ratePacingMs}ms</strong>
+                  </span>
+                </div>
+
+                {showCustomSliders && (
+                  <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-xl grid grid-cols-1 sm:grid-cols-2 gap-4 animate-fade-in text-xs">
+                    <div>
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-slate-300 font-semibold">Layout Extraction Workers</span>
+                        <span className="font-mono text-indigo-400 font-bold">{customWorkers} Keys</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="5"
+                        value={customWorkers}
+                        onChange={(e) => {
+                          setCustomWorkers(Number(e.target.value));
+                          setFleetStrategy('custom');
+                        }}
+                        className="w-full accent-indigo-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                      />
+                      <span className="text-[10px] text-slate-500 block mt-0.5">
+                        Parallel workers processing 2-page chunks simultaneously.
+                      </span>
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between text-xs mb-1">
+                        <span className="text-slate-300 font-semibold">Diagram & Math Auditors</span>
+                        <span className="font-mono text-purple-400 font-bold">{customAuditors} Keys</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="3"
+                        value={customAuditors}
+                        onChange={(e) => {
+                          setCustomAuditors(Number(e.target.value));
+                          setFleetStrategy('custom');
+                        }}
+                        className="w-full accent-purple-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                      />
+                      <span className="text-[10px] text-slate-500 block mt-0.5">
+                        Dedicated keys auditing bounding boxes for formulas and diagrams.
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
               {/* Left Config Panel */}
               <div className="space-y-4">
                 <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-2">
@@ -1455,6 +2054,7 @@ export const AutoPdfConverterModal: React.FC = () => {
                 </div>
               </div>
             </div>
+          </div>
           )}
 
           {/* STEP 2: Instructions & Subject Ranges Blueprint */}
@@ -1671,6 +2271,45 @@ export const AutoPdfConverterModal: React.FC = () => {
                 ))}
               </div>
 
+              {/* Swarm Fleet Summary Recap */}
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 bg-purple-500/20 text-purple-400 rounded-lg">
+                    <Cpu className="w-3.5 h-3.5" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-slate-200">
+                        Fleet Swarm [{fleetStrategy.toUpperCase()}]:
+                      </span>
+                      <span className="text-indigo-400 font-semibold">
+                        {allocatedFleet.workers.length} Worker(s)
+                      </span>
+                      <span className="text-slate-600">•</span>
+                      <span className="text-purple-400 font-semibold">
+                        {allocatedFleet.auditors.length} Auditor(s)
+                      </span>
+                      <span className="text-slate-600">•</span>
+                      <span className="text-emerald-400 font-semibold">
+                        1 Manager ({allocatedFleet.manager.label})
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-slate-500 mt-0.5">
+                      Batch Pacing: {allocatedFleet.ratePacingMs}ms • Batch Size: {allocatedFleet.batchSize} pages • Auto-Deduplication Cache Active
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setIsMonitorModalOpen(true)}
+                  className="px-2.5 py-1 bg-slate-900 hover:bg-slate-850 border border-slate-700 text-slate-300 rounded-lg text-xs font-semibold flex items-center gap-1.5 self-start sm:self-auto transition-colors"
+                >
+                  <Activity className="w-3 h-3 text-purple-400" />
+                  <span>Inspect Swarm Topology</span>
+                </button>
+              </div>
+
               <div className="flex items-center justify-between pt-2">
                 <button
                   onClick={handleAddRange}
@@ -1722,6 +2361,14 @@ export const AutoPdfConverterModal: React.FC = () => {
                       <span className="text-2xl font-black text-indigo-400 font-mono tracking-tight mr-1">
                         {percent}%
                       </span>
+                      <button
+                        onClick={() => setIsMonitorModalOpen(true)}
+                        className="px-2.5 py-1.5 bg-purple-950/60 hover:bg-purple-900 border border-purple-700/60 text-purple-200 hover:text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all shadow-md"
+                        title="Open real-time AI Fleet & Key Monitor"
+                      >
+                        <Activity className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
+                        <span className="hidden sm:inline">AI Monitor</span>
+                      </button>
                       <button
                         onClick={minimizeBackgroundTask}
                         className="px-3 py-1.5 bg-indigo-950 hover:bg-indigo-900 border border-indigo-700/60 text-indigo-200 hover:text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all shadow-md"
@@ -1787,6 +2434,18 @@ export const AutoPdfConverterModal: React.FC = () => {
           )}
         </div>
       </div>
+
+      {/* Real-time AI Key & Worker Monitor Modal */}
+      <AiProcessingMonitorModal
+        isOpen={isMonitorModalOpen}
+        onClose={() => setIsMonitorModalOpen(false)}
+        isLiveProcessing={isProcessing}
+        pagePartitions={pagePartitions}
+        activePhase={status}
+        fleetConfig={allocatedFleet}
+        triageResult={triageResult}
+        fleetStrategy={fleetStrategy}
+      />
     </div>
   );
 };

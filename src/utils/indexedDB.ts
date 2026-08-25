@@ -15,6 +15,19 @@ interface CBTStudioDB extends DBSchema {
       lastModified: number;
     };
   };
+  checkpoints: {
+    key: string;
+    value: {
+      id: string;
+      fileName: string;
+      testTitle: string;
+      totalPages: number;
+      completedPages: number[];
+      extractedQuestions: any[];
+      answerKeys: any[];
+      timestamp: number;
+    };
+  };
   settings: {
     key: string;
     value: any;
@@ -22,16 +35,19 @@ interface CBTStudioDB extends DBSchema {
 }
 
 const DB_NAME = 'cbt_question_paper_studio_v1';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 let dbPromise: Promise<IDBPDatabase<CBTStudioDB>> | null = null;
 
 function getDb(): Promise<IDBPDatabase<CBTStudioDB>> {
   if (!dbPromise) {
     dbPromise = openDB<CBTStudioDB>(DB_NAME, DB_VERSION, {
-      upgrade(db) {
+      upgrade(db, oldVersion) {
         if (!db.objectStoreNames.contains('archives')) {
           db.createObjectStore('archives', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('checkpoints')) {
+          db.createObjectStore('checkpoints', { keyPath: 'id' });
         }
         if (!db.objectStoreNames.contains('settings')) {
           db.createObjectStore('settings');
@@ -164,3 +180,53 @@ export async function clearAllArchivesFromDB(): Promise<void> {
     console.warn('Failed to clear archives in IndexedDB:', err);
   }
 }
+
+export interface ConversionCheckpointData {
+  id: string;
+  fileName: string;
+  testTitle: string;
+  totalPages: number;
+  completedPages: number[];
+  extractedQuestions: any[];
+  answerKeys: any[];
+  timestamp: number;
+}
+
+export async function saveConversionCheckpoint(checkpoint: ConversionCheckpointData): Promise<void> {
+  try {
+    const db = await getDb();
+    await db.put('checkpoints', checkpoint);
+  } catch (err) {
+    console.warn('Failed to save conversion checkpoint to IndexedDB:', err);
+  }
+}
+
+export async function getConversionCheckpoint(id: string): Promise<ConversionCheckpointData | undefined> {
+  try {
+    const db = await getDb();
+    return await db.get('checkpoints', id);
+  } catch (err) {
+    console.warn('Failed to get conversion checkpoint from IndexedDB:', err);
+    return undefined;
+  }
+}
+
+export async function getAllConversionCheckpoints(): Promise<ConversionCheckpointData[]> {
+  try {
+    const db = await getDb();
+    return await db.getAll('checkpoints');
+  } catch (err) {
+    console.warn('Failed to get all conversion checkpoints from IndexedDB:', err);
+    return [];
+  }
+}
+
+export async function deleteConversionCheckpoint(id: string): Promise<void> {
+  try {
+    const db = await getDb();
+    await db.delete('checkpoints', id);
+  } catch (err) {
+    console.warn('Failed to delete conversion checkpoint from IndexedDB:', err);
+  }
+}
+

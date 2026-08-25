@@ -228,6 +228,7 @@ interface CbtStoreState {
   replaceImagePart: (questionId: string, partIndex: number, file: File) => Promise<void>;
   deleteImagePart: (questionId: string, partIndex: number) => void;
   reorderImageParts: (questionId: string, fromIndex: number, toIndex: number) => void;
+  unlinkSplitQuestion: (questionId: string) => void;
 
   // Auto-Fix & Bulk Operations
   runLinter: () => void;
@@ -2199,6 +2200,108 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       }));
 
       commitArchiveUpdate({ ...active, subjects: updatedSubjects }, 'Reorder Image Parts');
+    },
+
+    unlinkSplitQuestion: (questionId: string) => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active) return;
+
+      let splitFound = false;
+      let originalQNumber = 0;
+      let newQNumber = 0;
+      let createdQId = generateId();
+
+      const updatedSubjects = active.subjects.map((sub) => ({
+        ...sub,
+        sections: sub.sections.map((sec) => {
+          const qIdx = sec.questions.findIndex((q) => q.id === questionId);
+          if (qIdx === -1) return sec;
+
+          const targetQ = sec.questions[qIdx];
+          if (targetQ.images.length < 2 && (!targetQ.pdfData || targetQ.pdfData.length < 2)) {
+            state.addToast({
+              title: 'Cannot Unlink',
+              description: 'This question does not have multiple split parts to unlink.',
+              type: 'warning',
+            });
+            return sec;
+          }
+
+          splitFound = true;
+          originalQNumber = targetQ.que;
+          newQNumber = originalQNumber + 1;
+
+          // Part 1 keeps image 0
+          const part1Image = targetQ.images[0]
+            ? { ...targetQ.images[0], partIndex: 1 }
+            : undefined;
+          const part1PdfData = targetQ.pdfData && targetQ.pdfData[0]
+            ? [targetQ.pdfData[0]]
+            : [];
+
+          const updatedPart1: QuestionData = {
+            ...targetQ,
+            isSplitQuestion: false,
+            images: part1Image ? [part1Image] : [],
+            pdfData: part1PdfData,
+          };
+
+          // Part 2 becomes new separate question
+          const remainingImages = targetQ.images.slice(1).map((img, idx) => ({
+            ...img,
+            partIndex: idx + 1,
+            fileName: buildImageFileName(sec.name, newQNumber, idx + 1, 'png'),
+          }));
+          const remainingPdfData = (targetQ.pdfData || []).slice(1).map((pdf, idx) => ({
+            ...pdf,
+            filename: buildImageFileName(sec.name, newQNumber, idx + 1, 'png'),
+          }));
+
+          const part2Question: QuestionData = {
+            id: createdQId,
+            key: String(newQNumber),
+            que: newQNumber,
+            type: targetQ.type,
+            marks: { ...targetQ.marks },
+            answerOptions: '',
+            isSplitQuestion: false,
+            images: remainingImages,
+            pdfData: remainingPdfData,
+          };
+
+          const newQList = [...sec.questions];
+          newQList[qIdx] = updatedPart1;
+          newQList.splice(qIdx + 1, 0, part2Question);
+
+          // Renumber all subsequent questions in this section
+          for (let i = qIdx + 2; i < newQList.length; i++) {
+            const currQue = newQList[i].que + 1;
+            newQList[i] = {
+              ...newQList[i],
+              que: currQue,
+              key: String(currQue),
+            };
+          }
+
+          return {
+            ...sec,
+            questions: newQList,
+          };
+        }),
+      }));
+
+      if (splitFound) {
+        commitArchiveUpdate(
+          { ...active, subjects: updatedSubjects },
+          `Unlink Split Question Q${originalQNumber} -> Q${originalQNumber} & Q${newQNumber}`
+        );
+        state.addToast({
+          title: 'Split Question Unlinked',
+          description: `Successfully separated Q${originalQNumber} into two independent questions: Q${originalQNumber} and Q${newQNumber}.`,
+          type: 'success',
+        });
+      }
     },
 
     runLinter: () => {

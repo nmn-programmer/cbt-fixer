@@ -56,6 +56,7 @@ export const QuestionEditor: React.FC = () => {
     replaceImagePart,
     deleteImagePart,
     reorderImageParts,
+    unlinkSplitQuestion,
     diagnostics,
     fixStandardizeFilenames,
     fixMarkingSchemes,
@@ -256,6 +257,17 @@ export const QuestionEditor: React.FC = () => {
             <Sparkles className="w-3.5 h-3.5 text-purple-400" />
             <span className="hidden md:inline">AI Doctor</span>
           </button>
+
+          {(currentQuestion.images.length > 1 || currentQuestion.isSplitQuestion) && (
+            <button
+              onClick={() => unlinkSplitQuestion(currentQuestion!.id)}
+              className="flex items-center gap-1 px-2.5 py-1 text-xs bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-md border border-amber-500/40 transition-colors font-medium"
+              title="Split this multi-part question into two separate sequential questions"
+            >
+              <Scissors className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden lg:inline">Unlink Split Q</span>
+            </button>
+          )}
 
           <div className="h-4 w-px bg-slate-800 mx-1" />
 
@@ -913,6 +925,17 @@ export const QuestionEditor: React.FC = () => {
                     <Plus className="w-3.5 h-3.5 text-indigo-400" />
                     <span>Crop New Part</span>
                   </button>
+
+                  {currentQuestion.images.length > 1 && (
+                    <button
+                      onClick={() => unlinkSplitQuestion(currentQuestion!.id)}
+                      className="flex items-center gap-1 px-2 py-1 text-xs bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 rounded-md border border-amber-500/40 transition-colors"
+                      title="Unlink and split these parts into separate sequential questions"
+                    >
+                      <Scissors className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Unlink Parts</span>
+                    </button>
+                  )}
 
                   <button
                     onClick={() => fileAddRef.current?.click()}

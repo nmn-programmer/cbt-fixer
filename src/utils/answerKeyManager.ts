@@ -445,10 +445,17 @@ export function classifyAndMatchAnswerKey(
       matchedKeyIndices.add(keyIdx);
       matchedQuestionIds.add(exactMatch.question.id);
 
-      const isTypeChanged = exactMatch.question.type !== item.inferredType;
+      // Blueprint & NAT Preservation Guard:
+      // If the question is in a NAT section or is already a NAT question, preserve NAT type and raw numerical answer
+      const isPaperNat = exactMatch.question.type === 'nat' || exactMatch.section.name.toLowerCase().includes('numerical') || exactMatch.section.name.toLowerCase().includes('nat');
+      const finalProposedType = isPaperNat && item.inferredType === 'mcq' ? 'nat' : item.inferredType;
+      const finalProposedAnswer = isPaperNat ? item.rawAnswer : item.normalizedAnswer;
+      const finalLetterAnswer = isPaperNat ? item.rawAnswer : item.letterAnswer;
+
+      const isTypeChanged = exactMatch.question.type !== finalProposedType;
       const isAnswerChanged =
-        exactMatch.question.answerOptions !== item.normalizedAnswer &&
-        exactMatch.question.answerOptions !== item.letterAnswer;
+        exactMatch.question.answerOptions !== finalProposedAnswer &&
+        exactMatch.question.answerOptions !== finalLetterAnswer;
 
       let status: QuestionMatchResult['status'] = 'already_matches';
       if (isTypeChanged) status = 'type_changed';
@@ -461,10 +468,10 @@ export function classifyAndMatchAnswerKey(
         subjectName: exactMatch.subject.name,
         sectionName: exactMatch.section.name,
         currentType: exactMatch.question.type,
-        proposedType: item.inferredType,
+        proposedType: finalProposedType,
         currentAnswer: exactMatch.question.answerOptions,
-        proposedAnswer: item.normalizedAnswer,
-        proposedLetterAnswer: item.letterAnswer,
+        proposedAnswer: finalProposedAnswer,
+        proposedLetterAnswer: finalLetterAnswer,
         confidence: 'exact',
         matchScore: 100,
         matchReason: `Exact match on Section "${item.sectionName}" and Question #${item.questionNumber}`,
@@ -498,10 +505,15 @@ export function classifyAndMatchAnswerKey(
       matchedKeyIndices.add(keyIdx);
       matchedQuestionIds.add(fuzzyMatch.question.id);
 
-      const isTypeChanged = fuzzyMatch.question.type !== item.inferredType;
+      const isPaperNat = fuzzyMatch.question.type === 'nat' || fuzzyMatch.section.name.toLowerCase().includes('numerical') || fuzzyMatch.section.name.toLowerCase().includes('nat');
+      const finalProposedType = isPaperNat && item.inferredType === 'mcq' ? 'nat' : item.inferredType;
+      const finalProposedAnswer = isPaperNat ? item.rawAnswer : item.normalizedAnswer;
+      const finalLetterAnswer = isPaperNat ? item.rawAnswer : item.letterAnswer;
+
+      const isTypeChanged = fuzzyMatch.question.type !== finalProposedType;
       const isAnswerChanged =
-        fuzzyMatch.question.answerOptions !== item.normalizedAnswer &&
-        fuzzyMatch.question.answerOptions !== item.letterAnswer;
+        fuzzyMatch.question.answerOptions !== finalProposedAnswer &&
+        fuzzyMatch.question.answerOptions !== finalLetterAnswer;
 
       let status: QuestionMatchResult['status'] = 'already_matches';
       if (isTypeChanged) status = 'type_changed';
@@ -514,10 +526,10 @@ export function classifyAndMatchAnswerKey(
         subjectName: fuzzyMatch.subject.name,
         sectionName: fuzzyMatch.section.name,
         currentType: fuzzyMatch.question.type,
-        proposedType: item.inferredType,
+        proposedType: finalProposedType,
         currentAnswer: fuzzyMatch.question.answerOptions,
-        proposedAnswer: item.normalizedAnswer,
-        proposedLetterAnswer: item.letterAnswer,
+        proposedAnswer: finalProposedAnswer,
+        proposedLetterAnswer: finalLetterAnswer,
         confidence: 'section_fuzzy',
         matchScore: 92,
         matchReason: `Fuzzy section match ("${item.sectionName}" ~ "${fuzzyMatch.section.name}") for Q#${item.questionNumber}`,
@@ -540,10 +552,15 @@ export function classifyAndMatchAnswerKey(
       matchedKeyIndices.add(keyIdx);
       matchedQuestionIds.add(qMatch.question.id);
 
-      const isTypeChanged = qMatch.question.type !== item.inferredType;
+      const isPaperNat = qMatch.question.type === 'nat' || qMatch.section.name.toLowerCase().includes('numerical') || qMatch.section.name.toLowerCase().includes('nat');
+      const finalProposedType = isPaperNat && item.inferredType === 'mcq' ? 'nat' : item.inferredType;
+      const finalProposedAnswer = isPaperNat ? item.rawAnswer : item.normalizedAnswer;
+      const finalLetterAnswer = isPaperNat ? item.rawAnswer : item.letterAnswer;
+
+      const isTypeChanged = qMatch.question.type !== finalProposedType;
       const isAnswerChanged =
-        qMatch.question.answerOptions !== item.normalizedAnswer &&
-        qMatch.question.answerOptions !== item.letterAnswer;
+        qMatch.question.answerOptions !== finalProposedAnswer &&
+        qMatch.question.answerOptions !== finalLetterAnswer;
 
       let status: QuestionMatchResult['status'] = 'already_matches';
       if (isTypeChanged) status = 'type_changed';
@@ -556,10 +573,10 @@ export function classifyAndMatchAnswerKey(
         subjectName: qMatch.subject.name,
         sectionName: qMatch.section.name,
         currentType: qMatch.question.type,
-        proposedType: item.inferredType,
+        proposedType: finalProposedType,
         currentAnswer: qMatch.question.answerOptions,
-        proposedAnswer: item.normalizedAnswer,
-        proposedLetterAnswer: item.letterAnswer,
+        proposedAnswer: finalProposedAnswer,
+        proposedLetterAnswer: finalLetterAnswer,
         confidence: 'global_qnum',
         matchScore: 85,
         matchReason: `Global Question #${item.questionNumber} unique index match`,

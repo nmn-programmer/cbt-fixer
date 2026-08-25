@@ -15,6 +15,7 @@ import { AutoPdfConverterModal } from './components/AutoPdfConverterModal';
 import { BlueprintRangeStudioModal } from './components/BlueprintRangeStudioModal';
 import { PdfRecropModal } from './components/PdfRecropModal';
 import { AiQuestionRepairModal } from './components/AiQuestionRepairModal';
+import { AiProcessingMonitorModal } from './components/AiProcessingMonitorModal';
 import { SettingsModal } from './components/SettingsModal';
 import { ToastContainer } from './components/ToastContainer';
 import { FloatingBgTaskWidget } from './components/FloatingBgTaskWidget';
@@ -22,11 +23,19 @@ import { ConfirmDialog } from './components/ConfirmDialog';
 
 export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
+  const [isAiMonitorOpen, setIsAiMonitorOpen] = React.useState(false);
 
   useEffect(() => {
-    const handleOpen = () => setIsSettingsOpen(true);
-    window.addEventListener('open-settings', handleOpen);
-    return () => window.removeEventListener('open-settings', handleOpen);
+    const handleOpenSettings = () => setIsSettingsOpen(true);
+    const handleOpenAiMonitor = () => setIsAiMonitorOpen(true);
+
+    window.addEventListener('open-settings', handleOpenSettings);
+    window.addEventListener('open-ai-monitor', handleOpenAiMonitor);
+
+    return () => {
+      window.removeEventListener('open-settings', handleOpenSettings);
+      window.removeEventListener('open-ai-monitor', handleOpenAiMonitor);
+    };
   }, []);
 
   const {
@@ -114,6 +123,7 @@ export default function App() {
       <BlueprintRangeStudioModal />
       <PdfRecropModal />
       <AiQuestionRepairModal />
+      <AiProcessingMonitorModal isOpen={isAiMonitorOpen} onClose={() => setIsAiMonitorOpen(false)} />
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
       <ConfirmDialog />
 

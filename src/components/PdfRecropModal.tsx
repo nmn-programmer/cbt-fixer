@@ -31,7 +31,10 @@ import {
   ImagePlus,
   CheckCheck,
   HelpCircle,
-  Image as ImageIcon
+  Image as ImageIcon,
+  ArrowUpDown,
+  GitMerge,
+  Columns
 } from 'lucide-react';
 import { getPdfjsLib } from '../utils/pdfWorkerConfig';
 
@@ -208,6 +211,9 @@ export const PdfRecropModal: React.FC = () => {
   const [pageB, setPageB] = useState<number>(1);
   const [activeRegion, setActiveRegion] = useState<'A' | 'B'>('A');
   const [isMultiRegion, setIsMultiRegion] = useState<boolean>(false);
+  const [viewMode, setViewMode] = useState<'crop' | 'merge_verification'>('crop');
+  const [stitchGap, setStitchGap] = useState<number>(12);
+  const [stitchOrder, setStitchOrder] = useState<'A_THEN_B' | 'B_THEN_A'>('A_THEN_B');
 
   // Mouse / Touch Dragging State
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
@@ -504,9 +510,11 @@ export const PdfRecropModal: React.FC = () => {
       if (cB) {
         setPreviewUrlB(cB.toDataURL('image/png'));
         if (cA) {
-          const gap = 12;
-          const stitchW = Math.max(cA.width, cB.width);
-          const stitchH = cA.height + cB.height + gap;
+          const topCanvas = stitchOrder === 'A_THEN_B' ? cA : cB;
+          const bottomCanvas = stitchOrder === 'A_THEN_B' ? cB : cA;
+          const gap = stitchGap;
+          const stitchW = Math.max(topCanvas.width, bottomCanvas.width);
+          const stitchH = topCanvas.height + bottomCanvas.height + gap;
           const sCanvas = document.createElement('canvas');
           sCanvas.width = stitchW;
           sCanvas.height = stitchH;
@@ -514,14 +522,14 @@ export const PdfRecropModal: React.FC = () => {
           if (sCtx) {
             sCtx.fillStyle = '#FFFFFF';
             sCtx.fillRect(0, 0, stitchW, stitchH);
-            sCtx.drawImage(cA, 0, 0);
-            sCtx.drawImage(cB, 0, cA.height + gap);
+            sCtx.drawImage(topCanvas, 0, 0);
+            sCtx.drawImage(bottomCanvas, 0, topCanvas.height + gap);
             setPreviewUrlStitched(sCanvas.toDataURL('image/png'));
           }
         }
       }
     }
-  }, [boxA, boxB, isMultiRegion, autoWhiten, sharpenText]);
+  }, [boxA, boxB, isMultiRegion, autoWhiten, sharpenText, stitchGap, stitchOrder]);
 
   // Render High-DPI Page to Canvas
   const renderCurrentPage = useCallback(async () => {
@@ -1036,9 +1044,11 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
       const cA = await cropBoxFromPage(currentPage, boxA);
       const cB = await cropBoxFromPage(pageB, boxB || boxA);
       if (cA && cB) {
-        const gap = 12;
-        const stitchW = Math.max(cA.width, cB.width);
-        const stitchH = cA.height + cB.height + gap;
+        const topCanvas = stitchOrder === 'A_THEN_B' ? cA : cB;
+        const bottomCanvas = stitchOrder === 'A_THEN_B' ? cB : cA;
+        const gap = stitchGap;
+        const stitchW = Math.max(topCanvas.width, bottomCanvas.width);
+        const stitchH = topCanvas.height + bottomCanvas.height + gap;
         finalCanvas = document.createElement('canvas');
         finalCanvas.width = stitchW;
         finalCanvas.height = stitchH;
@@ -1046,8 +1056,8 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
         if (sCtx) {
           sCtx.fillStyle = '#FFFFFF';
           sCtx.fillRect(0, 0, stitchW, stitchH);
-          sCtx.drawImage(cA, 0, 0);
-          sCtx.drawImage(cB, 0, cA.height + gap);
+          sCtx.drawImage(topCanvas, 0, 0);
+          sCtx.drawImage(bottomCanvas, 0, topCanvas.height + gap);
         }
       }
     } else {
@@ -1399,13 +1409,16 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                   </div>
                 )}
 
-                {/* Region Switcher (if Split Question mode) */}
+                {/* Region Switcher & Merge Verification Tab (if Split Question mode) */}
                 {isMultiRegion && (
-                  <div className="flex items-center bg-slate-950 rounded-lg p-0.5 border border-slate-800">
+                  <div className="flex items-center gap-1.5 bg-slate-950 rounded-lg p-0.5 border border-slate-800">
                     <button
-                      onClick={() => setActiveRegion('A')}
+                      onClick={() => {
+                        setViewMode('crop');
+                        setActiveRegion('A');
+                      }}
                       className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
-                        activeRegion === 'A'
+                        viewMode === 'crop' && activeRegion === 'A'
                           ? 'bg-indigo-600 text-white'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
@@ -1414,16 +1427,30 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                     </button>
                     <button
                       onClick={() => {
+                        setViewMode('crop');
                         setActiveRegion('B');
                         if (!boxB) setBoxB({ ...boxA });
                       }}
                       className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
-                        activeRegion === 'B'
+                        viewMode === 'crop' && activeRegion === 'B'
                           ? 'bg-emerald-600 text-white'
                           : 'text-slate-400 hover:text-slate-200'
                       }`}
                     >
                       Region B (Pg {pageB})
+                    </button>
+                    <div className="w-px h-4 bg-slate-800 mx-0.5" />
+                    <button
+                      onClick={() => setViewMode(v => v === 'merge_verification' ? 'crop' : 'merge_verification')}
+                      className={`flex items-center gap-1 px-2.5 py-1 rounded text-xs font-bold transition-all ${
+                        viewMode === 'merge_verification'
+                          ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-sm ring-1 ring-purple-400'
+                          : 'bg-purple-950/40 text-purple-300 hover:bg-purple-900/50 border border-purple-800/40'
+                      }`}
+                      title="Open Side-by-Side Merge Verification Studio"
+                    >
+                      <GitMerge className="w-3.5 h-3.5" />
+                      <span>Merge Verification Tab</span>
                     </button>
                   </div>
                 )}
@@ -1479,7 +1506,7 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                 </div>
               )}
 
-              {/* Interactive PDF Document Stage */}
+              {/* Interactive PDF Document Stage OR Merge Verification Studio */}
               <div
                 ref={containerRef}
                 className="flex-1 overflow-auto bg-slate-950 p-4 relative flex items-start justify-center select-none"
@@ -1488,148 +1515,337 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                 onTouchMove={handlePointerMove}
                 onTouchEnd={handlePointerUp}
               >
-                {loadingDoc || renderingPage ? (
-                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/70 z-30">
-                    <Loader2 className="w-8 h-8 text-indigo-500 animate-spin mb-2" />
-                    <span className="text-xs text-slate-400">Rendering high-res page...</span>
-                  </div>
-                ) : null}
-
-                <div
-                  className="relative shadow-2xl border border-slate-700 bg-white"
-                  style={{
-                    cursor: isDrawing ? 'crosshair' : 'default'
-                  }}
-                  onMouseDown={(e) => {
-                    if ((e.target as HTMLElement).tagName === 'CANVAS') {
-                      handlePointerDown(e, 'create');
-                    }
-                  }}
-                  onTouchStart={(e) => {
-                    if ((e.target as HTMLElement).tagName === 'CANVAS') {
-                      handlePointerDown(e, 'create');
-                    }
-                  }}
-                >
-                  <canvas ref={canvasRef} className="block" />
-
-                  {/* Render Dotted Boundary Outlines for OTHER Questions on the Same Page */}
-                  {otherQuestionsOnPage.map((oq) => (
-                    <div
-                      key={oq.keyId}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        selectQuestionByIndex(oq.index);
-                      }}
-                      className="absolute border-2 border-dashed border-amber-500/80 bg-amber-500/10 hover:bg-amber-500/25 cursor-pointer rounded-xs transition-all z-10 group"
-                      style={{
-                        top: `${oq.box.ymin * 100}%`,
-                        left: `${oq.box.xmin * 100}%`,
-                        width: `${(oq.box.xmax - oq.box.xmin) * 100}%`,
-                        height: `${(oq.box.ymax - oq.box.ymin) * 100}%`,
-                      }}
-                      title={`Click to inspect & re-crop Question Q${oq.que}`}
-                    >
-                      <div className="absolute -top-5 left-0 px-1.5 py-0.5 bg-amber-600 text-white text-[9px] font-bold rounded shadow group-hover:scale-105 transition-transform flex items-center gap-1">
-                        <span>Q{oq.que}</span>
-                        <span className="text-[8px] opacity-80">(Switch)</span>
+                {viewMode === 'merge_verification' ? (
+                  <div className="w-full max-w-5xl bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-2xl flex flex-col gap-6 text-slate-200 my-auto">
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-4">
+                      <div className="flex items-center gap-2.5">
+                        <div className="p-2 bg-purple-600/20 rounded-lg border border-purple-500/30">
+                          <GitMerge className="w-5 h-5 text-purple-400" />
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                            <span>Split Question Merge & Stitch Studio</span>
+                            <span className="px-2 py-0.5 bg-indigo-900/60 border border-indigo-700/50 text-indigo-300 text-xs rounded-full font-mono font-bold">
+                              Q{newQProps.que}
+                            </span>
+                          </h3>
+                          <p className="text-xs text-slate-400">
+                            Compare Region A and Region B side-by-side, fine-tune vertical seam gap, and verify seamless compilation.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setViewMode('crop')}
+                          className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                        >
+                          <Scissors className="w-3.5 h-3.5" />
+                          <span>Adjust Crop Boxes</span>
+                        </button>
+                        <button
+                          onClick={() => handleSaveCrop(false)}
+                          className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold shadow-lg shadow-indigo-600/20 flex items-center gap-1.5 transition-all cursor-pointer"
+                        >
+                          <Check className="w-4 h-4" />
+                          <span>Save Stitched Question</span>
+                        </button>
                       </div>
                     </div>
-                  ))}
 
-                  {/* Render Active Crop Box */}
-                  {canvasRef.current && (
+                    {/* 3-Column Inspection Grid */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+                      {/* Region A Column */}
+                      <div className="bg-slate-950/70 border border-indigo-900/40 rounded-xl p-4 flex flex-col gap-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-indigo-400 flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full bg-indigo-500" />
+                            Region A (Page {currentPage})
+                          </span>
+                          <button
+                            onClick={() => {
+                              setViewMode('crop');
+                              setActiveRegion('A');
+                            }}
+                            className="text-[11px] text-indigo-300 hover:underline cursor-pointer"
+                          >
+                            Edit Box A
+                          </button>
+                        </div>
+                        <div className={`flex-1 rounded-lg border border-slate-800 p-2 flex items-center justify-center min-h-[180px] max-h-[300px] overflow-auto ${
+                          previewDarkMode ? 'bg-slate-950' : 'bg-white'
+                        }`}>
+                          {previewUrlA ? (
+                            <img src={previewUrlA} alt="Region A" className={`max-w-full h-auto object-contain ${previewDarkMode ? 'invert hue-rotate-180' : ''}`} />
+                          ) : (
+                            <span className="text-xs text-slate-500 italic">No Region A selected</span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Region B Column */}
+                      <div className="bg-slate-950/70 border border-emerald-900/40 rounded-xl p-4 flex flex-col gap-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-emerald-400 flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                            Region B (Page {pageB})
+                          </span>
+                          <button
+                            onClick={() => {
+                              setViewMode('crop');
+                              setActiveRegion('B');
+                            }}
+                            className="text-[11px] text-emerald-300 hover:underline cursor-pointer"
+                          >
+                            Edit Box B
+                          </button>
+                        </div>
+                        <div className={`flex-1 rounded-lg border border-slate-800 p-2 flex items-center justify-center min-h-[180px] max-h-[300px] overflow-auto ${
+                          previewDarkMode ? 'bg-slate-950' : 'bg-white'
+                        }`}>
+                          {previewUrlB ? (
+                            <img src={previewUrlB} alt="Region B" className={`max-w-full h-auto object-contain ${previewDarkMode ? 'invert hue-rotate-180' : ''}`} />
+                          ) : (
+                            <span className="text-xs text-slate-500 italic">No Region B selected</span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Stitched Output Column */}
+                      <div className="bg-slate-950/70 border border-purple-900/50 rounded-xl p-4 flex flex-col gap-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-purple-300 flex items-center gap-1.5">
+                            <GitMerge className="w-3.5 h-3.5 text-purple-400" />
+                            Unified Stitched Preview
+                          </span>
+                          <button
+                            onClick={() => setStitchOrder(o => o === 'A_THEN_B' ? 'B_THEN_A' : 'A_THEN_B')}
+                            className="px-2 py-0.5 text-[10px] bg-purple-950 border border-purple-700/50 hover:bg-purple-900/60 text-purple-300 rounded font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                            title="Swap which region appears on top"
+                          >
+                            <ArrowUpDown className="w-3 h-3" />
+                            <span>Order: {stitchOrder === 'A_THEN_B' ? 'A ➔ B' : 'B ➔ A'}</span>
+                          </button>
+                        </div>
+                        <div className={`flex-1 rounded-lg border border-purple-800/40 p-2 flex items-center justify-center min-h-[180px] max-h-[300px] overflow-auto ${
+                          previewDarkMode ? 'bg-slate-950' : 'bg-white shadow-inner'
+                        }`}>
+                          {previewUrlStitched ? (
+                            <img src={previewUrlStitched} alt="Stitched Question" className={`max-w-full h-auto object-contain ${previewDarkMode ? 'invert hue-rotate-180' : ''}`} />
+                          ) : (
+                            <span className="text-xs text-slate-500 italic">Configure Region A & B to preview stitch</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Stitch Fine-Tuning Controls */}
+                    <div className="bg-slate-950/90 border border-slate-800/80 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4 text-xs">
+                      <div className="flex items-center gap-4">
+                        <div className="flex items-center gap-2">
+                          <label className="text-slate-400 font-semibold">Vertical Seam Gap:</label>
+                          <input
+                            type="range"
+                            min={0}
+                            max={40}
+                            step={2}
+                            value={stitchGap}
+                            onChange={(e) => setStitchGap(parseInt(e.target.value, 10))}
+                            className="w-28 accent-purple-500 cursor-pointer"
+                          />
+                          <span className="font-mono text-purple-300 w-8">{stitchGap}px</span>
+                        </div>
+
+                        <div className="h-4 w-px bg-slate-800" />
+
+                        <label className="flex items-center gap-2 cursor-pointer hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={autoWhiten}
+                            onChange={(e) => setAutoWhiten(e.target.checked)}
+                            className="rounded text-purple-600 bg-slate-900 border-slate-700"
+                          />
+                          <span>Clean Whiten</span>
+                        </label>
+
+                        <label className="flex items-center gap-2 cursor-pointer hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={sharpenText}
+                            onChange={(e) => setSharpenText(e.target.checked)}
+                            className="rounded text-purple-600 bg-slate-900 border-slate-700"
+                          />
+                          <span>Sharpen Text</span>
+                        </label>
+
+                        <label className="flex items-center gap-2 cursor-pointer hover:text-white">
+                          <input
+                            type="checkbox"
+                            checked={previewDarkMode}
+                            onChange={(e) => setPreviewDarkMode(e.target.checked)}
+                            className="rounded text-purple-600 bg-slate-900 border-slate-700"
+                          />
+                          <span>Invert Dark Mode</span>
+                        </label>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleSaveCrop(true)}
+                          disabled={activeQIndex >= allQuestionsList.length - 1}
+                          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-lg font-bold flex items-center gap-1.5 shadow-lg shadow-emerald-600/20 transition-all cursor-pointer"
+                        >
+                          <ArrowRightCircle className="w-4 h-4" />
+                          <span>Save & Next Question</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {loadingDoc || renderingPage ? (
+                      <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/70 z-30">
+                        <Loader2 className="w-8 h-8 text-indigo-500 animate-spin mb-2" />
+                        <span className="text-xs text-slate-400">Rendering high-res page...</span>
+                      </div>
+                    ) : null}
+
                     <div
-                      className={`absolute border-2 transition-shadow z-20 ${
-                        activeRegion === 'A'
-                          ? 'border-indigo-500 bg-indigo-500/15 shadow-indigo-500/20'
-                          : 'border-emerald-500 bg-emerald-500/15 shadow-emerald-500/20'
-                      }`}
+                      className="relative shadow-2xl border border-slate-700 bg-white"
                       style={{
-                        top: `${currentActiveBox.ymin * 100}%`,
-                        left: `${currentActiveBox.xmin * 100}%`,
-                        width: `${(currentActiveBox.xmax - currentActiveBox.xmin) * 100}%`,
-                        height: `${(currentActiveBox.ymax - currentActiveBox.ymin) * 100}%`,
-                        cursor: 'move'
+                        cursor: isDrawing ? 'crosshair' : 'default'
                       }}
                       onMouseDown={(e) => {
-                        e.stopPropagation();
-                        handlePointerDown(e, 'move');
+                        if ((e.target as HTMLElement).tagName === 'CANVAS') {
+                          handlePointerDown(e, 'create');
+                        }
                       }}
                       onTouchStart={(e) => {
-                        e.stopPropagation();
-                        handlePointerDown(e, 'move');
+                        if ((e.target as HTMLElement).tagName === 'CANVAS') {
+                          handlePointerDown(e, 'create');
+                        }
                       }}
                     >
-                      {/* Region Tag */}
-                      <div
-                        className={`absolute -top-6 left-0 px-2 py-0.5 rounded text-[10px] font-bold text-white shadow ${
-                          activeRegion === 'A' ? 'bg-indigo-600' : 'bg-emerald-600'
-                        }`}
-                      >
-                        {isMultiRegion ? `Q${newQProps.que} Region ${activeRegion}` : `Q${newQProps.que} Crop Area`}
-                      </div>
+                      <canvas ref={canvasRef} className="block" />
 
-                      {/* Resize Handles */}
-                      <div
-                        className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 'nw');
-                        }}
-                      />
-                      <div
-                        className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 'ne');
-                        }}
-                      />
-                      <div
-                        className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 'sw');
-                        }}
-                      />
-                      <div
-                        className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 'se');
-                        }}
-                      />
-                      <div
-                        className="absolute top-1/2 -left-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 'w');
-                        }}
-                      />
-                      <div
-                        className="absolute top-1/2 -right-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 'e');
-                        }}
-                      />
-                      <div
-                        className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 'n');
-                        }}
-                      />
-                      <div
-                        className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
-                        onMouseDown={(e) => {
-                          e.stopPropagation();
-                          handlePointerDown(e, 's');
-                        }}
-                      />
+                      {/* Render Dotted Boundary Outlines for OTHER Questions on the Same Page */}
+                      {otherQuestionsOnPage.map((oq) => (
+                        <div
+                          key={oq.keyId}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            selectQuestionByIndex(oq.index);
+                          }}
+                          className="absolute border-2 border-dashed border-amber-500/80 bg-amber-500/10 hover:bg-amber-500/25 cursor-pointer rounded-xs transition-all z-10 group"
+                          style={{
+                            top: `${oq.box.ymin * 100}%`,
+                            left: `${oq.box.xmin * 100}%`,
+                            width: `${(oq.box.xmax - oq.box.xmin) * 100}%`,
+                            height: `${(oq.box.ymax - oq.box.ymin) * 100}%`,
+                          }}
+                          title={`Click to inspect & re-crop Question Q${oq.que}`}
+                        >
+                          <div className="absolute -top-5 left-0 px-1.5 py-0.5 bg-amber-600 text-white text-[9px] font-bold rounded shadow group-hover:scale-105 transition-transform flex items-center gap-1">
+                            <span>Q{oq.que}</span>
+                            <span className="text-[8px] opacity-80">(Switch)</span>
+                          </div>
+                        </div>
+                      ))}
+
+                      {/* Render Active Crop Box */}
+                      {canvasRef.current && (
+                        <div
+                          className={`absolute border-2 transition-shadow z-20 ${
+                            activeRegion === 'A'
+                              ? 'border-indigo-500 bg-indigo-500/15 shadow-indigo-500/20'
+                              : 'border-emerald-500 bg-emerald-500/15 shadow-emerald-500/20'
+                          }`}
+                          style={{
+                            top: `${currentActiveBox.ymin * 100}%`,
+                            left: `${currentActiveBox.xmin * 100}%`,
+                            width: `${(currentActiveBox.xmax - currentActiveBox.xmin) * 100}%`,
+                            height: `${(currentActiveBox.ymax - currentActiveBox.ymin) * 100}%`,
+                            cursor: 'move'
+                          }}
+                          onMouseDown={(e) => {
+                            e.stopPropagation();
+                            handlePointerDown(e, 'move');
+                          }}
+                          onTouchStart={(e) => {
+                            e.stopPropagation();
+                            handlePointerDown(e, 'move');
+                          }}
+                        >
+                          {/* Region Tag */}
+                          <div
+                            className={`absolute -top-6 left-0 px-2 py-0.5 rounded text-[10px] font-bold text-white shadow ${
+                              activeRegion === 'A' ? 'bg-indigo-600' : 'bg-emerald-600'
+                            }`}
+                          >
+                            {isMultiRegion ? `Q${newQProps.que} Region ${activeRegion}` : `Q${newQProps.que} Crop Area`}
+                          </div>
+
+                          {/* Resize Handles */}
+                          <div
+                            className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 'nw');
+                            }}
+                          />
+                          <div
+                            className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 'ne');
+                            }}
+                          />
+                          <div
+                            className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 'sw');
+                            }}
+                          />
+                          <div
+                            className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 'se');
+                            }}
+                          />
+                          <div
+                            className="absolute top-1/2 -left-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 'w');
+                            }}
+                          />
+                          <div
+                            className="absolute top-1/2 -right-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 'e');
+                            }}
+                          />
+                          <div
+                            className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 'n');
+                            }}
+                          />
+                          <div
+                            className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
+                            onMouseDown={(e) => {
+                              e.stopPropagation();
+                              handlePointerDown(e, 's');
+                            }}
+                          />
+                        </div>
+                      )}
                     </div>
-                  )}
-                </div>
+                  </>
+                )}
               </div>
 
               {/* Bottom Thumbnail Strip */}

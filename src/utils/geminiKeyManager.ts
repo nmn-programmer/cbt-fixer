@@ -2,11 +2,13 @@ import { executeGeminiClientSide } from './aiDirectEngine';
 import { getStoredSelectedModel } from './aiModelConfig';
 
 export type ApiKeyStatus = 'Ready' | 'Active' | 'Quota Exhausted' | 'Invalid';
+export type ApiKeyRole = 'worker' | 'merger' | 'auto';
 
 export interface FallbackKeyItem {
   id: string;
   key: string;
   label: string;
+  role?: ApiKeyRole;
   status: ApiKeyStatus;
   rpmCount: number;
   rpdCount: number;
@@ -14,6 +16,27 @@ export interface FallbackKeyItem {
   lastUsedAt?: number;
   exhaustedUntil?: number;
   lastError?: string;
+}
+
+export interface OrchestratedKey {
+  id: string;
+  key: string;
+  label: string;
+  role: 'worker' | 'merger';
+  workerIndex?: number;
+  status: ApiKeyStatus;
+  rpmCount: number;
+  rpdCount: number;
+  exhaustedUntil?: number;
+  lastUsedAt?: number;
+  lastError?: string;
+}
+
+export interface OrchestratedPoolResult {
+  totalKeys: number;
+  workers: OrchestratedKey[];
+  merger: OrchestratedKey;
+  all: OrchestratedKey[];
 }
 
 export interface KeyUsageMetrics {
@@ -444,6 +467,146 @@ export function maskApiKey(key: string): string {
  */
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Calculates exponential backoff with randomized jitter:
+ * WaitTime = (2^attempt * 1000ms) + jitter (0-400ms)
+ */
+export function calculateExponentialBackoffWithJitter(attempt: number): number {
+  const base = Math.pow(2, Math.max(1, attempt)) * 1000;
+  const jitter = Math.floor(Math.random() * 400);
+  return base + jitter;
+}
+
+/**
+ * Resolves full orchestrated key pool according to the K-1 Workers + 1 Merger architecture:
+ * - If 1 key: Worker 1 & Merger use Key 1 (Single key mode)
+ * - If K >= 2 keys: Keys 1...(K-1) are assigned as Workers, and Key K is the dedicated Merger
+ */
+export function getOrchestratedKeyPool(): OrchestratedPoolResult {
+  const snapshot = getKeyUsageSnapshot();
+  const primaryKey = snapshot.primaryKey.trim();
+  const rawFallbacks = snapshot.fallbackKeys;
+
+  const rawList: { id: string; key: string; label: string; role?: ApiKeyRole; status: ApiKeyStatus; rpm: number; rpd: number; exhaustedUntil?: number; lastUsedAt?: number; lastError?: string }[] = [];
+
+  if (primaryKey.length > 0) {
+    rawList.push({
+      id: 'primary',
+      key: primaryKey,
+      label: 'Primary Key',
+      status: snapshot.primaryKeyStatus,
+      rpm: snapshot.primaryRpm,
+      rpd: snapshot.primaryRpd,
+      exhaustedUntil: snapshot.primaryExhaustedUntil,
+      lastUsedAt: snapshot.primaryLastUsedAt,
+      lastError: snapshot.primaryLastError,
+    });
+  }
+
+  rawFallbacks.forEach((f, idx) => {
+    if (f.key && f.key.trim().length > 0) {
+      rawList.push({
+        id: f.id,
+        key: f.key.trim(),
+        label: f.label || `Backup Key ${idx + 1}`,
+        role: f.role,
+        status: f.status,
+        rpm: f.rpmCount,
+        rpd: f.rpdCount,
+        exhaustedUntil: f.exhaustedUntil,
+        lastUsedAt: f.lastUsedAt,
+        lastError: f.lastError,
+      });
+    }
+  });
+
+  // Limit to up to 5 keys
+  const limitedList = rawList.slice(0, 5);
+
+  if (limitedList.length === 0) {
+    const dummyKey: OrchestratedKey = {
+      id: 'env_default',
+      key: '',
+      label: 'Server Environment Key',
+      role: 'merger',
+      status: 'Ready',
+      rpmCount: 0,
+      rpdCount: 0,
+    };
+    return {
+      totalKeys: 0,
+      workers: [dummyKey],
+      merger: dummyKey,
+      all: [dummyKey],
+    };
+  }
+
+  if (limitedList.length === 1) {
+    const single = limitedList[0];
+    const keyObj: OrchestratedKey = {
+      id: single.id,
+      key: single.key,
+      label: single.label,
+      role: 'worker',
+      workerIndex: 1,
+      status: single.status,
+      rpmCount: single.rpm,
+      rpdCount: single.rpd,
+      exhaustedUntil: single.exhaustedUntil,
+      lastUsedAt: single.lastUsedAt,
+      lastError: single.lastError,
+    };
+    return {
+      totalKeys: 1,
+      workers: [keyObj],
+      merger: { ...keyObj, role: 'merger' },
+      all: [keyObj],
+    };
+  }
+
+  // K >= 2: Keys 0..(K-2) are Workers, Last key (K-1) is Merger
+  const workers: OrchestratedKey[] = [];
+  for (let i = 0; i < limitedList.length - 1; i++) {
+    const item = limitedList[i];
+    workers.push({
+      id: item.id,
+      key: item.key,
+      label: item.label || `Worker ${i + 1}`,
+      role: 'worker',
+      workerIndex: i + 1,
+      status: item.status,
+      rpmCount: item.rpm,
+      rpdCount: item.rpd,
+      exhaustedUntil: item.exhaustedUntil,
+      lastUsedAt: item.lastUsedAt,
+      lastError: item.lastError,
+    });
+  }
+
+  const lastItem = limitedList[limitedList.length - 1];
+  const merger: OrchestratedKey = {
+    id: lastItem.id,
+    key: lastItem.key,
+    label: lastItem.label || 'Dedicated Merger Key',
+    role: 'merger',
+    status: lastItem.status,
+    rpmCount: lastItem.rpm,
+    rpdCount: lastItem.rpd,
+    exhaustedUntil: lastItem.exhaustedUntil,
+    lastUsedAt: lastItem.lastUsedAt,
+    lastError: lastItem.lastError,
+  };
+
+  const all: OrchestratedKey[] = [...workers, merger];
+
+  return {
+    totalKeys: limitedList.length,
+    workers,
+    merger,
+    all,
+  };
 }
 
 let currentKeyRotationIndex = 0;
