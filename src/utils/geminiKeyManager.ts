@@ -136,6 +136,128 @@ export function setStoredPrimaryStatus(status: ApiKeyStatus, exhaustedUntil?: nu
 }
 
 /**
+ * Export all API keys (primary + fallbacks) as a JSON string
+ */
+export function exportApiKeysJson(): string {
+  const primaryKey = getStoredPrimaryApiKey();
+  const fallbacks = getStoredFallbackKeys();
+  const exportData = {
+    primaryKey,
+    fallbackKeys: fallbacks.map(f => ({
+      id: f.id,
+      label: f.label,
+      key: f.key
+    })),
+    exportedAt: new Date().toISOString()
+  };
+  return JSON.stringify(exportData, null, 2);
+}
+
+/**
+ * Import API keys from a JSON string.
+ * Using the first appearing key as the active key! Any subsequent keys become backup/fallback keys.
+ */
+export function importApiKeysFromJson(jsonString: string): {
+  success: boolean;
+  importedCount: number;
+  primaryKeyMasked?: string;
+  error?: string;
+} {
+  try {
+    const data = JSON.parse(jsonString);
+    const keysFound: { key: string; label?: string }[] = [];
+
+    // Helper to collect string keys
+    const addKey = (k: any, label?: string) => {
+      if (typeof k === 'string' && k.trim().length > 5) {
+        const trimmed = k.trim();
+        if (!keysFound.some(item => item.key === trimmed)) {
+          keysFound.push({ key: trimmed, label });
+        }
+      }
+    };
+
+    if (Array.isArray(data)) {
+      // Direct array of strings or key objects
+      data.forEach((item, index) => {
+        if (typeof item === 'string') {
+          addKey(item, index === 0 ? 'Primary Key' : `Backup Key ${index}`);
+        } else if (item && typeof item === 'object') {
+          const val = item.key || item.apiKey || item.value;
+          const lbl = item.label || item.name || (index === 0 ? 'Primary Key' : `Backup Key ${index}`);
+          addKey(val, lbl);
+        }
+      });
+    } else if (data && typeof data === 'object') {
+      // Object structure: { primaryKey, fallbackKeys, ... }
+      if (data.primaryKey) {
+        addKey(data.primaryKey, 'Primary Key');
+      }
+      if (Array.isArray(data.fallbackKeys)) {
+        data.fallbackKeys.forEach((item: any, index: number) => {
+          if (typeof item === 'string') {
+            addKey(item, `Backup Key ${index + 1}`);
+          } else if (item && typeof item === 'object') {
+            const val = item.key || item.apiKey;
+            const lbl = item.label || item.name || `Backup Key ${index + 1}`;
+            addKey(val, lbl);
+          }
+        });
+      }
+      if (Array.isArray(data.keys)) {
+        data.keys.forEach((item: any, index: number) => {
+          if (typeof item === 'string') {
+            addKey(item, index === 0 ? 'Primary Key' : `Backup Key ${index}`);
+          } else if (item && typeof item === 'object') {
+            addKey(item.key || item.apiKey, item.label || item.name);
+          }
+        });
+      }
+      if (Array.isArray(data.apiKeys)) {
+        data.apiKeys.forEach((item: any, index: number) => {
+          if (typeof item === 'string') {
+            addKey(item, index === 0 ? 'Primary Key' : `Backup Key ${index}`);
+          } else if (item && typeof item === 'object') {
+            addKey(item.key || item.apiKey, item.label || item.name);
+          }
+        });
+      }
+    }
+
+    if (keysFound.length === 0) {
+      return { success: false, importedCount: 0, error: 'No valid API keys found in JSON.' };
+    }
+
+    // First appearing key is set as active primary key!
+    const primary = keysFound[0];
+    setStoredPrimaryApiKey(primary.key);
+    setStoredPrimaryStatus('Ready');
+
+    // Subsequent keys become fallback keys
+    const fallbackList: FallbackKeyItem[] = keysFound.slice(1).map((item, index) => ({
+      id: `fallback_imported_${Date.now()}_${index}`,
+      key: item.key,
+      label: item.label || `Backup Key ${index + 1}`,
+      status: 'Ready',
+      rpmCount: 0,
+      rpdCount: 0,
+      requestTimestamps: []
+    }));
+
+    setStoredFallbackKeys(fallbackList);
+
+    const primaryMasked = primary.key.slice(0, 6) + '...' + primary.key.slice(-4);
+    return {
+      success: true,
+      importedCount: keysFound.length,
+      primaryKeyMasked: primaryMasked
+    };
+  } catch (err: any) {
+    return { success: false, importedCount: 0, error: `Invalid JSON format: ${err?.message || 'Parse error'}` };
+  }
+}
+
+/**
  * Calculates RPM (last 60s) and RPD (last 24h) from a list of timestamps
  */
 export function filterAndCalculateUsage(timestamps: number[]): {

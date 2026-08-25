@@ -136,17 +136,51 @@ export async function serializeZipArchive(
       }
     }
 
+    // Always bundle raw source PDF and Answer Key files if available
+    let hasPdfBundled = false;
+    let hasAnswerKeyBundled = false;
+
+    for (const [path, entry] of archive.rawFiles.entries()) {
+      const lower = path.toLowerCase();
+      if (lower.endsWith('.pdf')) {
+        zip.file('source_document.pdf', entry.blob);
+        if (path !== 'source_document.pdf') {
+          zip.file(path, entry.blob);
+        }
+        hasPdfBundled = true;
+      } else if (lower.includes('answer_key') || lower.includes('answerkey')) {
+        const keyName = lower.endsWith('.json') ? 'answer_key.json' : 'answer_key.pdf';
+        zip.file(keyName, entry.blob);
+        hasAnswerKeyBundled = true;
+      }
+    }
+
+    const studioManifest = {
+      appVersion: archive.metadata.appVersion || '2.6.0',
+      title: archive.title,
+      createdAt: new Date().toISOString(),
+      sourcePdfName: archive.metadata.sourcePdfName || 'source_document.pdf',
+      hasSourcePdf: hasPdfBundled,
+      hasAnswerKey: hasAnswerKeyBundled,
+      testConfig: {
+        pdfFileHash: archive.metadata.pdfFileHash || '',
+        additionalData: archive.metadata.additionalData || {},
+      },
+      pdfCropperData,
+    };
+
     const rootJson = {
       testConfig: {
         pdfFileHash: archive.metadata.pdfFileHash || '',
         additionalData: archive.metadata.additionalData || {},
       },
       pdfCropperData,
-      appVersion: archive.metadata.appVersion || '2.5.0',
+      appVersion: archive.metadata.appVersion || '2.6.0',
       generatedBy: 'pdfCropperPage',
     };
 
     zip.file('data.json', JSON.stringify(rootJson, null, 2));
+    zip.file('studio_manifest.json', JSON.stringify(studioManifest, null, 2));
   }
 
   // Generate binary ZIP Blob
@@ -218,12 +252,29 @@ function serializeQuestion(
 ): any {
   // Build pdfData with exact requested coordinates structure: page, x1, x2, y1, y2
   const pdfData = q.pdfData.map((part) => {
+    const pPage = part.page ?? part.pageNumber ?? 1;
+    const x1 = part.x1 ?? (part.xmin !== undefined ? Math.round(part.xmin * 1000) : 0);
+    const y1 = part.y1 ?? (part.ymin !== undefined ? Math.round(part.ymin * 1000) : 0);
+    const x2 = part.x2 ?? (part.xmax !== undefined ? Math.round(part.xmax * 1000) : 1000);
+    const y2 = part.y2 ?? (part.ymax !== undefined ? Math.round(part.ymax * 1000) : 1000);
+
+    const xmin = part.xmin !== undefined ? part.xmin : x1 / 1000;
+    const ymin = part.ymin !== undefined ? part.ymin : y1 / 1000;
+    const xmax = part.xmax !== undefined ? part.xmax : x2 / 1000;
+    const ymax = part.ymax !== undefined ? part.ymax : y2 / 1000;
+
     return {
-      page: part.page ?? 1,
-      x1: part.x1 ?? 0,
-      x2: part.x2 ?? 100,
-      y1: part.y1 ?? 0,
-      y2: part.y2 ?? 100,
+      page: pPage,
+      pageNumber: pPage,
+      x1,
+      y1,
+      x2,
+      y2,
+      ymin,
+      xmin,
+      ymax,
+      xmax,
+      bounds: part.bounds || [xmin, ymin, Math.max(0.01, xmax - xmin), Math.max(0.01, ymax - ymin)],
     };
   });
 

@@ -50,17 +50,56 @@ export const SidebarTree: React.FC = () => {
     deleteSection,
     moveSection,
     addQuestion,
+    updateQuestionQue,
     deleteQuestion,
     duplicateQuestion,
     moveQuestion,
     openPdfRecrop,
     openAiRepair,
+    showConfirm,
   } = useCbtStore();
 
   const [expandedSubjects, setExpandedSubjects] = useState<Record<string, boolean>>({});
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({});
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState<string>('');
+  const [editingQId, setEditingQId] = useState<string | null>(null);
+  const [editingQVal, setEditingQVal] = useState<string>('');
+  const [addingCustomQSecId, setAddingCustomQSecId] = useState<string | null>(null);
+  const [customQVal, setCustomQVal] = useState<string>('');
+
+  const handleStartEditQue = (qId: string, currentQue: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setEditingQId(qId);
+    setEditingQVal(String(currentQue));
+  };
+
+  const handleCommitEditQue = (qId: string) => {
+    const parsed = parseInt(editingQVal, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      updateQuestionQue(qId, parsed);
+    }
+    setEditingQId(null);
+  };
+
+  const handleAddCustomQue = (sectionId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setAddingCustomQSecId(sectionId);
+    
+    // Find next sequential question number across the entire paper
+    const active = archives.find((a) => a.id === activeArchiveId);
+    let maxQ = 0;
+    if (active) {
+      active.subjects.forEach((sub) => {
+        sub.sections.forEach((sec) => {
+          sec.questions.forEach((q) => {
+            if (q.que > maxQ) maxQ = q.que;
+          });
+        });
+      });
+    }
+    setCustomQVal(String(maxQ + 1));
+  };
 
   const activeArchive = archives.find((a) => a.id === activeArchiveId);
 
@@ -150,14 +189,31 @@ export const SidebarTree: React.FC = () => {
             <Layers className="w-3.5 h-3.5 text-indigo-400" />
             <span>Structure Navigator</span>
           </div>
-          <button
-            onClick={() => addSubject()}
-            className="flex items-center gap-1 px-1.5 py-0.5 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition-colors"
-            title="Add New Subject (e.g. Mathematics)"
-          >
-            <Plus className="w-3 h-3 text-indigo-400" />
-            <span>Subject</span>
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => addSubject()}
+              className="flex items-center gap-1 px-1.5 py-0.5 text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition-colors"
+              title="Add New Subject (e.g. Mathematics)"
+            >
+              <Plus className="w-3 h-3 text-indigo-400" />
+              <span>Subject</span>
+            </button>
+            <button
+              onClick={() => {
+                showConfirm({
+                  title: 'Delete Paper Directory',
+                  message: `Are you sure you want to delete the current paper directory "${activeArchive.title || activeArchive.fileName}"?\n\nThis will remove the paper and all its questions from the workspace and IndexedDB.`,
+                  onConfirm: () => {
+                    useCbtStore.getState().closeArchive(activeArchive.id);
+                  }
+                });
+              }}
+              className="p-1 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded transition-colors"
+              title="Delete / Close this paper directory"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
 
         {/* Search input */}
@@ -293,20 +349,23 @@ export const SidebarTree: React.FC = () => {
                       <MoveDown className="w-3 h-3" />
                     </button>
                   )}
-                  {activeArchive.subjects.length > 1 && (
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (confirm(`Delete subject "${subject.name}" and all its questions?`)) {
+                  {/* Delete Subject Button */}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      showConfirm({
+                        title: 'Delete Subject',
+                        message: `Are you sure you want to delete subject "${subject.name}" and all its questions? This action cannot be undone.`,
+                        onConfirm: () => {
                           deleteSubject(subject.id);
                         }
-                      }}
-                      className="p-1 hover:bg-slate-700 text-slate-400 hover:text-rose-400 rounded"
-                      title="Delete Subject"
-                    >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
-                  )}
+                      });
+                    }}
+                    className="p-1 hover:bg-slate-700 text-slate-400 hover:text-rose-400 rounded"
+                    title="Delete Subject"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
                 </div>
               </div>
 
@@ -374,10 +433,47 @@ export const SidebarTree: React.FC = () => {
                                 addQuestion(section.id, 'mcq');
                               }}
                               className="p-1 hover:bg-slate-700 text-slate-400 hover:text-emerald-400 rounded"
-                              title="Add Question"
+                              title="Add Next Question"
                             >
                               <Plus className="w-3 h-3" />
                             </button>
+                            {addingCustomQSecId === section.id ? (
+                              <div className="flex items-center gap-1 bg-slate-900 border border-indigo-500 rounded px-1 py-0.2" onClick={(e) => e.stopPropagation()}>
+                                <input
+                                  type="number"
+                                  value={customQVal}
+                                  autoFocus
+                                  onChange={(e) => setCustomQVal(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') {
+                                      const parsed = parseInt(customQVal, 10);
+                                      if (!isNaN(parsed) && parsed > 0) {
+                                        addQuestion(section.id, 'mcq', parsed);
+                                      }
+                                      setAddingCustomQSecId(null);
+                                    } else if (e.key === 'Escape') {
+                                      setAddingCustomQSecId(null);
+                                    }
+                                  }}
+                                  onBlur={() => {
+                                    const parsed = parseInt(customQVal, 10);
+                                    if (!isNaN(parsed) && parsed > 0) {
+                                      addQuestion(section.id, 'mcq', parsed);
+                                    }
+                                    setAddingCustomQSecId(null);
+                                  }}
+                                  className="w-8 bg-slate-950 text-white text-[10px] font-bold font-mono px-0.5 focus:outline-none rounded text-center"
+                                />
+                              </div>
+                            ) : (
+                              <button
+                                onClick={(e) => handleAddCustomQue(section.id, e)}
+                                className="px-1 py-0.5 hover:bg-slate-700 text-indigo-400 hover:text-indigo-200 rounded text-[10px] font-bold font-mono border border-indigo-500/30"
+                                title="Add Question with Custom Q#"
+                              >
+                                +Q#
+                              </button>
+                            )}
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -388,20 +484,22 @@ export const SidebarTree: React.FC = () => {
                             >
                               <Edit2 className="w-3 h-3" />
                             </button>
-                            {subject.sections.length > 1 && (
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  if (confirm(`Delete section "${section.name}"?`)) {
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                showConfirm({
+                                  title: 'Delete Section',
+                                  message: `Are you sure you want to delete section "${section.name}" and all its questions? This action cannot be undone.`,
+                                  onConfirm: () => {
                                     deleteSection(section.id);
                                   }
-                                }}
-                                className="p-1 hover:bg-slate-700 text-slate-400 hover:text-rose-400 rounded"
-                                title="Delete Section"
-                              >
-                                <Trash2 className="w-3 h-3" />
-                              </button>
-                            )}
+                                });
+                              }}
+                              className="p-1 hover:bg-slate-700 text-slate-400 hover:text-rose-400 rounded"
+                              title="Delete Section"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
                           </div>
                         </div>
 
@@ -437,15 +535,34 @@ export const SidebarTree: React.FC = () => {
                                   >
                                     <div className="flex items-center gap-2 truncate">
                                       {/* Question Number Badge */}
-                                      <span
-                                        className={`px-1.5 py-0.5 rounded text-[10px] font-bold font-mono ${
-                                          isSelected
-                                            ? 'bg-white/20 text-white'
-                                            : 'bg-slate-800 text-slate-300'
-                                        }`}
-                                      >
-                                        Q{q.que}
-                                      </span>
+                                      {editingQId === q.id ? (
+                                        <input
+                                          type="number"
+                                          value={editingQVal}
+                                          autoFocus
+                                          onMouseDown={(e) => e.stopPropagation()}
+                                          onClick={(e) => e.stopPropagation()}
+                                          onChange={(e) => setEditingQVal(e.target.value)}
+                                          onBlur={() => handleCommitEditQue(q.id)}
+                                          onKeyDown={(e) => {
+                                            if (e.key === 'Enter') handleCommitEditQue(q.id);
+                                            if (e.key === 'Escape') setEditingQId(null);
+                                          }}
+                                          className="w-12 bg-slate-950 border border-indigo-400 rounded px-1 py-0.5 text-xs text-white font-mono text-center focus:outline-none z-20"
+                                        />
+                                      ) : (
+                                        <span
+                                          onClick={(e) => handleStartEditQue(q.id, q.que, e)}
+                                          className={`px-1.5 py-0.5 rounded text-[10px] font-bold font-mono cursor-pointer transition-all hover:scale-105 hover:ring-1 hover:ring-indigo-400 ${
+                                            isSelected
+                                              ? 'bg-white/20 text-white'
+                                              : 'bg-slate-800 text-slate-300'
+                                          }`}
+                                          title="Click to edit Question Number"
+                                        >
+                                          Q{q.que}
+                                        </span>
+                                      )}
 
                                       {/* Type Tag */}
                                       <span

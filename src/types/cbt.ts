@@ -14,6 +14,11 @@ export interface PdfDataPart {
   y1: number;
   x2: number;
   y2: number;
+  xmin?: number;
+  ymin?: number;
+  xmax?: number;
+  ymax?: number;
+  bounds?: number[];
   filename?: string; // e.g. "Chemistry Section 2__--__6__--__1.png"
 }
 

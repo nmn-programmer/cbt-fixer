@@ -147,7 +147,7 @@ interface CbtStoreState {
   future: HistoryEntry[];
 
   // Action methods
-  setActiveArchive: (archiveId: string) => void;
+  setActiveArchive: (archiveId: string | null) => void;
   addArchive: (archive: QuestionPaperArchive, makeActive?: boolean) => void;
   closeArchive: (archiveId: string) => void;
   reorderArchives: (fromIndex: number, toIndex: number) => void;
@@ -201,7 +201,8 @@ interface CbtStoreState {
     actionLabel?: string
   ) => void;
   applyMarkingPreset: (questionId: string, presetId: string) => void;
-  addQuestion: (sectionId: string, type?: QuestionType) => void;
+  addQuestion: (sectionId: string, type?: QuestionType, customQueNumber?: number) => void;
+  updateQuestionQue: (questionId: string, newQue: number) => void;
   deleteQuestion: (questionId: string) => void;
   duplicateQuestion: (questionId: string) => void;
   moveQuestion: (questionId: string, direction: 'up' | 'down') => void;
@@ -259,6 +260,16 @@ interface CbtStoreState {
   setSearchTerm: (term: string) => void;
   setFilterType: (filter: string) => void;
   setTheme: (theme: 'dark' | 'light' | 'cbt-high-contrast') => void;
+
+  confirmDialog: {
+    isOpen: boolean;
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    onCancel?: () => void;
+  } | null;
+  showConfirm: (props: { title: string; message: string; onConfirm: () => void; onCancel?: () => void }) => void;
+  hideConfirm: () => void;
 }
 
 export const useCbtStore = create<CbtStoreState>((set, get) => {
@@ -515,6 +526,12 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
     isMobileSidebarOpen: false,
     theme: 'dark',
 
+    confirmDialog: null,
+    showConfirm: (props) => set({ confirmDialog: { ...props, isOpen: true } }),
+    hideConfirm: () => set((state) => ({
+      confirmDialog: state.confirmDialog ? { ...state.confirmDialog, isOpen: false } : null
+    })),
+
     past: [],
     future: [],
 
@@ -725,12 +742,37 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       const updatedRawFiles = new Map(active.rawFiles);
 
       if (payload.mode === 'new_question') {
-        let targetSubj = active.subjects.find((s) => s.id === payload.subjectId) || active.subjects[0];
+        let targetSubj: any = undefined;
+        
+        if (payload.subjectId?.startsWith('new:')) {
+          targetSubj = { id: generateId(), name: payload.subjectId.replace('new:', ''), sections: [] };
+          active.subjects.push(targetSubj);
+        } else if (payload.subjectId) {
+          targetSubj = active.subjects.find((s) => s.id === payload.subjectId);
+        }
+        
+        if (!targetSubj) {
+          targetSubj = active.subjects[0];
+        }
+        
         if (!targetSubj) {
           targetSubj = { id: generateId(), name: 'General', sections: [] };
           active.subjects.push(targetSubj);
         }
-        let targetSec = targetSubj.sections.find((s) => s.id === payload.sectionId) || targetSubj.sections[0];
+
+        let targetSec: any = undefined;
+        
+        if (payload.sectionId?.startsWith('new:')) {
+          targetSec = { id: generateId(), name: payload.sectionId.replace('new:', ''), questions: [] };
+          targetSubj.sections.push(targetSec);
+        } else if (payload.sectionId) {
+          targetSec = targetSubj.sections.find((s: any) => s.id === payload.sectionId);
+        }
+        
+        if (!targetSec) {
+          targetSec = targetSubj.sections[0];
+        }
+        
         if (!targetSec) {
           targetSec = { id: generateId(), name: 'Section 1', questions: [] };
           targetSubj.sections.push(targetSec);
@@ -741,6 +783,61 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           (targetSec.questions.length > 0
             ? Math.max(...targetSec.questions.map((q) => q.que)) + 1
             : 1);
+            
+        const existingQuestion = targetSec.questions.find(q => q.que === nextQueNum);
+        
+        if (existingQuestion) {
+          const partIndex = (existingQuestion.imagesCount || existingQuestion.images?.length || 0) + 1;
+          const imageName = buildImageFileName(targetSec.name, nextQueNum, partIndex, 'png');
+          
+          updatedRawFiles.set(imageName, { blob: payload.blob, url: blobUrl, size: payload.blob.size });
+          
+          const updatedSubjects = active.subjects.map((sub) => {
+            if (sub.id !== targetSubj.id) return sub;
+            return {
+              ...sub,
+              sections: sub.sections.map((sec) => {
+                if (sec.id !== targetSec.id) return sec;
+                return {
+                  ...sec,
+                  questions: sec.questions.map((q) => {
+                    if (q.id === existingQuestion.id) {
+                      const newImagePart = {
+                        id: generateId(),
+                        partIndex,
+                        fileName: imageName,
+                        blobUrl,
+                        rawBlob: payload.blob,
+                        mimeType: 'image/png',
+                        sizeBytes: payload.blob.size,
+                      };
+                      return {
+                        ...q,
+                        images: [...q.images, newImagePart],
+                        pdfData: payload.pdfCoords ? [...(q.pdfData || []), { ...payload.pdfCoords, filename: imageName }] : (q.pdfData || []),
+                        imagesCount: partIndex
+                      };
+                    }
+                    return q;
+                  }),
+                };
+              }),
+            };
+          });
+
+          commitArchiveUpdate(
+            { ...active, subjects: updatedSubjects, rawFiles: updatedRawFiles },
+            `Add Part to Cropped Question Q${nextQueNum}`
+          );
+
+          set({
+            selectedSubjectId: targetSubj.id,
+            selectedSectionId: targetSec.id,
+            selectedQuestionId: existingQuestion.id,
+          });
+          return;
+        }
+
         const imageName = buildImageFileName(targetSec.name, nextQueNum, 1, 'png');
 
         updatedRawFiles.set(imageName, { blob: payload.blob, url: blobUrl, size: payload.blob.size });
@@ -844,7 +941,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                   });
                 }
 
-                const updatedPdfData = q.pdfData.map((part, idx) =>
+                const updatedPdfData = (q.pdfData || []).map((part, idx) =>
                   idx === targetPartIdx - 1 && payload.pdfCoords
                     ? { ...payload.pdfCoords, filename: targetFileName }
                     : part
@@ -858,7 +955,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                       ? updatedPdfData
                       : payload.pdfCoords
                       ? [{ ...payload.pdfCoords, filename: targetFileName }]
-                      : q.pdfData,
+                      : (q.pdfData || []),
                 };
               }
               return q;
@@ -937,8 +1034,8 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                   ...q,
                   images: [...q.images, newImage],
                   pdfData: payload.pdfCoords
-                    ? [...q.pdfData, { ...payload.pdfCoords, filename: targetFileName }]
-                    : q.pdfData,
+                    ? [...(q.pdfData || []), { ...payload.pdfCoords, filename: targetFileName }]
+                    : (q.pdfData || []),
                 };
               }
               return q;
@@ -981,8 +1078,20 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       commitArchiveUpdate({ ...active, subjects: updatedSubjects }, 'Clear All Question Answers');
     },
 
-    setActiveArchive: (archiveId: string) => {
+    setActiveArchive: (archiveId: string | null) => {
       const state = get();
+      if (archiveId === null) {
+        set({
+          activeArchiveId: null,
+          selectedSubjectId: null,
+          selectedSectionId: null,
+          selectedQuestionId: null,
+          diagnostics: [],
+          past: [],
+          future: [],
+        });
+        return;
+      }
       const target = state.archives.find((a) => a.id === archiveId);
       if (!target) return;
 
@@ -1336,7 +1445,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       );
     },
 
-    addQuestion: (sectionId: string, type: QuestionType = 'mcq') => {
+    addQuestion: (sectionId: string, type: QuestionType = 'mcq', customQueNumber?: number) => {
       const state = get();
       const active = state.archives.find((a) => a.id === state.activeArchiveId);
       if (!active) return;
@@ -1344,13 +1453,33 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       let newQId = generateId();
       let parentSubId = '';
 
+      // Check if duplicate exists
+      if (customQueNumber !== undefined) {
+        let isDuplicate = false;
+        active.subjects.forEach((sub) => {
+          sub.sections.forEach((sec) => {
+            if (sec.id === sectionId && sec.questions.some((q) => q.que === customQueNumber)) {
+              isDuplicate = true;
+            }
+          });
+        });
+
+        if (isDuplicate) {
+          state.addToast({
+            title: 'Duplicate Question Number',
+            description: `⚠️ Warning: Question number ${customQueNumber} already exists in this section!`,
+            type: 'warning',
+          });
+        }
+      }
+
       const updatedSubjects = active.subjects.map((sub) => ({
         ...sub,
         sections: sub.sections.map((sec) => {
           if (sec.id === sectionId) {
             parentSubId = sub.id;
             const maxQue = sec.questions.reduce((max, q) => Math.max(max, q.que), 0);
-            const nextQue = maxQue + 1;
+            const nextQue = customQueNumber !== undefined && !isNaN(customQueNumber) ? customQueNumber : maxQue + 1;
             const defaultMarks: MarksScheme =
               type === 'msq'
                 ? { cm: 4, im: -2, pm: 1, max: 4 }
@@ -1371,7 +1500,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
 
             return {
               ...sec,
-              questions: [...sec.questions, newQuestion],
+              questions: [...sec.questions, newQuestion].sort((a, b) => a.que - b.que),
             };
           }
           return sec;
@@ -1384,6 +1513,52 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
         selectedSectionId: sectionId,
         selectedQuestionId: newQId,
       });
+    },
+
+    updateQuestionQue: (questionId: string, newQue: number) => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active || isNaN(newQue)) return;
+
+      // Check if duplicate exists in the same subject/sections
+      let isDuplicate = false;
+      active.subjects.forEach((sub) => {
+        sub.sections.forEach((sec) => {
+          if (sec.questions.some((q) => q.que === newQue && q.id !== questionId)) {
+            isDuplicate = true;
+          }
+        });
+      });
+
+      if (isDuplicate) {
+        state.addToast({
+          title: 'Duplicate Question Number',
+          description: `⚠️ Warning: Question number ${newQue} already exists in this paper!`,
+          type: 'warning',
+        });
+      }
+
+      const updatedSubjects = active.subjects.map((sub) => ({
+        ...sub,
+        sections: sub.sections.map((sec) => {
+          const hasQ = sec.questions.some((q) => q.id === questionId);
+          if (!hasQ) return sec;
+
+          const updatedQuestions = sec.questions.map((q) => {
+            if (q.id === questionId) {
+              return { ...q, que: newQue, key: String(newQue) };
+            }
+            return q;
+          }).sort((a, b) => a.que - b.que);
+
+          return {
+            ...sec,
+            questions: updatedQuestions,
+          };
+        }),
+      }));
+
+      commitArchiveUpdate({ ...active, subjects: updatedSubjects }, `Update Question Q# to ${newQue}`);
     },
 
     deleteQuestion: (questionId: string) => {
@@ -1450,7 +1625,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
               key: `${newQue}`,
               que: newQue,
               images: [...targetQ.images],
-              pdfData: [...targetQ.pdfData],
+              pdfData: [...(targetQ.pdfData || [])],
             };
 
             const updatedList = [...sec.questions];
@@ -1895,7 +2070,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
               return {
                 ...q,
                 images: [...q.images, newImage],
-                pdfData: [...q.pdfData, newPdfPart],
+                pdfData: [...(q.pdfData || []), newPdfPart],
               };
             }
             return q;
@@ -1963,7 +2138,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                 .filter((img) => img.partIndex !== partIndex)
                 .map((img, idx) => ({ ...img, partIndex: idx + 1 }));
 
-              const filteredPdfData = q.pdfData
+              const filteredPdfData = (q.pdfData || [])
                 .filter((_, idx) => idx + 1 !== partIndex)
                 .map((part, idx) => ({
                   ...part,
@@ -2001,7 +2176,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                 fileName: buildImageFileName(sec.name, q.que, idx + 1, 'png'),
               }));
 
-              const pdfData = [...q.pdfData];
+              const pdfData = [...(q.pdfData || [])];
               if (pdfData.length === images.length) {
                 const [movedPdf] = pdfData.splice(fromIndex, 1);
                 pdfData.splice(toIndex, 0, movedPdf);

@@ -11,6 +11,7 @@ import {
   Key,
   Plus,
   Sparkles,
+  Upload,
   Wand2,
 } from 'lucide-react';
 import { useCbtStore } from '../store/useCbtStore';
@@ -21,13 +22,28 @@ import {
   mergeMultipleAnswerKeys,
   parseAnswerKeyPayload,
 } from '../utils/answerKeyManager';
+import {
+  exportApiKeysJson,
+  getStoredPrimaryApiKey,
+  importApiKeysFromJson,
+} from '../utils/geminiKeyManager';
 
 export const ImportDropzone: React.FC = () => {
-  const { addArchive, loadSample, createNewPaper, setAnswerKeyModalOpen, addToast } = useCbtStore();
+  const {
+    addArchive,
+    loadSample,
+    createNewPaper,
+    setAnswerKeyModalOpen,
+    addToast,
+    geminiApiKey,
+    setGeminiApiKey,
+    fallbackApiKeys,
+  } = useCbtStore();
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [loadingStatus, setLoadingStatus] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const apiKeyJsonInputRef = useRef<HTMLInputElement>(null);
 
   const processFiles = async (files: FileList | File[]) => {
     if (!files || files.length === 0) return;
@@ -289,6 +305,111 @@ export const ImportDropzone: React.FC = () => {
                 </div>
               </div>
             </button>
+          </div>
+        </div>
+
+        {/* Embedded Gemini API Key Management Section */}
+        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 sm:p-5 space-y-4 shadow-xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+                <Key className="w-4 h-4" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-slate-200">Gemini API Key & Pool Settings</h3>
+                <p className="text-[11px] text-slate-400">Manage API keys, backup pools, and JSON import/export</p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="file"
+                ref={apiKeyJsonInputRef}
+                accept=".json"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = (ev) => {
+                    const text = ev.target?.result as string;
+                    if (!text) return;
+                    const res = importApiKeysFromJson(text);
+                    if (res.success) {
+                      const primary = getStoredPrimaryApiKey();
+                      useCbtStore.getState().setGeminiApiKey(primary);
+                      useCbtStore.getState().refreshUsageMetrics();
+                      addToast({
+                        title: 'API Keys Imported!',
+                        description: `Imported ${res.importedCount} keys. First key (${res.primaryKeyMasked}) set as active!`,
+                        type: 'success',
+                      });
+                    } else {
+                      addToast({ title: 'Import Failed', description: res.error || 'Invalid JSON file', type: 'error' });
+                    }
+                  };
+                  reader.readAsText(file);
+                  if (e.target) e.target.value = '';
+                }}
+                className="hidden"
+              />
+              <button
+                onClick={() => apiKeyJsonInputRef.current?.click()}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 transition-colors"
+                title="Import API Key JSON file"
+              >
+                <Upload className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Import JSON</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  const jsonStr = exportApiKeysJson();
+                  const blob = new Blob([jsonStr], { type: 'application/json' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `gemini_api_keys_${new Date().toISOString().slice(0, 10)}.json`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  addToast({ title: 'Keys Exported', description: 'API Key pool exported to JSON.', type: 'success' });
+                }}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg border border-slate-700 transition-colors"
+                title="Export API Key JSON file"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Export JSON</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-semibold text-slate-400 mb-1">Active Primary Gemini API Key</label>
+              <div className="relative">
+                <input
+                  type="password"
+                  value={geminiApiKey}
+                  onChange={(e) => setGeminiApiKey(e.target.value)}
+                  placeholder="Enter Gemini API Key (AIzaSy...)"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-end justify-between p-2.5 bg-slate-950 rounded-xl border border-slate-800">
+              <div>
+                <div className="text-[10px] text-slate-400 font-semibold uppercase">API Pool Status</div>
+                <div className="text-xs font-bold text-slate-200 mt-0.5">
+                  {fallbackApiKeys.length} Backup Keys Configured
+                </div>
+              </div>
+              <button
+                onClick={() => window.dispatchEvent(new CustomEvent('open-settings'))}
+                className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold underline"
+              >
+                Open Full Key Manager →
+              </button>
+            </div>
           </div>
         </div>
       </div>

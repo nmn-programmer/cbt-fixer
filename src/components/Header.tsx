@@ -9,6 +9,7 @@ import { Settings,
   FileArchive,
   FilePlus,
   FolderOpen,
+  Home,
   Key,
   Layers,
   Moon,
@@ -55,6 +56,7 @@ export const Header: React.FC = () => {
     theme,
     setTheme,
     addToast,
+    showConfirm,
   } = useCbtStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -102,26 +104,34 @@ export const Header: React.FC = () => {
     if (!arc) return;
 
     if (arc.isDirty) {
-      const confirmed = window.confirm(
-        `⚠️ UNSAVED CHANGES WARNING:\n\nYou have unsaved modifications in '${arc.fileName}'.\nClosing this tab without exporting will discard your changes.\n\nAre you sure you want to close this tab?`
-      );
-      if (!confirmed) return;
+      showConfirm({
+        title: 'Close Tab',
+        message: `⚠️ UNSAVED CHANGES WARNING:\n\nYou have unsaved modifications in '${arc.fileName}'.\nClosing this tab without exporting will discard your changes.\n\nAre you sure you want to close this tab?`,
+        onConfirm: () => {
+          closeArchive(archiveId);
+        }
+      });
+    } else {
+      closeArchive(archiveId);
     }
-    closeArchive(archiveId);
   };
 
   // Close other tabs
   const handleCloseOthers = (archiveId: string) => {
     const otherDirty = archives.filter((a) => a.id !== archiveId && a.isDirty);
     if (otherDirty.length > 0) {
-      const confirmed = window.confirm(
-        `⚠️ UNSAVED CHANGES WARNING:\n\n${otherDirty.length} of the other open tabs contain unsaved modifications (${otherDirty
+      showConfirm({
+        title: 'Close Other Tabs',
+        message: `⚠️ UNSAVED CHANGES WARNING:\n\n${otherDirty.length} of the other open tabs contain unsaved modifications (${otherDirty
           .map((a) => a.fileName)
-          .join(', ')}).\n\nAre you sure you want to close all other tabs and discard their unsaved changes?`
-      );
-      if (!confirmed) return;
+          .join(', ')}).\n\nAre you sure you want to close all other tabs and discard their unsaved changes?`,
+        onConfirm: () => {
+          closeOtherArchives(archiveId);
+        }
+      });
+    } else {
+      closeOtherArchives(archiveId);
     }
-    closeOtherArchives(archiveId);
   };
 
   // Close tabs to right
@@ -132,27 +142,38 @@ export const Header: React.FC = () => {
     const rightDirty = rightTabs.filter((a) => a.isDirty);
 
     if (rightDirty.length > 0) {
-      const confirmed = window.confirm(
-        `⚠️ UNSAVED CHANGES WARNING:\n\n${rightDirty.length} of the tabs to the right contain unsaved modifications.\n\nAre you sure you want to close them?`
-      );
-      if (!confirmed) return;
+      showConfirm({
+        title: 'Close Tabs to Right',
+        message: `⚠️ UNSAVED CHANGES WARNING:\n\n${rightDirty.length} of the tabs to the right contain unsaved modifications.\n\nAre you sure you want to close them?`,
+        onConfirm: () => {
+          closeTabsToRight(archiveId);
+        }
+      });
+    } else {
+      closeTabsToRight(archiveId);
     }
-    closeTabsToRight(archiveId);
   };
 
   // Close all tabs
   const handleCloseAll = () => {
     const dirtyTabs = archives.filter((a) => a.isDirty);
     if (dirtyTabs.length > 0) {
-      const confirmed = window.confirm(
-        `⚠️ UNSAVED CHANGES WARNING:\n\n${dirtyTabs.length} open paper tabs contain unsaved modifications.\nClosing all tabs will discard all unsaved edits.\n\nAre you sure you want to close all tabs?`
-      );
-      if (!confirmed) return;
+      showConfirm({
+        title: 'Close All Tabs',
+        message: `⚠️ UNSAVED CHANGES WARNING:\n\n${dirtyTabs.length} open paper tabs contain unsaved modifications.\nClosing all tabs will discard all unsaved edits.\n\nAre you sure you want to close all tabs?`,
+        onConfirm: () => {
+          closeAllArchives();
+        }
+      });
     } else {
-      const confirmed = window.confirm('Are you sure you want to close all open paper tabs?');
-      if (!confirmed) return;
+      showConfirm({
+        title: 'Close All Tabs',
+        message: 'Are you sure you want to close all open paper tabs?',
+        onConfirm: () => {
+          closeAllArchives();
+        }
+      });
     }
-    closeAllArchives();
   };
 
   // Tab Context Menu trigger
@@ -414,85 +435,97 @@ export const Header: React.FC = () => {
       </div>
 
       {/* Multi-Tab Archive Strip with Drag & Drop Reordering */}
-      {archives.length > 0 && (
-        <div className="flex items-center justify-between px-2 pt-1 border-t border-slate-800/80 bg-slate-950 overflow-x-auto scrollbar-thin">
-          <div className="flex items-center gap-1 overflow-x-auto">
-            {archives.map((archive, index) => {
-              const isActive = archive.id === activeArchiveId;
-              return (
-                <div
-                  key={archive.id}
-                  draggable
-                  onDragStart={() => {
-                    dragItemIndexRef.current = index;
-                  }}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    if (dragItemIndexRef.current !== null && dragItemIndexRef.current !== index) {
-                      reorderArchives(dragItemIndexRef.current, index);
-                      dragItemIndexRef.current = null;
-                    }
-                  }}
-                  onClick={() => setActiveArchive(archive.id)}
-                  onContextMenu={(e) => handleTabContextMenu(e, archive.id)}
-                  className={`group flex items-center gap-2 px-3 py-1.5 text-xs rounded-t-md cursor-pointer transition-all border-t-2 border-x select-none ${
-                    isActive
-                      ? 'bg-slate-900 border-t-indigo-500 border-x-slate-800 text-slate-100 font-medium shadow-md'
-                      : 'bg-slate-950/60 border-t-transparent border-x-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/50'
-                  }`}
-                  title={`${archive.fileName}${archive.isDirty ? ' (Unsaved changes)' : ''} - Right click for options / Drag to reorder`}
-                >
-                  <FileArchive
-                    className={`w-3.5 h-3.5 shrink-0 ${
-                      isActive ? 'text-indigo-400' : 'text-slate-500 group-hover:text-slate-400'
-                    }`}
-                  />
-                  <span className="max-w-[140px] sm:max-w-[200px] truncate">{archive.fileName}</span>
-
-                  {archive.isDirty && (
-                    <span
-                      className="w-2 h-2 rounded-full bg-amber-400 shrink-0 animate-pulse"
-                      title="Unsaved changes in workspace"
-                    />
-                  )}
-
-                  {/* Single tab close button with confirmation */}
-                  <button
-                    onClick={(e) => handleCloseSingleTab(archive.id, e)}
-                    className="p-0.5 rounded hover:bg-slate-800 text-slate-500 hover:text-slate-300 opacity-60 group-hover:opacity-100 transition-opacity ml-1"
-                    title="Close tab (Confirm if unsaved)"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                </div>
-              );
-            })}
-
-            <button
-              onClick={() => createNewPaper()}
-              className="p-1 text-slate-500 hover:text-slate-300 hover:bg-slate-800 rounded transition-colors mb-1 ml-1"
-              title="Create new blank paper tab"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
+      <div className="flex items-center justify-between px-2 pt-1 border-t border-slate-800/80 bg-slate-950 overflow-x-auto scrollbar-thin">
+        <div className="flex items-center gap-1 overflow-x-auto">
+          {/* Homepage Tab */}
+          <div
+            onClick={() => setActiveArchive(null)}
+            className={`group flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-t-md cursor-pointer transition-all border-t-2 border-x select-none ${
+              activeArchiveId === null
+                ? 'bg-slate-900 border-t-indigo-500 border-x-slate-800 text-slate-100 font-medium shadow-md'
+                : 'bg-slate-950/60 border-t-transparent border-x-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/50'
+            }`}
+            title="Application Homepage & Import"
+          >
+            <Home className={`w-3.5 h-3.5 shrink-0 ${activeArchiveId === null ? 'text-indigo-400' : 'text-slate-500 group-hover:text-slate-400'}`} />
+            <span>Home</span>
           </div>
 
-          {/* Quick Close All Action */}
-          {archives.length > 1 && (
-            <button
-              onClick={handleCloseAll}
-              className="hidden sm:flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-500 hover:text-rose-300 hover:bg-rose-950/50 rounded transition-colors mb-1 shrink-0"
-              title="Close all open tabs"
-            >
-              <X className="w-3 h-3" />
-              <span>Close All</span>
-            </button>
-          )}
+          {archives.map((archive, index) => {
+            const isActive = archive.id === activeArchiveId;
+            return (
+              <div
+                key={archive.id}
+                draggable
+                onDragStart={() => {
+                  dragItemIndexRef.current = index;
+                }}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (dragItemIndexRef.current !== null && dragItemIndexRef.current !== index) {
+                    reorderArchives(dragItemIndexRef.current, index);
+                    dragItemIndexRef.current = null;
+                  }
+                }}
+                onClick={() => setActiveArchive(archive.id)}
+                onContextMenu={(e) => handleTabContextMenu(e, archive.id)}
+                className={`group flex items-center gap-2 px-3 py-1.5 text-xs rounded-t-md cursor-pointer transition-all border-t-2 border-x select-none ${
+                  isActive
+                    ? 'bg-slate-900 border-t-indigo-500 border-x-slate-800 text-slate-100 font-medium shadow-md'
+                    : 'bg-slate-950/60 border-t-transparent border-x-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/50'
+                }`}
+                title={`${archive.fileName}${archive.isDirty ? ' (Unsaved changes)' : ''} - Right click for options / Drag to reorder`}
+              >
+                <FileArchive
+                  className={`w-3.5 h-3.5 shrink-0 ${
+                    isActive ? 'text-indigo-400' : 'text-slate-500 group-hover:text-slate-400'
+                  }`}
+                />
+                <span className="max-w-[140px] sm:max-w-[200px] truncate">{archive.fileName}</span>
+
+                {archive.isDirty && (
+                  <span
+                    className="w-2 h-2 rounded-full bg-amber-400 shrink-0 animate-pulse"
+                    title="Unsaved changes in workspace"
+                  />
+                )}
+
+                {/* Single tab close button with confirmation */}
+                <button
+                  onClick={(e) => handleCloseSingleTab(archive.id, e)}
+                  className="p-0.5 rounded hover:bg-slate-800 text-slate-500 hover:text-slate-300 opacity-60 group-hover:opacity-100 transition-opacity ml-1"
+                  title="Close tab (Confirm if unsaved)"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            );
+          })}
+
+          <button
+            onClick={() => setActiveArchive(null)}
+            className="p-1 text-slate-400 hover:text-indigo-300 hover:bg-slate-800 rounded transition-colors mb-1 ml-1"
+            title="Open Homepage"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
         </div>
-      )}
+
+        {/* Quick Close All Action */}
+        {archives.length > 1 && (
+          <button
+            onClick={handleCloseAll}
+            className="hidden sm:flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-500 hover:text-rose-300 hover:bg-rose-950/50 rounded transition-colors mb-1 shrink-0"
+            title="Close all open tabs"
+          >
+            <X className="w-3 h-3" />
+            <span>Close All</span>
+          </button>
+        )}
+      </div>
 
       {/* Floating Right-Click Tab Context Menu */}
       {contextMenu && (

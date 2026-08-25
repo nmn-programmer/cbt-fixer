@@ -209,12 +209,25 @@ export async function parseZipArchive(
     });
   }
 
+  // Ensure source PDF and answer key detection in rawFilesMap
+  let sourcePdfName = parsedJson.sourcePdfName || 'source_document.pdf';
+  for (const [pKey, pVal] of rawFilesMap.entries()) {
+    if (pKey.toLowerCase().endsWith('.pdf')) {
+      sourcePdfName = pKey;
+      if (!rawFilesMap.has('source_document.pdf')) {
+        rawFilesMap.set('source_document.pdf', pVal);
+      }
+      break;
+    }
+  }
+
   const archive: QuestionPaperArchive = {
     id: generateId(),
     fileName,
     title: parsedJson.testConfig?.title || parsedJson.metadata?.testTitle || fileName.replace(/\.[^/.]+$/, ''),
     format,
     metadata: {
+      sourcePdfName,
       pdfFileHash: parsedJson.testConfig?.pdfFileHash || parsedJson.metadata?.pdfFileHash || '',
       additionalData: parsedJson.testConfig?.additionalData || parsedJson.metadata?.additionalData || {},
       appVersion: parsedJson.appVersion || '2.6.0',

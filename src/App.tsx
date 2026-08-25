@@ -18,6 +18,7 @@ import { AiQuestionRepairModal } from './components/AiQuestionRepairModal';
 import { SettingsModal } from './components/SettingsModal';
 import { ToastContainer } from './components/ToastContainer';
 import { FloatingBgTaskWidget } from './components/FloatingBgTaskWidget';
+import { ConfirmDialog } from './components/ConfirmDialog';
 
 export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = React.useState(false);
@@ -114,6 +115,7 @@ export default function App() {
       <PdfRecropModal />
       <AiQuestionRepairModal />
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+      <ConfirmDialog />
 
       {/* Draggable & Pinned Floating Question Image Previewer */}
       <FloatingQuestionPreview />

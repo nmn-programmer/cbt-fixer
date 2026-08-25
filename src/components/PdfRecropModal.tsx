@@ -30,7 +30,8 @@ import {
   ArrowRightCircle,
   ImagePlus,
   CheckCheck,
-  HelpCircle
+  HelpCircle,
+  Image as ImageIcon
 } from 'lucide-react';
 import { getPdfjsLib } from '../utils/pdfWorkerConfig';
 
@@ -240,13 +241,19 @@ export const PdfRecropModal: React.FC = () => {
   const [previewUrlB, setPreviewUrlB] = useState<string>('');
   const [previewUrlStitched, setPreviewUrlStitched] = useState<string>('');
 
+  const [sourceMode, setSourceMode] = useState<'pdf' | 'image'>('pdf');
+  const [showNewSubjectInput, setShowNewSubjectInput] = useState<boolean>(false);
+  const [newSubjectName, setNewSubjectName] = useState<string>('');
+  const [showNewSectionInput, setShowNewSectionInput] = useState<boolean>(false);
+  const [newSectionName, setNewSectionName] = useState<string>('');
+
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeRenderTaskRef = useRef<any>(null);
 
   // Load question properties & crop coordinates for a given index
-  const selectQuestionByIndex = useCallback((idx: number) => {
+  const selectQuestionByIndex = useCallback((idx: number, targetPartIdx: number = 1) => {
     if (idx < 0 || idx >= allQuestionsList.length) return;
     setActiveQIndex(idx);
     const q = allQuestionsList[idx];
@@ -280,7 +287,8 @@ export const PdfRecropModal: React.FC = () => {
 
     // Check pdfData or images for page & crop box
     if (q.pdfData && q.pdfData.length > 0) {
-      const p1 = q.pdfData[0];
+      const partIdxToLoad = Math.max(0, Math.min(targetPartIdx - 1, q.pdfData.length - 1));
+      const p1 = q.pdfData[partIdxToLoad];
       const pNum = p1.page || p1.pageNumber || (p1 as any).pageIndex || 1;
       setCurrentPage(pNum);
 
@@ -291,7 +299,8 @@ export const PdfRecropModal: React.FC = () => {
         setBoxA({ ymin: 0.1, xmin: 0.05, ymax: 0.4, xmax: 0.95 });
       }
 
-      if (q.pdfData.length >= 2) {
+      // If targetMode is stitch and we have another part available, load it into B
+      if (useCbtStore.getState().recropTarget?.mode === 'stitch' && q.pdfData.length >= 2) {
         setIsMultiRegion(true);
         const p2 = q.pdfData[1];
         setPageB(p2.page || p2.pageNumber || (p2 as any).pageIndex || pNum);
@@ -335,7 +344,23 @@ export const PdfRecropModal: React.FC = () => {
         if (foundIdx !== -1) targetIdx = foundIdx;
       }
 
-      selectQuestionByIndex(targetIdx);
+      selectQuestionByIndex(targetIdx, recropTarget?.partIndex || 1);
+
+      if (recropTarget?.mode === 'new_question') {
+        const state = useCbtStore.getState();
+        const activeSubId = recropTarget.subjectId || state.selectedSubjectId || activeArchive.subjects[0]?.id || '';
+        const activeSecId = recropTarget.sectionId || state.selectedSectionId || activeArchive.subjects.find(s => s.id === activeSubId)?.sections[0]?.id || '';
+        const sec = activeArchive.subjects.find(s => s.id === activeSubId)?.sections.find(sc => sc.id === activeSecId);
+        const nextQ = sec ? (sec.questions.length > 0 ? Math.max(...sec.questions.map(q => q.que)) + 1 : 1) : 1;
+        
+        setNewQProps({
+          que: nextQ,
+          type: 'mcq',
+          subjectId: activeSubId,
+          sectionId: activeSecId,
+          answerOptions: ''
+        });
+      }
 
       // Detect if source PDF already exists in archive rawFiles
       let foundPdf: Blob | null = null;
@@ -551,9 +576,56 @@ export const PdfRecropModal: React.FC = () => {
     }
   }, [pdfDoc, currentPage, pageB, activeRegion, scale, generateLivePreview]);
 
+  // Render current question's existing image to canvas
+  const renderCurrentImage = useCallback(async () => {
+    if (!canvasRef.current) return;
+    const currentQ = allQuestionsList[activeQIndex];
+    if (!currentQ || !currentQ.images || currentQ.images.length === 0) return;
+
+    setRenderingPage(true);
+    try {
+      const partIdx = recropTarget?.partIndex || 1;
+      const imgData = currentQ.images.find(img => img.partIndex === partIdx) || currentQ.images[0];
+      if (!imgData || !imgData.blobUrl) {
+        setRenderingPage(false);
+        return;
+      }
+
+      const img = new Image();
+      img.src = imgData.blobUrl;
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+      });
+
+      const dpr = window.devicePixelRatio || 1.5;
+      const canvas = canvasRef.current;
+      canvas.width = img.width;
+      canvas.height = img.height;
+      canvas.style.width = `${img.width / dpr}px`;
+      canvas.style.height = `${img.height / dpr}px`;
+
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        generateLivePreview();
+      }
+    } catch (err) {
+      console.error("Error rendering current question image onto canvas:", err);
+    } finally {
+      setRenderingPage(false);
+    }
+  }, [allQuestionsList, activeQIndex, recropTarget, generateLivePreview]);
+
   useEffect(() => {
-    renderCurrentPage();
-  }, [renderCurrentPage]);
+    if (sourceMode === 'image') {
+      renderCurrentImage();
+    } else {
+      renderCurrentPage();
+    }
+  }, [renderCurrentPage, renderCurrentImage, sourceMode]);
 
   // Keep live crop preview updated whenever boxes or options change
   useEffect(() => {
@@ -568,6 +640,82 @@ export const PdfRecropModal: React.FC = () => {
   // Helper to extract a crop box from a given page into a canvas
   const cropBoxFromPage = useCallback(
     async (pageIndex: number, box: BoxCoord): Promise<HTMLCanvasElement | null> => {
+      if (sourceMode === 'image') {
+        const currentQ = allQuestionsList[activeQIndex];
+        if (!currentQ || !currentQ.images || currentQ.images.length === 0) return null;
+        try {
+          const partIdx = recropTarget?.partIndex || 1;
+          const imgData = currentQ.images.find(img => img.partIndex === partIdx) || currentQ.images[0];
+          if (!imgData || !imgData.blobUrl) return null;
+
+          const img = new Image();
+          img.src = imgData.blobUrl;
+          await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = reject;
+          });
+
+          const ymin = Math.max(0, Math.min(1, Math.min(box.ymin, box.ymax)));
+          const ymax = Math.max(0, Math.min(1, Math.max(box.ymin, box.ymax)));
+          const xmin = Math.max(0, Math.min(1, Math.min(box.xmin, box.xmax)));
+          const xmax = Math.max(0, Math.min(1, Math.max(box.xmin, box.xmax)));
+
+          const pxX = Math.floor(xmin * img.width);
+          const pxY = Math.floor(ymin * img.height);
+          const pxW = Math.max(10, Math.ceil((xmax - xmin) * img.width));
+          const pxH = Math.max(10, Math.ceil((ymax - ymin) * img.height));
+
+          const cropCanvas = document.createElement('canvas');
+          cropCanvas.width = pxW;
+          cropCanvas.height = pxH;
+          const cropCtx = cropCanvas.getContext('2d');
+          if (!cropCtx) return null;
+
+          cropCtx.imageSmoothingEnabled = true;
+          cropCtx.imageSmoothingQuality = 'high';
+          cropCtx.fillStyle = '#FFFFFF';
+          cropCtx.fillRect(0, 0, pxW, pxH);
+          cropCtx.drawImage(img, pxX, pxY, pxW, pxH, 0, 0, pxW, pxH);
+
+          // Apply Image Clean / Enhancement filters
+          if (autoWhiten || sharpenText) {
+            const imgData = cropCtx.getImageData(0, 0, pxW, pxH);
+            const data = imgData.data;
+            for (let i = 0; i < data.length; i += 4) {
+              const r = data[i];
+              const g = data[i + 1];
+              const b = data[i + 2];
+              const avg = (r + g + b) / 3;
+
+              if (autoWhiten) {
+                if (avg > 210) {
+                  const factor = Math.min(1, (avg - 210) / 42);
+                  data[i] = Math.min(255, Math.round(r + (255 - r) * factor));
+                  data[i + 1] = Math.min(255, Math.round(g + (255 - g) * factor));
+                  data[i + 2] = Math.min(255, Math.round(b + (255 - b) * factor));
+                }
+              }
+
+              if (sharpenText) {
+                if (avg < 130) {
+                  const factor = (130 - avg) / 130;
+                  const boost = Math.round(28 * factor);
+                  data[i] = Math.max(0, r - boost);
+                  data[i + 1] = Math.max(0, g - boost);
+                  data[i + 2] = Math.max(0, b - boost);
+                }
+              }
+            }
+            cropCtx.putImageData(imgData, 0, 0);
+          }
+
+          return cropCanvas;
+        } catch (e) {
+          console.error("Error cropping box from image:", e);
+          return null;
+        }
+      }
+
       if (!pdfDoc) return null;
       try {
         const page = await pdfDoc.getPage(pageIndex);
@@ -878,7 +1026,7 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
 
   // Save Crop logic (with optional autoAdvance)
   const handleSaveCrop = async (autoAdvance: boolean = false) => {
-    if (!pdfDoc) return;
+    if (!pdfDoc && sourceMode !== 'image') return;
 
     let finalCanvas: HTMLCanvasElement | null = null;
     let targetPage = currentPage;
@@ -930,9 +1078,14 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
         bounds: [targetBox.xmin, targetBox.ymin, targetBox.xmax - targetBox.xmin, targetBox.ymax - targetBox.ymin],
       };
 
+      const currentQ = allQuestionsList[activeQIndex];
+      const computedPartIdx = targetMode === 'add_part' 
+        ? ((currentQ?.imagesCount || currentQ?.images?.length || 0) + 1)
+        : (recropTarget?.partIndex || 1);
+
       await applyCroppedImage({
         questionId: targetQId,
-        partIndex: recropTarget?.partIndex || 1,
+        partIndex: computedPartIdx,
         mode: targetMode,
         blob,
         sectionId: newQProps.sectionId || currentQ?.sectionId || recropTarget?.sectionId,
@@ -1159,56 +1312,92 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
             <div className="flex-1 flex flex-col min-w-0 bg-slate-950 border-r border-slate-800 overflow-hidden">
               {/* PDF Page Bar & AI Auto-Detect */}
               <div className="flex flex-wrap items-center justify-between px-3 py-2 bg-slate-900 border-b border-slate-800 gap-2 text-xs">
-                {/* Page Navigation */}
-                <div className="flex items-center gap-1.5">
-                  <button
-                    onClick={() => {
-                      if (activeRegion === 'A') {
-                        setCurrentPage((p) => Math.max(1, p - 1));
-                      } else {
-                        setPageB((p) => Math.max(1, p - 1));
-                      }
-                    }}
-                    disabled={(activeRegion === 'A' ? currentPage : pageB) <= 1}
-                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300"
-                  >
-                    <ChevronLeft className="w-4 h-4" />
-                  </button>
-
-                  <div className="flex items-center gap-1 font-mono text-slate-200 font-semibold px-2">
-                    <span>Page</span>
-                    <select
-                      value={activeRegion === 'A' ? currentPage : pageB}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value, 10);
-                        if (activeRegion === 'A') setCurrentPage(val);
-                        else setPageB(val);
-                      }}
-                      className="bg-slate-950 border border-slate-700 rounded px-2 py-0.5 text-xs text-white"
+                {/* Source Selection Toggle */}
+                {currentQ && currentQ.images && currentQ.images.length > 0 && (
+                  <div className="flex items-center bg-slate-950 rounded-lg p-0.5 border border-slate-800 shrink-0">
+                    <button
+                      onClick={() => setSourceMode('pdf')}
+                      className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
+                        sourceMode === 'pdf'
+                          ? 'bg-indigo-600 text-white'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                      disabled={!pdfDoc}
+                      title={!pdfDoc ? "Please load a PDF first to crop from PDF" : "Crop from original PDF"}
                     >
-                      {Array.from({ length: totalPages }, (_, i) => i + 1).map((pg) => (
-                        <option key={pg} value={pg}>
-                          {pg}
-                        </option>
-                      ))}
-                    </select>
-                    <span>of {totalPages}</span>
+                      Original PDF
+                    </button>
+                    <button
+                      onClick={() => setSourceMode('image')}
+                      className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
+                        sourceMode === 'image'
+                          ? 'bg-indigo-600 text-white'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                      title="Crop/Split from existing Question Image"
+                    >
+                      Question Image
+                    </button>
                   </div>
+                )}
 
-                  <button
-                    onClick={() => {
-                      if (activeRegion === 'A') {
-                        setCurrentPage((p) => Math.min(totalPages, p + 1));
-                      } else {
-                        setPageB((p) => Math.min(totalPages, p + 1));
-                      }
-                    }}
-                    disabled={(activeRegion === 'A' ? currentPage : pageB) >= totalPages}
-                    className="p-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300"
-                  >
-                    <ChevronRight className="w-4 h-4" />
-                  </button>
-                </div>
+                {/* Page Navigation or Image Mode Text */}
+                {sourceMode === 'image' ? (
+                  <div className="flex items-center gap-1.5 text-slate-400 font-medium">
+                    <ImageIcon className="w-4 h-4 text-indigo-400" />
+                    <span>Cropping from existing Question Image (Part {recropTarget?.partIndex || 1})</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => {
+                        if (activeRegion === 'A') {
+                          setCurrentPage((p) => Math.max(1, p - 1));
+                        } else {
+                          setPageB((p) => Math.max(1, p - 1));
+                        }
+                      }}
+                      disabled={(activeRegion === 'A' ? currentPage : pageB) <= 1}
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300"
+                    >
+                      <ChevronLeft className="w-4 h-4" />
+                    </button>
+
+                    <div className="flex items-center gap-1 font-mono text-slate-200 font-semibold px-2">
+                      <span>Page</span>
+                      <select
+                        value={activeRegion === 'A' ? currentPage : pageB}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value, 10);
+                          if (activeRegion === 'A') setCurrentPage(val);
+                          else setPageB(val);
+                        }}
+                        className="bg-slate-950 border border-slate-700 rounded px-2 py-0.5 text-xs text-white"
+                      >
+                        {Array.from({ length: totalPages }, (_, i) => i + 1).map((pg) => (
+                          <option key={pg} value={pg}>
+                            {pg}
+                          </option>
+                        ))}
+                      </select>
+                      <span>of {totalPages}</span>
+                    </div>
+
+                    <button
+                      onClick={() => {
+                        if (activeRegion === 'A') {
+                          setCurrentPage((p) => Math.min(totalPages, p + 1));
+                        } else {
+                          setPageB((p) => Math.min(totalPages, p + 1));
+                        }
+                      }}
+                      disabled={(activeRegion === 'A' ? currentPage : pageB) >= totalPages}
+                      className="p-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300"
+                    >
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
 
                 {/* Region Switcher (if Split Question mode) */}
                 {isMultiRegion && (
@@ -1500,6 +1689,48 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                     {currentQ?.sectionName || 'Section'}
                   </span>
                 </div>
+
+                {/* Multi-Part Image Part Selector Bar */}
+                {currentQ && (
+                  <div className="mt-3 pt-2 border-t border-slate-800/80 space-y-1.5">
+                    <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center justify-between">
+                      <span>Question Image Parts ({Math.max(currentQ.images?.length || 0, currentQ.pdfData?.length || 0, 1)})</span>
+                      <button
+                        onClick={() => {
+                          setTargetMode('add_part');
+                          addToast({ title: 'Add Part Mode Active', description: 'Draw a bounding box on the PDF to add an extra part.', type: 'info' });
+                        }}
+                        className="px-1.5 py-0.5 text-[10px] bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-300 rounded border border-indigo-500/40 font-medium transition-colors"
+                        title="Crop and append a new image part to this question"
+                      >
+                        + Add Part
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-1">
+                      {Array.from({ length: Math.max(currentQ.images?.length || 0, currentQ.pdfData?.length || 0, 1) }).map((_, i) => {
+                        const pIdx = i + 1;
+                        const isPartActive = (recropTarget?.partIndex || 1) === pIdx && targetMode !== 'add_part';
+                        return (
+                          <button
+                            key={pIdx}
+                            onClick={() => {
+                              setTargetMode('replace_part');
+                              selectQuestionByIndex(activeQIndex, pIdx);
+                            }}
+                            className={`px-2 py-1 rounded text-xs font-mono font-bold transition-all ${
+                              isPartActive
+                                ? 'bg-indigo-600 text-white shadow-sm ring-1 ring-indigo-400'
+                                : 'bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800'
+                            }`}
+                          >
+                            Part {pIdx}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Scrollable Toolbox */}
@@ -1629,9 +1860,132 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                     ))}
                   </div>
 
-                  {targetMode === 'new_question' && (
+                  {targetMode === 'new_question' && activeArchive && (
                     <div className="grid grid-cols-2 gap-3 pt-2">
-                      <div>
+                      <div className="col-span-2">
+                        <label className="block text-[10px] text-slate-400 font-semibold mb-1">Subject</label>
+                        {showNewSubjectInput ? (
+                          <div className="flex gap-1.5">
+                            <input
+                              type="text"
+                              value={newSubjectName}
+                              onChange={(e) => setNewSubjectName(e.target.value)}
+                              placeholder="New subject name..."
+                              className="flex-1 bg-slate-950 border border-indigo-500 rounded px-2 py-1 text-xs text-white focus:outline-none"
+                              autoFocus
+                            />
+                            <button
+                              onClick={() => {
+                                if (newSubjectName.trim()) {
+                                  setNewQProps(p => ({ ...p, subjectId: `new:${newSubjectName.trim()}` }));
+                                  setNewSectionName('');
+                                  setShowNewSectionInput(true);
+                                }
+                                setShowNewSubjectInput(false);
+                              }}
+                              className="px-2 py-1 bg-indigo-600 text-white text-xs rounded hover:bg-indigo-500 font-bold"
+                            >
+                              Add
+                            </button>
+                            <button
+                              onClick={() => {
+                                setShowNewSubjectInput(false);
+                                setNewSubjectName('');
+                              }}
+                              className="px-2 py-1 bg-slate-800 text-slate-300 text-xs rounded hover:bg-slate-700"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ) : (
+                          <select
+                            value={newQProps.subjectId}
+                            onChange={(e) => {
+                              if (e.target.value === 'new_subject') {
+                                setNewSubjectName('');
+                                setShowNewSubjectInput(true);
+                              } else {
+                                const subj = activeArchive.subjects.find(s => s.id === e.target.value);
+                                setNewQProps(p => ({ 
+                                  ...p, 
+                                  subjectId: e.target.value,
+                                  sectionId: subj?.sections[0]?.id || ''
+                                }));
+                              }
+                            }}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white text-xs focus:ring-1 focus:ring-indigo-500"
+                          >
+                            <option value="">-- Select Subject --</option>
+                            {activeArchive.subjects.map(s => (
+                              <option key={s.id} value={s.id}>{s.name}</option>
+                            ))}
+                            {newQProps.subjectId.startsWith('new:') && (
+                              <option value={newQProps.subjectId}>{newQProps.subjectId.replace('new:', '')} (New)</option>
+                            )}
+                            <option value="new_subject" className="text-indigo-400 font-bold">+ Create New Subject</option>
+                          </select>
+                        )}
+                      </div>
+
+                      <div className="col-span-2">
+                        <label className="block text-[10px] text-slate-400 font-semibold mb-1">Section</label>
+                        {showNewSectionInput ? (
+                          <div className="flex gap-1.5">
+                            <input
+                              type="text"
+                              value={newSectionName}
+                              onChange={(e) => setNewSectionName(e.target.value)}
+                              placeholder="New section name..."
+                              className="flex-1 bg-slate-950 border border-indigo-500 rounded px-2 py-1 text-xs text-white focus:outline-none"
+                              autoFocus
+                            />
+                            <button
+                              onClick={() => {
+                                if (newSectionName.trim()) {
+                                  setNewQProps(p => ({ ...p, sectionId: `new:${newSectionName.trim()}` }));
+                                }
+                                setShowNewSectionInput(false);
+                              }}
+                              className="px-2 py-1 bg-indigo-600 text-white text-xs rounded hover:bg-indigo-500 font-bold"
+                            >
+                              Add
+                            </button>
+                            <button
+                              onClick={() => {
+                                setShowNewSectionInput(false);
+                                setNewSectionName('');
+                              }}
+                              className="px-2 py-1 bg-slate-800 text-slate-300 text-xs rounded hover:bg-slate-700"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ) : (
+                          <select
+                            value={newQProps.sectionId}
+                            onChange={(e) => {
+                              if (e.target.value === 'new_section') {
+                                setNewSectionName('');
+                                setShowNewSectionInput(true);
+                              } else {
+                                setNewQProps(p => ({ ...p, sectionId: e.target.value }));
+                              }
+                            }}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white text-xs focus:ring-1 focus:ring-indigo-500"
+                          >
+                            <option value="">-- Select Section --</option>
+                            {activeArchive.subjects.find(s => s.id === newQProps.subjectId)?.sections.map(sec => (
+                              <option key={sec.id} value={sec.id}>{sec.name}</option>
+                            ))}
+                            {newQProps.sectionId.startsWith('new:') && (
+                              <option value={newQProps.sectionId}>{newQProps.sectionId.replace('new:', '')} (New)</option>
+                            )}
+                            <option value="new_section" className="text-indigo-400 font-bold">+ Create New Section</option>
+                          </select>
+                        )}
+                      </div>
+
+                      <div className="col-span-2">
                         <label className="block text-[10px] text-slate-400 font-semibold mb-1">New Q Number</label>
                         <input
                           type="number"
@@ -1639,6 +1993,7 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                           onChange={(e) => setNewQProps(p => ({ ...p, que: parseInt(e.target.value, 10) || 1 }))}
                           className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-white font-mono text-xs focus:ring-1 focus:ring-indigo-500"
                         />
+                        <p className="text-[10px] text-slate-500 mt-1">If the Q# exists in the section, the image will be appended as a new part to it.</p>
                       </div>
                     </div>
                   )}

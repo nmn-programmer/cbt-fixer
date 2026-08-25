@@ -23,6 +23,9 @@ import {
   Monitor,
   Zap,
   SlidersHorizontal,
+  Download,
+  Upload,
+  FileJson,
 } from 'lucide-react';
 import { useCbtStore } from '../store/useCbtStore';
 import {
@@ -31,6 +34,9 @@ import {
   getUsageColor,
   maskApiKey,
   ApiKeyStatus,
+  exportApiKeysJson,
+  importApiKeysFromJson,
+  getStoredPrimaryApiKey,
 } from '../utils/geminiKeyManager';
 import { GEMINI_MODELS_DESCENDING, GeminiModelInfo } from '../utils/aiModelConfig';
 
@@ -49,6 +55,46 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
   const [isAddingFallback, setIsAddingFallback] = useState(false);
   const [testingKeyId, setTestingKeyId] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const jsonFileInputRef = React.useRef<HTMLInputElement>(null);
+
+  const handleExportKeysJson = () => {
+    const jsonStr = exportApiKeysJson();
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `gemini_api_keys_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    addToast('API Keys Exported', 'Key configuration downloaded as JSON file.', 'success');
+  };
+
+  const handleImportKeysJson = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target?.result as string;
+      if (!text) return;
+
+      const res = importApiKeysFromJson(text);
+      if (res.success) {
+        refreshUsageMetrics();
+        const primary = getStoredPrimaryApiKey();
+        setGeminiApiKey(primary);
+        addToast(
+          'API Keys Imported!',
+          `Imported ${res.importedCount} keys. First key (${res.primaryKeyMasked}) set as active primary key!`,
+          'success'
+        );
+      } else {
+        addToast('Key Import Failed', res.error || 'Failed to parse JSON file.', 'error');
+      }
+    };
+    reader.readAsText(file);
+    if (e.target) e.target.value = '';
+  };
 
   const {
     geminiApiKey,
@@ -509,6 +555,53 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                     ))}
                   </div>
                 )}
+              </div>
+
+              {/* JSON API Key Import & Export Card */}
+              <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 space-y-3 pt-4">
+                <input
+                  type="file"
+                  ref={jsonFileInputRef}
+                  onChange={handleImportKeysJson}
+                  accept=".json,application/json"
+                  className="hidden"
+                />
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <FileJson className="w-4 h-4 text-emerald-400" />
+                    <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">
+                      Import & Export Key Pool JSON
+                    </span>
+                  </div>
+                  <span className="text-[10px] text-slate-400 font-medium">
+                    First appearing key becomes Active Key
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400">
+                  Export your API key pool as a JSON file for backup, or import an existing JSON key configuration file.
+                </p>
+
+                <div className="flex items-center gap-2.5 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleExportKeysJson}
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 transition-colors min-h-[40px]"
+                    title="Export all API keys to JSON"
+                  >
+                    <Download className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Export Keys JSON</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => jsonFileInputRef.current?.click()}
+                    className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 text-xs font-medium border border-indigo-500/30 transition-colors min-h-[40px]"
+                    title="Import API keys from JSON file"
+                  >
+                    <Upload className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Import Keys JSON</span>
+                  </button>
+                </div>
               </div>
             </div>
           )}
