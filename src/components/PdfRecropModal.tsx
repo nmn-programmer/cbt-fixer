@@ -211,6 +211,7 @@ export const PdfRecropModal: React.FC = () => {
   const [pageB, setPageB] = useState<number>(1);
   const [activeRegion, setActiveRegion] = useState<'A' | 'B'>('A');
   const [isMultiRegion, setIsMultiRegion] = useState<boolean>(false);
+  const [showStitchOverlay, setShowStitchOverlay] = useState<boolean>(true);
   const [viewMode, setViewMode] = useState<'crop' | 'merge_verification'>('crop');
   const [stitchGap, setStitchGap] = useState<number>(12);
   const [stitchOrder, setStitchOrder] = useState<'A_THEN_B' | 'B_THEN_A'>('A_THEN_B');
@@ -257,6 +258,7 @@ export const PdfRecropModal: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeRenderTaskRef = useRef<any>(null);
+  const pageCanvasCacheRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
 
   // Load question properties & crop coordinates for a given index
   const selectQuestionByIndex = useCallback((idx: number, targetPartIdx: number = 1) => {
@@ -305,16 +307,24 @@ export const PdfRecropModal: React.FC = () => {
         setBoxA({ ymin: 0.1, xmin: 0.05, ymax: 0.4, xmax: 0.95 });
       }
 
-      // If targetMode is stitch and we have another part available, load it into B
-      if (useCbtStore.getState().recropTarget?.mode === 'stitch' && q.pdfData.length >= 2) {
-        setIsMultiRegion(true);
-        const p2 = q.pdfData[1];
-        setPageB(p2.page || p2.pageNumber || (p2 as any).pageIndex || pNum);
-        const box2 = extractBoxFromPdfDataPart(p2);
-        if (box2) {
-          setBoxB(box2);
+      // If question has multiple parts / split question or targetMode is stitch, load Part 2 into B
+      if ((useCbtStore.getState().recropTarget?.mode === 'stitch' || q.isSplitQuestion || (q.images && q.images.length >= 2) || q.pdfData.length >= 2)) {
+        if (q.pdfData.length >= 2) {
+          setIsMultiRegion(true);
+          const p2 = q.pdfData[1];
+          setPageB(p2.page || p2.pageNumber || (p2 as any).pageIndex || pNum);
+          const box2 = extractBoxFromPdfDataPart(p2);
+          if (box2) {
+            setBoxB(box2);
+          } else {
+            setBoxB({ ymin: 0.45, xmin: 0.05, ymax: 0.75, xmax: 0.95 });
+          }
+        } else if (q.isSplitQuestion || (q.images && q.images.length >= 2)) {
+          setIsMultiRegion(true);
+          setPageB(pNum);
+          setBoxB({ ymin: Math.min(0.85, (box1?.ymax || 0.4) + 0.05), xmin: box1?.xmin || 0.05, ymax: Math.min(1, (box1?.ymax || 0.4) + 0.35), xmax: box1?.xmax || 0.95 });
         } else {
-          setBoxB({ ymin: 0.45, xmin: 0.05, ymax: 0.75, xmax: 0.95 });
+          setIsMultiRegion(false);
         }
       } else {
         setIsMultiRegion(false);
@@ -412,26 +422,35 @@ export const PdfRecropModal: React.FC = () => {
         const initPage = recropTarget?.pageNumber ? Math.min(Math.max(1, recropTarget.pageNumber), loaded.numPages) : 1;
         setCurrentPage(initPage);
 
-        // Generate small thumbnails for pages asynchronously
-        const thumbs: { url: string; page: number }[] = [];
-        const thumbPages = Math.min(loaded.numPages, 30);
-        for (let i = 1; i <= thumbPages; i++) {
-          try {
-            const page = await loaded.getPage(i);
-            const viewport = page.getViewport({ scale: 0.2 });
-            const thumbCanvas = document.createElement('canvas');
-            thumbCanvas.width = viewport.width;
-            thumbCanvas.height = viewport.height;
-            const ctx = thumbCanvas.getContext('2d');
-            if (ctx) {
-              await page.render({ canvasContext: ctx, viewport } as any).promise;
-              thumbs.push({ url: thumbCanvas.toDataURL('image/jpeg', 0.6), page: i });
+        // Generate small thumbnails for pages lazily in non-blocking background batches
+        (async () => {
+          const thumbPages = Math.min(loaded.numPages, 30);
+          for (let i = 1; i <= thumbPages; i++) {
+            if (!isMounted) break;
+            try {
+              const page = await loaded.getPage(i);
+              const viewport = page.getViewport({ scale: 0.18 });
+              const thumbCanvas = document.createElement('canvas');
+              thumbCanvas.width = viewport.width;
+              thumbCanvas.height = viewport.height;
+              const ctx = thumbCanvas.getContext('2d');
+              if (ctx) {
+                await page.render({ canvasContext: ctx, viewport } as any).promise;
+                const url = thumbCanvas.toDataURL('image/jpeg', 0.5);
+                if (isMounted) {
+                  setPageThumbnails((prev) => {
+                    if (prev.some((p) => p.page === i)) return prev;
+                    return [...prev, { url, page: i }];
+                  });
+                }
+              }
+            } catch (e) {
+              console.warn("Failed generating thumb for page", i, e);
             }
-          } catch (e) {
-            console.warn("Failed generating thumb for page", i, e);
+            // Yield control back to browser to prevent main thread lag
+            await new Promise((r) => setTimeout(r, 16));
           }
-        }
-        if (isMounted) setPageThumbnails(thumbs);
+        })();
       } catch (err: any) {
         console.error("Failed to load PDF:", err);
       } finally {
@@ -531,9 +550,34 @@ export const PdfRecropModal: React.FC = () => {
     }
   }, [boxA, boxB, isMultiRegion, autoWhiten, sharpenText, stitchGap, stitchOrder]);
 
-  // Render High-DPI Page to Canvas
+  // Render Standard Resolution Page to Canvas (with Offscreen Memory Canvas Caching & Zero-Flicker Swap)
   const renderCurrentPage = useCallback(async () => {
     if (!pdfDoc || !canvasRef.current) return;
+
+    const pageToRender = activeRegion === 'A' ? currentPage : pageB;
+    const standardScale = Math.min(scale * 1.25, 1.8);
+    const dpr = Math.min(window.devicePixelRatio || 1.25, 1.5);
+    const effectiveScale = Math.min(standardScale * dpr, 2.2);
+    const cacheKey = `${pageToRender}_${effectiveScale.toFixed(2)}`;
+
+    const canvas = canvasRef.current;
+    const cachedCanvas = pageCanvasCacheRef.current.get(cacheKey);
+
+    if (cachedCanvas) {
+      // Fast instant 0ms canvas paint from memory cache without blocking spinner
+      canvas.width = cachedCanvas.width;
+      canvas.height = cachedCanvas.height;
+      canvas.style.width = `${cachedCanvas.width / dpr}px`;
+      canvas.style.height = `${cachedCanvas.height / dpr}px`;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(cachedCanvas, 0, 0);
+        generateLivePreview();
+      }
+      setRenderingPage(false);
+      return;
+    }
+
     setRenderingPage(true);
 
     if (activeRenderTaskRef.current) {
@@ -547,33 +591,40 @@ export const PdfRecropModal: React.FC = () => {
     }
 
     try {
-      const pageToRender = activeRegion === 'A' ? currentPage : pageB;
       const page = await pdfDoc.getPage(pageToRender);
-
-      const dpr = window.devicePixelRatio || 1.5;
-      const effectiveScale = scale * dpr;
       const viewport = page.getViewport({ scale: effectiveScale });
 
-      const canvas = canvasRef.current;
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      canvas.style.width = `${viewport.width / dpr}px`;
-      canvas.style.height = `${viewport.height / dpr}px`;
+      // Render to OFFSCREEN canvas first so visible canvas NEVER flashes black/blank
+      const offscreen = document.createElement('canvas');
+      offscreen.width = viewport.width;
+      offscreen.height = viewport.height;
+      const offCtx = offscreen.getContext('2d');
 
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (offCtx) {
+        offCtx.fillStyle = '#FFFFFF';
+        offCtx.fillRect(0, 0, offscreen.width, offscreen.height);
+
         const renderTask = page.render({
-          canvasContext: ctx,
+          canvasContext: offCtx,
           viewport: viewport
         } as any);
 
         activeRenderTaskRef.current = renderTask;
         await renderTask.promise;
-        
-        // Immediately generate live preview after page render
-        generateLivePreview();
+
+        // Save offscreen cache copy for zero-latency instant re-draws
+        pageCanvasCacheRef.current.set(cacheKey, offscreen);
+
+        // Atomic swap onto visible canvas
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        canvas.style.width = `${viewport.width / dpr}px`;
+        canvas.style.height = `${viewport.height / dpr}px`;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(offscreen, 0, 0);
+          generateLivePreview();
+        }
       }
     } catch (err: any) {
       if (err?.name !== 'RenderingCancelledException') {
@@ -727,8 +778,8 @@ export const PdfRecropModal: React.FC = () => {
       if (!pdfDoc) return null;
       try {
         const page = await pdfDoc.getPage(pageIndex);
-        const hiScale = 2.6; // High resolution 2.6x crop
-        const viewport = page.getViewport({ scale: hiScale });
+        const stdScale = 1.6; // Standard crisp resolution without high-res blob lag
+        const viewport = page.getViewport({ scale: stdScale });
         const fullCanvas = document.createElement('canvas');
         fullCanvas.width = Math.round(viewport.width);
         fullCanvas.height = Math.round(viewport.height);
@@ -891,6 +942,62 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
     }
   };
 
+  // Intelligent Spatial Break Detector for Split Questions
+  const handleDetectSpatialBreak = async () => {
+    setAiDetecting(true);
+    setAiMessage('Analyzing document spatial layout for split question fragments...');
+    try {
+      // Determine if current box is in Left Column or Right Column / Full Width
+      const isLeftColumn = (boxA.xmax <= 0.55);
+      
+      setIsMultiRegion(true);
+      setShowStitchOverlay(true);
+
+      if (isLeftColumn) {
+        // Spatial break continuation in 2-column paper is at the top of the right column on the SAME page
+        setPageB(currentPage);
+        const topOfRightCol: BoxCoord = {
+          xmin: 0.515,
+          ymin: 0.045,
+          xmax: 0.975,
+          ymax: Math.min(1.0, Math.max(0.25, 0.045 + (boxA.ymax - boxA.ymin)))
+        };
+        setBoxB(topOfRightCol);
+        setAiMessage(`Spatial break detected in 2-column layout! Top Fragment (Leading) & Bottom Fragment (Trailing) highlighted on Page ${currentPage}.`);
+        addToast({
+          title: 'Spatial Break Detected',
+          description: `Identified 2-column split continuation across columns on Page ${currentPage}.`,
+          type: 'info'
+        });
+      } else {
+        // Spatial break continuation is at the top of the NEXT page
+        const nextPage = Math.min(totalPages || (currentPage + 1), currentPage + 1);
+        setPageB(nextPage);
+        const topOfNextPage: BoxCoord = {
+          xmin: 0.035,
+          ymin: 0.045,
+          xmax: 0.965,
+          ymax: Math.min(1.0, Math.max(0.28, 0.045 + (boxA.ymax - boxA.ymin)))
+        };
+        setBoxB(topOfNextPage);
+        setAiMessage(`Cross-page spatial break detected! Top Fragment (Leading on Pg ${currentPage}) ➔ Bottom Fragment (Trailing on Pg ${nextPage}).`);
+        addToast({
+          title: 'Cross-Page Spatial Break Detected',
+          description: `Identified split continuation across pages (Pg ${currentPage} ➔ Pg ${nextPage}).`,
+          type: 'info'
+        });
+      }
+      setTimeout(() => {
+        generateLivePreview();
+      }, 50);
+    } catch (err: any) {
+      console.error('Error detecting spatial break:', err);
+      setAiMessage(`Spatial break error: ${err.message}`);
+    } finally {
+      setAiDetecting(false);
+    }
+  };
+
   // Convert Mouse/Touch Events to Normalized Page Coordinates (0.0 to 1.0)
   const getNormCoords = (e: React.MouseEvent | React.TouchEvent): { x: number; y: number } | null => {
     if (!canvasRef.current) return null;
@@ -1040,7 +1147,9 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
     let targetPage = currentPage;
     let targetBox = boxA;
 
-    if (targetMode === 'stitch' || (isMultiRegion && boxB)) {
+    const isStitch = targetMode === 'stitch' || (isMultiRegion && !!boxB);
+
+    if (isStitch) {
       const cA = await cropBoxFromPage(currentPage, boxA);
       const cB = await cropBoxFromPage(pageB, boxB || boxA);
       if (cA && cB) {
@@ -1071,10 +1180,44 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
     const currentQ = allQuestionsList[activeQIndex];
     const targetQId = currentQ?.id || recropTarget?.questionId;
 
-    finalCanvas.toBlob(async (blob) => {
-      if (!blob) return;
+    const blob = await new Promise<Blob | null>((resolve) => {
+      finalCanvas!.toBlob(resolve, 'image/png');
+    });
 
-      const pdfCoords = {
+    if (!blob) return;
+
+    let pdfCoordsPayload: any;
+    if (isStitch && boxB) {
+      pdfCoordsPayload = [
+        {
+          page: currentPage,
+          pageNumber: currentPage,
+          x1: Math.round(boxA.xmin * 1000),
+          y1: Math.round(boxA.ymin * 1000),
+          x2: Math.round(boxA.xmax * 1000),
+          y2: Math.round(boxA.ymax * 1000),
+          ymin: boxA.ymin,
+          xmin: boxA.xmin,
+          ymax: boxA.ymax,
+          xmax: boxA.xmax,
+          bounds: [boxA.xmin, boxA.ymin, boxA.xmax - boxA.xmin, boxA.ymax - boxA.ymin],
+        },
+        {
+          page: pageB,
+          pageNumber: pageB,
+          x1: Math.round(boxB.xmin * 1000),
+          y1: Math.round(boxB.ymin * 1000),
+          x2: Math.round(boxB.xmax * 1000),
+          y2: Math.round(boxB.ymax * 1000),
+          ymin: boxB.ymin,
+          xmin: boxB.xmin,
+          ymax: boxB.ymax,
+          xmax: boxB.xmax,
+          bounds: [boxB.xmin, boxB.ymin, boxB.xmax - boxB.xmin, boxB.ymax - boxB.ymin],
+        }
+      ];
+    } else {
+      pdfCoordsPayload = {
         page: targetPage,
         pageNumber: targetPage,
         x1: Math.round(targetBox.xmin * 1000),
@@ -1087,46 +1230,46 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
         xmax: targetBox.xmax,
         bounds: [targetBox.xmin, targetBox.ymin, targetBox.xmax - targetBox.xmin, targetBox.ymax - targetBox.ymin],
       };
+    }
 
-      const currentQ = allQuestionsList[activeQIndex];
-      const computedPartIdx = targetMode === 'add_part' 
-        ? ((currentQ?.imagesCount || currentQ?.images?.length || 0) + 1)
-        : (recropTarget?.partIndex || 1);
+    const computedPartIdx = targetMode === 'add_part' 
+      ? ((currentQ?.imagesCount || currentQ?.images?.length || 0) + 1)
+      : (recropTarget?.partIndex || 1);
 
-      await applyCroppedImage({
-        questionId: targetQId,
-        partIndex: computedPartIdx,
-        mode: targetMode,
-        blob,
-        sectionId: newQProps.sectionId || currentQ?.sectionId || recropTarget?.sectionId,
-        subjectId: newQProps.subjectId || currentQ?.subjectId || recropTarget?.subjectId,
-        newQuestionProps: {
-          que: newQProps.que,
-          type: newQProps.type,
-          marks:
-            newQProps.type === 'msq'
-              ? { cm: 4, im: -2, pm: 1, max: 4 }
-              : newQProps.type === 'msm'
-              ? { cm: 3, im: -1, pm: 1, max: 12 }
-              : { cm: 4, im: -1, pm: 0, max: 4 }
-        },
-        pdfCoords
+    await applyCroppedImage({
+      questionId: targetQId,
+      partIndex: computedPartIdx,
+      mode: isStitch ? 'stitch' : targetMode,
+      blob,
+      sectionId: newQProps.sectionId || currentQ?.sectionId || recropTarget?.sectionId,
+      subjectId: newQProps.subjectId || currentQ?.subjectId || recropTarget?.subjectId,
+      newQuestionProps: {
+        que: newQProps.que,
+        type: newQProps.type,
+        marks:
+          newQProps.type === 'msq'
+            ? { cm: 4, im: -2, pm: 1, max: 4 }
+            : newQProps.type === 'msm'
+            ? { cm: 3, im: -1, pm: 1, max: 12 }
+            : { cm: 4, im: -1, pm: 0, max: 4 }
+      },
+      pdfCoords: pdfCoordsPayload
+    });
+
+    if (autoAdvance && activeQIndex < allQuestionsList.length - 1) {
+      selectQuestionByIndex(activeQIndex + 1);
+    } else if (!autoAdvance) {
+      addToast({
+        title: `Saved Crop for Q${newQProps.que}`,
+        description: isStitch
+          ? 'Spatial break fragments stitched and question updated.'
+          : targetMode === 'add_part'
+          ? 'Added extra image part to question.'
+          : 'Question image updated successfully.',
+        type: 'success'
       });
-
-      if (autoAdvance && activeQIndex < allQuestionsList.length - 1) {
-        selectQuestionByIndex(activeQIndex + 1);
-        // Silently advance without toast or aiMessage to avoid blocking UI
-      } else {
-        if (!autoAdvance) {
-          addToast({
-            title: `Saved Crop for Q${newQProps.que}`,
-            description: targetMode === 'add_part' ? 'Added extra image part to question.' : 'Question image updated successfully.',
-            type: 'success'
-          });
-          closePdfRecrop();
-        }
-      }
-    }, 'image/png');
+      closePdfRecrop();
+    }
   };
 
   // Global Keyboard Navigation (Arrow Left/Right & Ctrl+Enter to Save)
@@ -1417,13 +1560,15 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                         setViewMode('crop');
                         setActiveRegion('A');
                       }}
-                      className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
+                      className={`px-2.5 py-1 rounded text-xs font-bold transition-all flex items-center gap-1 ${
                         viewMode === 'crop' && activeRegion === 'A'
-                          ? 'bg-indigo-600 text-white'
-                          : 'text-slate-400 hover:text-slate-200'
+                          ? 'bg-indigo-600 text-white shadow-sm ring-1 ring-indigo-400'
+                          : 'text-indigo-300 hover:text-indigo-100 hover:bg-indigo-950/40'
                       }`}
+                      title="Select & edit Leading / Top Fragment (Question stem & intro)"
                     >
-                      Region A (Pg {currentPage})
+                      <ArrowDown className="w-3 h-3 text-indigo-300" />
+                      <span>Top Fragment (Pg {currentPage})</span>
                     </button>
                     <button
                       onClick={() => {
@@ -1431,13 +1576,28 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                         setActiveRegion('B');
                         if (!boxB) setBoxB({ ...boxA });
                       }}
-                      className={`px-2.5 py-1 rounded text-xs font-semibold transition-colors ${
+                      className={`px-2.5 py-1 rounded text-xs font-bold transition-all flex items-center gap-1 ${
                         viewMode === 'crop' && activeRegion === 'B'
-                          ? 'bg-emerald-600 text-white'
-                          : 'text-slate-400 hover:text-slate-200'
+                          ? 'bg-emerald-600 text-white shadow-sm ring-1 ring-emerald-400'
+                          : 'text-emerald-300 hover:text-emerald-100 hover:bg-emerald-950/40'
                       }`}
+                      title="Select & edit Trailing / Bottom Fragment (Continuation & options)"
                     >
-                      Region B (Pg {pageB})
+                      <ArrowUp className="w-3 h-3 text-emerald-300" />
+                      <span>Bottom Fragment (Pg {pageB})</span>
+                    </button>
+                    <div className="w-px h-4 bg-slate-800 mx-0.5" />
+                    <button
+                      onClick={() => setShowStitchOverlay(v => !v)}
+                      className={`px-2 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
+                        showStitchOverlay
+                          ? 'bg-purple-950/60 text-purple-200 border border-purple-700/50'
+                          : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                      }`}
+                      title="Toggle Stitch Visualization Overlay on PDF canvas"
+                    >
+                      <Eye className="w-3 h-3 text-purple-400" />
+                      <span>Overlay: {showStitchOverlay ? 'ON' : 'OFF'}</span>
                     </button>
                     <div className="w-px h-4 bg-slate-800 mx-0.5" />
                     <button
@@ -1455,7 +1615,7 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                   </div>
                 )}
 
-                {/* AI Auto-Detect & Zoom Controls */}
+                {/* AI Auto-Detect, Spatial Break & Zoom Controls */}
                 <div className="flex items-center gap-1.5">
                   <button
                     onClick={handleAiAutoDetect}
@@ -1469,6 +1629,16 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                       <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
                     )}
                     <span>AI Find Q{newQProps.que}</span>
+                  </button>
+
+                  <button
+                    onClick={handleDetectSpatialBreak}
+                    disabled={aiDetecting}
+                    className="flex items-center gap-1 px-2.5 py-1 bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 border border-purple-500/40 rounded text-xs font-medium transition-colors"
+                    title="Detect spatial question break across columns/pages and activate stitch overlay"
+                  >
+                    <Scissors className="w-3.5 h-3.5 text-purple-400" />
+                    <span className="hidden sm:inline">Detect Spatial Break</span>
                   </button>
 
                   <div className="h-4 w-px bg-slate-800 mx-1" />
@@ -1751,97 +1921,314 @@ Where ymin, xmin, ymax, xmax are normalized floats (0.00 to 1.00). Ensure the bo
                         </div>
                       ))}
 
-                      {/* Render Active Crop Box */}
+                      {/* --- STITCH VISUALIZATION OVERLAY & CROP BOUNDARIES --- */}
                       {canvasRef.current && (
-                        <div
-                          className={`absolute border-2 transition-shadow z-20 ${
-                            activeRegion === 'A'
-                              ? 'border-indigo-500 bg-indigo-500/15 shadow-indigo-500/20'
-                              : 'border-emerald-500 bg-emerald-500/15 shadow-emerald-500/20'
-                          }`}
-                          style={{
-                            top: `${currentActiveBox.ymin * 100}%`,
-                            left: `${currentActiveBox.xmin * 100}%`,
-                            width: `${(currentActiveBox.xmax - currentActiveBox.xmin) * 100}%`,
-                            height: `${(currentActiveBox.ymax - currentActiveBox.ymin) * 100}%`,
-                            cursor: 'move'
-                          }}
-                          onMouseDown={(e) => {
-                            e.stopPropagation();
-                            handlePointerDown(e, 'move');
-                          }}
-                          onTouchStart={(e) => {
-                            e.stopPropagation();
-                            handlePointerDown(e, 'move');
-                          }}
-                        >
-                          {/* Region Tag */}
-                          <div
-                            className={`absolute -top-6 left-0 px-2 py-0.5 rounded text-[10px] font-bold text-white shadow ${
-                              activeRegion === 'A' ? 'bg-indigo-600' : 'bg-emerald-600'
-                            }`}
-                          >
-                            {isMultiRegion ? `Q${newQProps.que} Region ${activeRegion}` : `Q${newQProps.que} Crop Area`}
-                          </div>
+                        <>
+                          {isMultiRegion && showStitchOverlay ? (
+                            <>
+                              {/* 1. TOP FRAGMENT (LEADING REGION A) */}
+                              {activeRegion === 'A' ? (
+                                <div
+                                  className="absolute border-2 border-indigo-500 bg-indigo-500/20 shadow-lg shadow-indigo-500/25 z-20 transition-all"
+                                  style={{
+                                    top: `${boxA.ymin * 100}%`,
+                                    left: `${boxA.xmin * 100}%`,
+                                    width: `${(boxA.xmax - boxA.xmin) * 100}%`,
+                                    height: `${(boxA.ymax - boxA.ymin) * 100}%`,
+                                    cursor: 'move'
+                                  }}
+                                  onMouseDown={(e) => {
+                                    e.stopPropagation();
+                                    handlePointerDown(e, 'move');
+                                  }}
+                                  onTouchStart={(e) => {
+                                    e.stopPropagation();
+                                    handlePointerDown(e, 'move');
+                                  }}
+                                >
+                                  {/* Header Badge */}
+                                  <div className="absolute -top-7 left-0 px-2 py-0.5 rounded bg-indigo-600 text-white text-[10px] font-bold shadow flex items-center gap-1.5 whitespace-nowrap z-30">
+                                    <ArrowDown className="w-3 h-3 text-indigo-200" />
+                                    <span>Top Fragment (Leading) • Q{newQProps.que} (Pg {currentPage})</span>
+                                    <span className="opacity-75 font-mono text-[9px]">
+                                      {Math.round((boxA.xmax - boxA.xmin) * 100)}% × {Math.round((boxA.ymax - boxA.ymin) * 100)}%
+                                    </span>
+                                  </div>
 
-                          {/* Resize Handles */}
-                          <div
-                            className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 'nw');
-                            }}
-                          />
-                          <div
-                            className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 'ne');
-                            }}
-                          />
-                          <div
-                            className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 'sw');
-                            }}
-                          />
-                          <div
-                            className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 'se');
-                            }}
-                          />
-                          <div
-                            className="absolute top-1/2 -left-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 'w');
-                            }}
-                          />
-                          <div
-                            className="absolute top-1/2 -right-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 'e');
-                            }}
-                          />
-                          <div
-                            className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 'n');
-                            }}
-                          />
-                          <div
-                            className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
-                            onMouseDown={(e) => {
-                              e.stopPropagation();
-                              handlePointerDown(e, 's');
-                            }}
-                          />
-                        </div>
+                                  {/* Bottom Break Seam Guide */}
+                                  <div className="absolute -bottom-5 left-0 right-0 flex justify-center pointer-events-none z-20">
+                                    <span className="px-1.5 py-0.2 bg-indigo-950/90 border border-indigo-500/60 text-indigo-300 text-[9px] font-mono rounded shadow flex items-center gap-1">
+                                      <Scissors className="w-2.5 h-2.5 text-indigo-400" /> Break Seam (Trailing Region Joins Below)
+                                    </span>
+                                  </div>
+
+                                  {/* Resize Handles */}
+                                  <div
+                                    className="absolute -top-1.5 -left-1.5 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-nwse-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'nw'); }}
+                                  />
+                                  <div
+                                    className="absolute -top-1.5 -right-1.5 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-nesw-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'ne'); }}
+                                  />
+                                  <div
+                                    className="absolute -bottom-1.5 -left-1.5 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-nesw-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'sw'); }}
+                                  />
+                                  <div
+                                    className="absolute -bottom-1.5 -right-1.5 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-nwse-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'se'); }}
+                                  />
+                                  <div
+                                    className="absolute top-1/2 -left-1.5 -translate-y-1/2 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-ew-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'w'); }}
+                                  />
+                                  <div
+                                    className="absolute top-1/2 -right-1.5 -translate-y-1/2 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-ew-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'e'); }}
+                                  />
+                                  <div
+                                    className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-ns-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'n'); }}
+                                  />
+                                  <div
+                                    className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3.5 h-3.5 bg-white border-2 border-indigo-600 rounded-xs cursor-ns-resize shadow"
+                                    onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 's'); }}
+                                  />
+                                </div>
+                              ) : (
+                                /* Non-active Top Fragment Box */
+                                <div
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setActiveRegion('A');
+                                  }}
+                                  className="absolute border-2 border-dashed border-indigo-500/80 bg-indigo-500/10 hover:bg-indigo-500/25 cursor-pointer rounded-xs transition-all z-15 group"
+                                  style={{
+                                    top: `${boxA.ymin * 100}%`,
+                                    left: `${boxA.xmin * 100}%`,
+                                    width: `${(boxA.xmax - boxA.xmin) * 100}%`,
+                                    height: `${(boxA.ymax - boxA.ymin) * 100}%`,
+                                  }}
+                                  title="Top Fragment (Leading) - Click to Select & Edit"
+                                >
+                                  <div className="absolute -top-5 left-0 px-1.5 py-0.5 bg-indigo-700 text-white text-[9px] font-bold rounded shadow group-hover:scale-105 transition-transform flex items-center gap-1">
+                                    <ArrowDown className="w-2.5 h-2.5" />
+                                    <span>Top Fragment (Click to Edit)</span>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* 2. BOTTOM FRAGMENT (TRAILING REGION B) - Rendered if on Page B */}
+                              {currentPage === pageB && boxB && (
+                                activeRegion === 'B' ? (
+                                  <div
+                                    className="absolute border-2 border-emerald-500 bg-emerald-500/20 shadow-lg shadow-emerald-500/25 z-20 transition-all"
+                                    style={{
+                                      top: `${boxB.ymin * 100}%`,
+                                      left: `${boxB.xmin * 100}%`,
+                                      width: `${(boxB.xmax - boxB.xmin) * 100}%`,
+                                      height: `${(boxB.ymax - boxB.ymin) * 100}%`,
+                                      cursor: 'move'
+                                    }}
+                                    onMouseDown={(e) => {
+                                      e.stopPropagation();
+                                      handlePointerDown(e, 'move');
+                                    }}
+                                    onTouchStart={(e) => {
+                                      e.stopPropagation();
+                                      handlePointerDown(e, 'move');
+                                    }}
+                                  >
+                                    {/* Header Badge */}
+                                    <div className="absolute -top-7 left-0 px-2 py-0.5 rounded bg-emerald-600 text-white text-[10px] font-bold shadow flex items-center gap-1.5 whitespace-nowrap z-30">
+                                      <ArrowUp className="w-3 h-3 text-emerald-200" />
+                                      <span>Bottom Fragment (Trailing) • Q{newQProps.que} (Pg {pageB})</span>
+                                      <span className="opacity-75 font-mono text-[9px]">
+                                        {Math.round((boxB.xmax - boxB.xmin) * 100)}% × {Math.round((boxB.ymax - boxB.ymin) * 100)}%
+                                      </span>
+                                    </div>
+
+                                    {/* Top Merge Anchor Guide */}
+                                    <div className="absolute -top-5 right-0 flex justify-end pointer-events-none z-20">
+                                      <span className="px-1.5 py-0.2 bg-emerald-950/90 border border-emerald-500/60 text-emerald-300 text-[9px] font-mono rounded shadow flex items-center gap-1">
+                                        <GitMerge className="w-2.5 h-2.5 text-emerald-400" /> Merge Anchor (Continues from Leading)
+                                      </span>
+                                    </div>
+
+                                    {/* Resize Handles */}
+                                    <div
+                                      className="absolute -top-1.5 -left-1.5 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-nwse-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'nw'); }}
+                                    />
+                                    <div
+                                      className="absolute -top-1.5 -right-1.5 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-nesw-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'ne'); }}
+                                    />
+                                    <div
+                                      className="absolute -bottom-1.5 -left-1.5 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-nesw-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'sw'); }}
+                                    />
+                                    <div
+                                      className="absolute -bottom-1.5 -right-1.5 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-nwse-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'se'); }}
+                                    />
+                                    <div
+                                      className="absolute top-1/2 -left-1.5 -translate-y-1/2 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-ew-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'w'); }}
+                                    />
+                                    <div
+                                      className="absolute top-1/2 -right-1.5 -translate-y-1/2 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-ew-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'e'); }}
+                                    />
+                                    <div
+                                      className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-ns-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'n'); }}
+                                    />
+                                    <div
+                                      className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3.5 h-3.5 bg-white border-2 border-emerald-600 rounded-xs cursor-ns-resize shadow"
+                                      onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 's'); }}
+                                    />
+                                  </div>
+                                ) : (
+                                  /* Non-active Bottom Fragment Box */
+                                  <div
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setActiveRegion('B');
+                                    }}
+                                    className="absolute border-2 border-dashed border-emerald-500/80 bg-emerald-500/10 hover:bg-emerald-500/25 cursor-pointer rounded-xs transition-all z-15 group"
+                                    style={{
+                                      top: `${boxB.ymin * 100}%`,
+                                      left: `${boxB.xmin * 100}%`,
+                                      width: `${(boxB.xmax - boxB.xmin) * 100}%`,
+                                      height: `${(boxB.ymax - boxB.ymin) * 100}%`,
+                                    }}
+                                    title="Bottom Fragment (Trailing) - Click to Select & Edit"
+                                  >
+                                    <div className="absolute -top-5 left-0 px-1.5 py-0.5 bg-emerald-700 text-white text-[9px] font-bold rounded shadow group-hover:scale-105 transition-transform flex items-center gap-1">
+                                      <ArrowUp className="w-2.5 h-2.5" />
+                                      <span>Bottom Fragment (Click to Edit)</span>
+                                    </div>
+                                  </div>
+                                )
+                              )}
+
+                              {/* 3. SAME-PAGE SPATIAL BREAK SEAM CONNECTOR */}
+                              {currentPage === pageB && boxB && (
+                                <div
+                                  className="absolute pointer-events-none z-10 flex items-center justify-center"
+                                  style={{
+                                    top: `${Math.min(boxA.ymax, boxB.ymin) * 100}%`,
+                                    left: `${Math.min(boxA.xmin, boxB.xmin) * 100}%`,
+                                    width: `${(Math.max(boxA.xmax, boxB.xmax) - Math.min(boxA.xmin, boxB.xmin)) * 100}%`,
+                                    height: `${Math.max(24, Math.abs(boxB.ymin - boxA.ymax) * 100)}%`,
+                                  }}
+                                >
+                                  <div className="px-2.5 py-1 rounded-full bg-purple-950/90 border border-purple-500/60 shadow-lg text-purple-200 text-[10px] font-bold flex items-center gap-1.5">
+                                    <Scissors className="w-3 h-3 text-purple-400" />
+                                    <span>Spatial Break Detected • {stitchGap}px Seam Gap • Leading ➔ Trailing Flow ↓</span>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* 4. CROSS-PAGE SPATIAL BREAK BANNER */}
+                              {currentPage !== pageB && boxB && (
+                                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 bg-slate-950/95 border border-purple-500/80 shadow-2xl rounded-xl p-2 px-3 text-xs flex items-center gap-3 z-30">
+                                  <div className="flex items-center gap-1.5 text-purple-300">
+                                    <Layers className="w-4 h-4 text-purple-400 shrink-0" />
+                                    <span>
+                                      {currentPage === 1 ? 'Top Fragment (Leading)' : `Pg ${currentPage}`} ➔{' '}
+                                      {pageB === currentPage ? 'Same Page' : `Bottom Fragment on Pg ${pageB}`}
+                                    </span>
+                                  </div>
+                                  <button
+                                    onClick={() => {
+                                      if (activeRegion === 'A') {
+                                        setActiveRegion('B');
+                                        setCurrentPage(pageB);
+                                      } else {
+                                        setActiveRegion('A');
+                                        setCurrentPage(currentPage);
+                                      }
+                                    }}
+                                    className="px-2.5 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded text-[11px] font-bold flex items-center gap-1 shadow cursor-pointer"
+                                  >
+                                    <span>{activeRegion === 'A' ? `View Bottom Fragment (Pg ${pageB})` : `View Top Fragment (Pg 1)`}</span>
+                                    <ArrowRightCircle className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            /* STANDARD SINGLE-REGION CROP BOX */
+                            <div
+                              className={`absolute border-2 transition-shadow z-20 ${
+                                activeRegion === 'A'
+                                  ? 'border-indigo-500 bg-indigo-500/15 shadow-indigo-500/20'
+                                  : 'border-emerald-500 bg-emerald-500/15 shadow-emerald-500/20'
+                              }`}
+                              style={{
+                                top: `${currentActiveBox.ymin * 100}%`,
+                                left: `${currentActiveBox.xmin * 100}%`,
+                                width: `${(currentActiveBox.xmax - currentActiveBox.xmin) * 100}%`,
+                                height: `${(currentActiveBox.ymax - currentActiveBox.ymin) * 100}%`,
+                                cursor: 'move'
+                              }}
+                              onMouseDown={(e) => {
+                                e.stopPropagation();
+                                handlePointerDown(e, 'move');
+                              }}
+                              onTouchStart={(e) => {
+                                e.stopPropagation();
+                                handlePointerDown(e, 'move');
+                              }}
+                            >
+                              {/* Region Tag */}
+                              <div
+                                className={`absolute -top-6 left-0 px-2 py-0.5 rounded text-[10px] font-bold text-white shadow ${
+                                  activeRegion === 'A' ? 'bg-indigo-600' : 'bg-emerald-600'
+                                }`}
+                              >
+                                {isMultiRegion ? `Q${newQProps.que} Region ${activeRegion}` : `Q${newQProps.que} Crop Area`}
+                              </div>
+
+                              {/* Resize Handles */}
+                              <div
+                                className="absolute -top-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'nw'); }}
+                              />
+                              <div
+                                className="absolute -top-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'ne'); }}
+                              />
+                              <div
+                                className="absolute -bottom-1.5 -left-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nesw-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'sw'); }}
+                              />
+                              <div
+                                className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-nwse-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'se'); }}
+                              />
+                              <div
+                                className="absolute top-1/2 -left-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'w'); }}
+                              />
+                              <div
+                                className="absolute top-1/2 -right-1.5 -translate-y-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ew-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'e'); }}
+                              />
+                              <div
+                                className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 'n'); }}
+                              />
+                              <div
+                                className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-white border border-indigo-600 rounded-xs cursor-ns-resize"
+                                onMouseDown={(e) => { e.stopPropagation(); handlePointerDown(e, 's'); }}
+                              />
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
                   </>

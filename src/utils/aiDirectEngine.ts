@@ -50,8 +50,8 @@ async function handleGeminiGenerate(ai: GoogleGenAI, body: any) {
 }
 
 async function handleExtractTestBlueprint(ai: GoogleGenAI, body: any) {
-  const { image, text } = body;
-  if (!image && !text) {
+  const { image, images, text } = body;
+  if (!image && (!images || !images.length) && !text) {
     throw new Error('Instruction page image or text is required');
   }
 
@@ -106,7 +106,17 @@ async function handleExtractTestBlueprint(ai: GoogleGenAI, body: any) {
 Examine this Instructions / Cover page or text thoroughly and extract Test Title, Duration, Marks, Total Questions, and Subject Sections with marking scheme rules.`;
 
   const contents: any[] = [];
-  if (image) {
+  if (images && Array.isArray(images) && images.length > 0) {
+    images.forEach((imgStr: string) => {
+      const isJpeg = imgStr.startsWith('data:image/jpeg');
+      contents.push({
+        inlineData: {
+          data: imgStr.replace(/^data:image\/\w+;base64,/, ''),
+          mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+        }
+      });
+    });
+  } else if (image) {
     const isJpeg = image.startsWith('data:image/jpeg');
     contents.push({
       inlineData: {
@@ -130,7 +140,7 @@ Examine this Instructions / Cover page or text thoroughly and extract Test Title
 
 async function handleExtractPdfStructure(ai: GoogleGenAI, body: any) {
   const { images, pageOffset = 0, options = {} } = body;
-  const { hasAnswerKey = true, extractEnglishOnly = false, enableDoublePass = true } = options;
+  const { hasAnswerKey = true, extractEnglishOnly = false, enableDoublePass = true, autoCorrectionInstruction = null } = options;
   if (!images || !images.length) throw new Error('No images provided');
 
   const contents = images.map((base64: string) => ({
@@ -196,23 +206,38 @@ async function handleExtractPdfStructure(ai: GoogleGenAI, body: any) {
 Analyze the provided page images (Pages ${pageOffset + 1} to ${pageOffset + images.length}).
 The document is an official exam paper with printed question numbers and formulas.
 
-CRITICAL BOUNDING BOX & COLUMN PROTOCOL:
-1. Column Separation in 2-Column Papers:
-   - Left Column: The bounding box MUST span from the left margin (~0.03 to 0.05) to the center column divider (~0.485). NEVER cross into the right column.
-   - Right Column: The bounding box MUST start after the center divider (~0.515) and span to the right margin (~0.97).
-   - Full-Width Questions: span from left margin (~0.035) to right margin (~0.97).
+CRITICAL BOUNDING BOX & 4-LINE GRID PROTOCOL:
+1. 4-Line Imaginary Grid for 2-Column Papers:
+   - Line 1 (Left Margin): x ≈ 0.035
+   - Line 2 (Center Divider Left): x ≈ 0.490
+   - Line 3 (Center Divider Right): x ≈ 0.508
+   - Line 4 (Right Margin): x ≈ 0.965
+   - Left Column Questions: [ymin, 0.035, ymax, 0.490]. NEVER cross past center divider into right column.
+   - Right Column Questions: [ymin, 0.508, ymax, 0.965]. NEVER cross into left column.
+   - Full-Width Questions (only for single column or full width headers): [ymin, 0.035, ymax, 0.965].
 
-2. Zero-Clipping Rules:
-   - Question Number Margin: The bounding box xmin MUST start to the LEFT of the question number (e.g. "Q.15", "15.").
-   - Complete Options Enclosure: For MCQs, the bounding box ymax MUST comfortably enclose the entire bottom line of all options (A, B, C, D) or (1, 2, 3, 4).
+2. Horizontal Question-to-Question Boundary Snapping:
+   - Top Boundary (ymin): Snapped precisely to the top of the question number (e.g. "1.", "Q.1") and its stem/diagram.
+   - Bottom Boundary (ymax): Snapped strictly ABOVE where the next question begins (ymax <= next_question.ymin - 0.005). NEVER include the next question in the current question's slice!
+   - Complete Options Enclosure: For MCQs, ymax must enclose the entire bottom line of all options (A, B, C, D) or (1, 2, 3, 4) without bleeding into subsequent question numbers.
    - Exclude page headers, subject header banners, and page numbers.
 
-3. MANDATORY PROTOCOL FOR MULTI-COLUMN & MULTI-PAGE SPLIT QUESTIONS:
-   - If a question near the bottom of a left column ends before listing all options, mark "isSplit": true, "completeness": "split", and locate the continuation at the top of the right column or next page.
+3. Reading Order & Question Sequence:
+   - Read columns strictly top-to-bottom for LEFT column first, then top-to-bottom for RIGHT column.
+   - Extract questions in strict ascending sequence according to printed numbers (Q1, Q2, Q3...).
+   - STRICT MANDATE: EVERY printed question number (e.g. "1.", "2.", "Q.1", "Q.2", "Question 2") MUST be emitted as its own distinct question in the array. NEVER merge Question N+1 into Question N if Question N+1 has its own printed question number!
+
+4. MANDATORY PROTOCOL FOR MULTI-COLUMN & MULTI-PAGE SPLIT QUESTIONS:
+   - If a question near the bottom of a left column ends before listing all options, mark "isSplit": true, "completeness": "split", and locate the continuation at the top of the right column or next page (WITHOUT a new question number).
    - Provide "splitParts" with ordered normalized boxes for each part.
    - If the top of a column starts with orphaned options (e.g. "(A)... (B)... (C)... (D)..." or "(C)... (D)...") without a new Q-number, mark "isOrphanContinuation": true, and set "continuationForQNo" to the preceding question number.
+   - STRICT FORBIDDEN RULE: NEVER mark a block as a split part or orphan continuation if it has its own printed question number (e.g. "Q.2", "2.", "Question 2"). Every block with a printed question number is an independent question.
 
 ${extractEnglishOnly ? 'BILINGUAL PAPER: Extract ONLY the English version of questions.' : ''}
+
+${autoCorrectionInstruction ? `\n*************************************************************
+${autoCorrectionInstruction}
+*************************************************************\n` : ''}
 
 Output normalized bounding box [ymin, xmin, ymax, xmax] between 0.0 and 1.0 for each question.
 ${hasAnswerKey ? 'Extract printed answer key table if present on these pages.' : ''}`;

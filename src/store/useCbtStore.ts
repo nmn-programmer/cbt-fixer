@@ -789,6 +789,14 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       const active = state.archives.find((a) => a.id === state.activeArchiveId);
       if (!active) return;
 
+      const formatPdfCoordsForStorage = (coords: any, filename: string) => {
+        if (!coords) return [];
+        if (Array.isArray(coords)) {
+          return coords.map((c) => ({ ...c, filename }));
+        }
+        return [{ ...coords, filename }];
+      };
+
       const blobUrl = URL.createObjectURL(payload.blob);
       const updatedRawFiles = new Map(active.rawFiles);
 
@@ -836,7 +844,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
             : 1);
             
         const existingQuestion = targetSec.questions.find(q => q.que === nextQueNum);
-        
+
         if (existingQuestion) {
           const partIndex = (existingQuestion.imagesCount || existingQuestion.images?.length || 0) + 1;
           const imageName = buildImageFileName(targetSec.name, nextQueNum, partIndex, 'png');
@@ -865,7 +873,10 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                       return {
                         ...q,
                         images: [...q.images, newImagePart],
-                        pdfData: payload.pdfCoords ? [...(q.pdfData || []), { ...payload.pdfCoords, filename: imageName }] : (q.pdfData || []),
+                        pdfData: [
+                          ...(q.pdfData || []),
+                          ...formatPdfCoordsForStorage(payload.pdfCoords, imageName),
+                        ],
                         imagesCount: partIndex
                       };
                     }
@@ -900,7 +911,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           type: payload.newQuestionProps?.type || 'mcq',
           marks: payload.newQuestionProps?.marks || { cm: 4, im: -1, pm: 0, max: 4 },
           answerOptions: payload.newQuestionProps?.answerOptions || '',
-          pdfData: payload.pdfCoords ? [{ ...payload.pdfCoords, filename: imageName }] : [],
+          pdfData: formatPdfCoordsForStorage(payload.pdfCoords, imageName),
           images: [
             {
               id: generateId(),
@@ -992,21 +1003,22 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                   });
                 }
 
-                const updatedPdfData = (q.pdfData || []).map((part, idx) =>
-                  idx === targetPartIdx - 1 && payload.pdfCoords
-                    ? { ...payload.pdfCoords, filename: targetFileName }
-                    : part
-                );
+                const formattedCoords = formatPdfCoordsForStorage(payload.pdfCoords, targetFileName);
+                let updatedPdfData = q.pdfData ? [...q.pdfData] : [];
+                if (Array.isArray(payload.pdfCoords)) {
+                  updatedPdfData = formattedCoords;
+                } else if (payload.pdfCoords) {
+                  if (updatedPdfData.length >= targetPartIdx) {
+                    updatedPdfData[targetPartIdx - 1] = formattedCoords[0];
+                  } else {
+                    updatedPdfData = formattedCoords;
+                  }
+                }
 
                 return {
                   ...q,
                   images: updatedImages,
-                  pdfData:
-                    updatedPdfData.length > 0
-                      ? updatedPdfData
-                      : payload.pdfCoords
-                      ? [{ ...payload.pdfCoords, filename: targetFileName }]
-                      : (q.pdfData || []),
+                  pdfData: updatedPdfData,
                 };
               }
               return q;
@@ -1040,9 +1052,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                 return {
                   ...q,
                   images: [newImage],
-                  pdfData: payload.pdfCoords
-                    ? [{ ...payload.pdfCoords, filename: targetFileName }]
-                    : [],
+                  pdfData: formatPdfCoordsForStorage(payload.pdfCoords, targetFileName),
                 };
               }
               return q;
@@ -1084,9 +1094,10 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
                 return {
                   ...q,
                   images: [...q.images, newImage],
-                  pdfData: payload.pdfCoords
-                    ? [...(q.pdfData || []), { ...payload.pdfCoords, filename: targetFileName }]
-                    : (q.pdfData || []),
+                  pdfData: [
+                    ...(q.pdfData || []),
+                    ...formatPdfCoordsForStorage(payload.pdfCoords, targetFileName),
+                  ],
                 };
               }
               return q;

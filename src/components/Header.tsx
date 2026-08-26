@@ -249,7 +249,7 @@ export const Header: React.FC = () => {
                   ZIP Inspector
                 </span>
                 <span className="text-[10px] font-mono font-medium px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                  v2.5.0
+                  v2.6.0
                 </span>
               </h1>
               <p className="text-[10px] text-slate-400 hidden xl:block">

@@ -1,7 +1,7 @@
 import { ApiKeyStatus, FallbackKeyItem, getKeyUsageSnapshot, getStoredPrimaryApiKey } from './geminiKeyManager';
 import { fetchWithGeminiFallback } from './geminiKeyManager';
 
-export type FleetStrategy = 'autopilot' | 'eco' | 'balanced' | 'turbo' | 'custom';
+export type FleetStrategy = 'autopilot' | 'eco' | 'balanced' | 'turbo' | 'prior_parallel' | 'custom';
 export type AgentRole = 'layout_worker' | 'diagram_auditor' | 'answer_linker' | 'consensus_manager';
 
 export interface SwarmAgent {
@@ -346,6 +346,13 @@ export function allocateSwarmFleet(
     targetLinkers = 0;
     ratePacingMs = 1200; // Pacing for quota preservation
     batchSize = 2;
+  } else if (strategy === 'prior_parallel') {
+    // Prior Full Parallel Swarm: Saturate all available keys simultaneously (1 page per worker)
+    targetWorkers = Math.max(1, availableKeys.length);
+    targetAuditors = 0;
+    targetLinkers = 0;
+    ratePacingMs = 50; // Minimal inter-batch pacing since all workers launch concurrently
+    batchSize = 1; // 1 page per worker for perfect parallel distribution
   } else if (strategy === 'balanced') {
     targetWorkers = Math.min(2, Math.max(1, availableKeys.length - 1));
     targetAuditors = availableKeys.length >= 4 ? 1 : 0;

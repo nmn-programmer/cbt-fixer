@@ -231,7 +231,7 @@ export const CbtPreviewModal: React.FC = () => {
                     const resolvedBlobUrl = img.blobUrl?.trim() || activeArchive.rawFiles.get(img.fileName)?.url || '';
                     return (
                       <div
-                        key={img.id}
+                        key={`${img.id}-${resolvedBlobUrl}-${img.sizeBytes || 0}`}
                         className="rounded-lg border border-slate-800 bg-white p-3 shadow-md overflow-hidden"
                       >
                         {resolvedBlobUrl && resolvedBlobUrl.trim() !== '' ? (

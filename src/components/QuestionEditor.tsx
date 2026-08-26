@@ -14,6 +14,7 @@ import {
   FileImage,
   FlipHorizontal,
   FlipVertical,
+  GitMerge,
   HelpCircle,
   Image as ImageIcon,
   Key,
@@ -926,6 +927,23 @@ export const QuestionEditor: React.FC = () => {
                     <span>Crop New Part</span>
                   </button>
 
+                  {(currentQuestion.images.length > 1 || currentQuestion.isSplitQuestion || (currentQuestion.pdfData && currentQuestion.pdfData.length > 1)) && (
+                    <button
+                      onClick={() =>
+                        openPdfRecrop({
+                          questionId: currentQuestion!.id,
+                          partIndex: 1,
+                          mode: 'stitch'
+                        })
+                      }
+                      className="flex items-center gap-1 px-2.5 py-1 text-xs bg-gradient-to-r from-purple-600/30 to-indigo-600/30 hover:from-purple-600/50 hover:to-indigo-600/50 text-purple-200 rounded-md border border-purple-500/50 transition-all font-semibold shadow-sm"
+                      title="Open Stitch Visualization Overlay to inspect spatial break and merge fragments"
+                    >
+                      <GitMerge className="w-3.5 h-3.5 text-purple-400" />
+                      <span>Stitch Overlay & Merge</span>
+                    </button>
+                  )}
+
                   {currentQuestion.images.length > 1 && (
                     <button
                       onClick={() => unlinkSplitQuestion(currentQuestion!.id)}
@@ -1177,7 +1195,7 @@ export const QuestionEditor: React.FC = () => {
                           const resolvedBlobUrl = img.blobUrl?.trim() || activeArchive.rawFiles.get(img.fileName)?.url || '';
                           return (
                             <div
-                              key={img.id}
+                              key={`${img.id}-${resolvedBlobUrl}-${img.sizeBytes || 0}`}
                               className="w-full max-w-2xl bg-slate-900/60 rounded-lg p-2 border border-slate-800/80 space-y-1.5"
                             >
                               <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
