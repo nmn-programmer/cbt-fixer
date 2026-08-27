@@ -1,7 +1,7 @@
 {
   "name": "cbt-question-paper-studio",
   "private": true,
-  "version": "2.6.0",
+  "version": "2.5.0",
   "description": "JEE CBT Question Paper Studio & ZIP Inspector",
   "type": "module",
   "scripts": {

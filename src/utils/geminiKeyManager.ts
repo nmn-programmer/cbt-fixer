@@ -962,6 +962,22 @@ export async function fetchWithGeminiFallback(
   // Ensure selected model is injected into request body for POST requests if not specified
   const selectedModel = getStoredSelectedModel();
   let modifiedOptions = { ...options };
+  
+  // Extract and strip preferred key if specified in headers
+  let preferredKey: string | null = null;
+  if (options.headers) {
+    const headers = new Headers(options.headers);
+    preferredKey = headers.get('X-Preferred-Key');
+    if (preferredKey) {
+      headers.delete('X-Preferred-Key');
+      const plainHeaders: Record<string, string> = {};
+      headers.forEach((val, k) => {
+        plainHeaders[k] = val;
+      });
+      modifiedOptions.headers = plainHeaders;
+    }
+  }
+
   if (options.body && typeof options.body === 'string') {
     try {
       const parsed = JSON.parse(options.body);
@@ -1048,6 +1064,18 @@ export async function fetchWithGeminiFallback(
       ...usableCandidates.slice(startIdx),
       ...usableCandidates.slice(0, startIdx),
     ];
+  }
+
+  // Prioritize preferred key if specified
+  if (preferredKey) {
+    const preferredCandIdx = usableCandidates.findIndex(
+      (c) => c.key.trim() === preferredKey?.trim()
+    );
+    if (preferredCandIdx !== -1) {
+      const preferredCand = usableCandidates[preferredCandIdx];
+      usableCandidates.splice(preferredCandIdx, 1);
+      usableCandidates.unshift(preferredCand);
+    }
   }
 
   let lastError: any = null;

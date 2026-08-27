@@ -2,6 +2,7 @@ import React, { useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
+  Crop,
   Download,
   FileArchive,
   FileCode,
@@ -204,6 +205,17 @@ export const ImportDropzone: React.FC = () => {
             >
               <FolderOpen className="w-4 h-4" />
               <span>Browse ZIPs</span>
+            </button>
+
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                useCbtStore.getState().openPdfRecrop();
+              }}
+              className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg shadow-md transition-colors flex items-center gap-2 shadow-emerald-900/30"
+            >
+              <Crop className="w-4 h-4" />
+              <span>Manual PDF Cropper</span>
             </button>
 
             <button

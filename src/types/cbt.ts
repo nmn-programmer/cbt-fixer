@@ -1,10 +1,18 @@
 export type QuestionType = 'mcq' | 'msq' | 'nat' | 'msm';
 
+export interface PartialTiersScheme {
+  threeCorrect?: number; // e.g. +3 if all 4 options are correct and 3 are chosen
+  twoCorrect?: number;   // e.g. +2 if 3 or 4 options are correct and 2 are chosen
+  oneCorrect?: number;   // e.g. +1 if 2, 3, or 4 options are correct and 1 is chosen
+}
+
 export interface MarksScheme {
   cm: number;      // Correct Marks (e.g. 3 or 4)
   im: number;      // Incorrect Marks (e.g. -1 or -2)
   pm?: number;     // Partial Marks per option (e.g. 1 for MSQ)
   max?: number;    // Maximum question marks (e.g. 4 or 12 for matrix)
+  partialTiers?: PartialTiersScheme; // JEE Advanced tiered partial marks
+  schemeType?: 'jee_main' | 'jee_adv_msq' | 'jee_adv_single' | 'jee_adv_nat' | 'custom';
 }
 
 export interface PdfDataPart {
@@ -47,6 +55,9 @@ export interface QuestionData {
   images: ImageAttachment[];
   notes?: string;
   isFlagged?: boolean;
+  hasExtractionWarning?: boolean;
+  warningReason?: string;
+  doubleScanStatus?: 'verified' | 'repaired' | 'flagged';
 }
 
 export interface SectionData {

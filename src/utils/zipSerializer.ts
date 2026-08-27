@@ -307,6 +307,10 @@ async function getImageBinary(
   if (archive.rawFiles.has(img.fileName)) {
     return archive.rawFiles.get(img.fileName)!.blob;
   }
+  const validatedPath = `validated_final/${img.fileName}`;
+  if (archive.rawFiles.has(validatedPath)) {
+    return archive.rawFiles.get(validatedPath)!.blob;
+  }
   // Try fetching blobUrl
   if (img.blobUrl && img.blobUrl.startsWith('blob:')) {
     try {
@@ -331,10 +335,12 @@ function prepareSubjectsForExport(
   return subjects.map((sub) => ({
     ...sub,
     sections: sub.sections.map((sec) => {
+      // Force strict numerical sorting by q.que
+      const sortedQuestions = [...sec.questions].sort((a, b) => a.que - b.que);
       let qNumCounter = 1;
       return {
         ...sec,
-        questions: sec.questions.map((q) => {
+        questions: sortedQuestions.map((q) => {
           const effectiveQNum = autoRenumber ? qNumCounter++ : q.que;
           return {
             ...q,

@@ -5,6 +5,7 @@ import { Settings,
   BookOpen,
   CheckCircle2,
   ChevronDown,
+  Crop,
   Download,
   Eye,
   FileArchive,
@@ -16,10 +17,12 @@ import { Settings,
   Moon,
   Plus,
   Redo2,
+  Sparkles,
   Sun,
   Trash2,
   Undo2,
   Upload,
+  Wand2,
   Wrench,
   X,
   Menu,
@@ -50,6 +53,8 @@ export const Header: React.FC = () => {
     setAnswerKeyModalOpen,
     setCbtSimulatorOpen,
     setMobileSidebarOpen,
+    openPdfRecrop,
+    setPdfConverterModalOpen,
     past,
     future,
     undo,
@@ -249,7 +254,7 @@ export const Header: React.FC = () => {
                   ZIP Inspector
                 </span>
                 <span className="text-[10px] font-mono font-medium px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                  v2.6.0
+                  v2.5.0
                 </span>
               </h1>
               <p className="text-[10px] text-slate-400 hidden xl:block">
@@ -280,6 +285,28 @@ export const Header: React.FC = () => {
           >
             <Download className="w-3.5 h-3.5 text-indigo-400" />
             <span className="hidden sm:inline">Import ZIP</span>
+          </button>
+
+          {/* Manual PDF Cropper Studio */}
+          <button
+            id="manual-cropper-btn"
+            onClick={() => openPdfRecrop()}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-emerald-950/60 hover:bg-emerald-900/60 active:bg-emerald-850 text-emerald-300 rounded-md border border-emerald-700/60 transition-colors shrink-0 shadow-sm"
+            title="Open Manual PDF Cropper & Test Maker Studio"
+          >
+            <Crop className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden md:inline font-semibold">Manual Cropper</span>
+          </button>
+
+          {/* AI Auto PDF Converter */}
+          <button
+            id="ai-pdf-converter-btn"
+            onClick={() => setPdfConverterModalOpen(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-indigo-950/60 hover:bg-indigo-900/60 active:bg-indigo-850 text-indigo-300 rounded-md border border-indigo-700/60 transition-colors shrink-0 shadow-sm"
+            title="Auto AI PDF to CBT Archive Extractor"
+          >
+            <Wand2 className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="hidden md:inline">AI Converter</span>
           </button>
 
           {/* Create New Paper Button */}

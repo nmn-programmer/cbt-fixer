@@ -400,7 +400,7 @@ export const FloatingQuestionPreview: React.FC = () => {
             ) : (
               displayedImages.map((img) => (
                 <div
-                  key={`${img.id}-${img.resolvedUrl}-${img.sizeBytes || 0}`}
+                  key={img.id}
                   className="w-full flex flex-col items-center rounded-lg border border-slate-800/60 bg-slate-900/20 p-2 shadow-sm relative group"
                 >
                   {/* Image Part Banner */}

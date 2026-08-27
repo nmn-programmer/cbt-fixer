@@ -14,7 +14,6 @@ import {
   FileImage,
   FlipHorizontal,
   FlipVertical,
-  GitMerge,
   HelpCircle,
   Image as ImageIcon,
   Key,
@@ -337,6 +336,41 @@ export const QuestionEditor: React.FC = () => {
 
       {/* Main Content Area */}
       <div className="flex-1 overflow-y-auto p-3 sm:p-5 space-y-4 scrollbar-thin">
+        {/* Double-Scan Manual Image Review Flag Banner */}
+        {(currentQuestion.hasExtractionWarning ||
+          currentQuestion.doubleScanStatus === 'flagged' ||
+          currentQuestion.isFlagged) && (
+          <div className="rounded-lg bg-amber-950/40 border border-amber-800/80 p-3 flex items-center justify-between text-xs text-amber-200 shadow-sm">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+              <div>
+                <span className="font-bold bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded text-[10px] uppercase font-mono mr-2 border border-amber-500/40">
+                  Needs Manual Image Review
+                </span>
+                <span>
+                  {currentQuestion.warningReason ||
+                    'Double-scan audit detected possible option truncation or boundary constraint on this extracted question.'}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={() =>
+                  openPdfRecrop({
+                    questionId: currentQuestion!.id,
+                    partIndex: activePartIndex,
+                    mode: 'replace_part',
+                  })
+                }
+                className="px-2.5 py-1 text-xs bg-amber-500 hover:bg-amber-400 text-slate-950 rounded font-semibold transition-colors flex items-center gap-1 shadow-sm"
+              >
+                <Crop className="w-3.5 h-3.5" />
+                <span>Adjust Bounds</span>
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Active Question Diagnostic Alerts Banner */}
         {qIssues.length > 0 && (
           <div className="rounded-lg bg-rose-950/40 border border-rose-800/80 p-3 space-y-2">
@@ -448,7 +482,14 @@ export const QuestionEditor: React.FC = () => {
                         onClick={() => {
                           const defaultMarks =
                             t.id === 'msq'
-                              ? { cm: 4, im: -2, pm: 1, max: 4 }
+                              ? {
+                                  cm: 4,
+                                  im: -2,
+                                  pm: 1,
+                                  max: 4,
+                                  partialTiers: { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 },
+                                  schemeType: 'jee_adv_msq' as const,
+                                }
                               : t.id === 'msm'
                               ? { cm: 3, im: -1, pm: 1, max: 12 }
                               : { cm: 4, im: -1, pm: 0, max: 4 };
@@ -662,6 +703,101 @@ export const QuestionEditor: React.FC = () => {
                   />
                 </div>
               </div>
+
+              {/* JEE Advanced MSQ Tiered Partial Marking Detail Panel */}
+              {currentQuestion.type === 'msq' && (
+                <div className="bg-slate-950/80 p-3 rounded-lg border border-purple-500/30 space-y-2 mt-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-purple-300 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                      <span>JEE Advanced MSQ Tiered Partial Marking Rules</span>
+                    </span>
+                    <span className="text-[10px] text-slate-400">Evaluates dynamically based on chosen count</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 text-[11px]">3 of 4 Correct:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-emerald-400 font-mono font-bold">+</span>
+                        <input
+                          type="number"
+                          value={currentQuestion.marks.partialTiers?.threeCorrect ?? 3}
+                          onChange={(e) =>
+                            updateQuestion(
+                              currentQuestion!.id,
+                              {
+                                marks: {
+                                  ...currentQuestion!.marks,
+                                  partialTiers: {
+                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
+                                    threeCorrect: parseFloat(e.target.value) || 0,
+                                  },
+                                },
+                              },
+                              'Update 3-correct partial tier'
+                            )
+                          }
+                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 text-[11px]">2 of 3/4 Correct:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-emerald-400 font-mono font-bold">+</span>
+                        <input
+                          type="number"
+                          value={currentQuestion.marks.partialTiers?.twoCorrect ?? 2}
+                          onChange={(e) =>
+                            updateQuestion(
+                              currentQuestion!.id,
+                              {
+                                marks: {
+                                  ...currentQuestion!.marks,
+                                  partialTiers: {
+                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
+                                    twoCorrect: parseFloat(e.target.value) || 0,
+                                  },
+                                },
+                              },
+                              'Update 2-correct partial tier'
+                            )
+                          }
+                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 text-[11px]">1 of 2/3/4 Correct:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-emerald-400 font-mono font-bold">+</span>
+                        <input
+                          type="number"
+                          value={currentQuestion.marks.partialTiers?.oneCorrect ?? 1}
+                          onChange={(e) =>
+                            updateQuestion(
+                              currentQuestion!.id,
+                              {
+                                marks: {
+                                  ...currentQuestion!.marks,
+                                  partialTiers: {
+                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
+                                    oneCorrect: parseFloat(e.target.value) || 0,
+                                  },
+                                },
+                              },
+                              'Update 1-correct partial tier'
+                            )
+                          }
+                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Row 3: Answer Key & Option Responses */}
@@ -927,23 +1063,6 @@ export const QuestionEditor: React.FC = () => {
                     <span>Crop New Part</span>
                   </button>
 
-                  {(currentQuestion.images.length > 1 || currentQuestion.isSplitQuestion || (currentQuestion.pdfData && currentQuestion.pdfData.length > 1)) && (
-                    <button
-                      onClick={() =>
-                        openPdfRecrop({
-                          questionId: currentQuestion!.id,
-                          partIndex: 1,
-                          mode: 'stitch'
-                        })
-                      }
-                      className="flex items-center gap-1 px-2.5 py-1 text-xs bg-gradient-to-r from-purple-600/30 to-indigo-600/30 hover:from-purple-600/50 hover:to-indigo-600/50 text-purple-200 rounded-md border border-purple-500/50 transition-all font-semibold shadow-sm"
-                      title="Open Stitch Visualization Overlay to inspect spatial break and merge fragments"
-                    >
-                      <GitMerge className="w-3.5 h-3.5 text-purple-400" />
-                      <span>Stitch Overlay & Merge</span>
-                    </button>
-                  )}
-
                   {currentQuestion.images.length > 1 && (
                     <button
                       onClick={() => unlinkSplitQuestion(currentQuestion!.id)}
@@ -1195,7 +1314,7 @@ export const QuestionEditor: React.FC = () => {
                           const resolvedBlobUrl = img.blobUrl?.trim() || activeArchive.rawFiles.get(img.fileName)?.url || '';
                           return (
                             <div
-                              key={`${img.id}-${resolvedBlobUrl}-${img.sizeBytes || 0}`}
+                              key={img.id}
                               className="w-full max-w-2xl bg-slate-900/60 rounded-lg p-2 border border-slate-800/80 space-y-1.5"
                             >
                               <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
