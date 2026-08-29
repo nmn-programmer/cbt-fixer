@@ -1,7 +1,7 @@
 import { ApiKeyStatus, FallbackKeyItem, getKeyUsageSnapshot, getStoredPrimaryApiKey } from './geminiKeyManager';
 import { fetchWithGeminiFallback } from './geminiKeyManager';
 
-export type FleetStrategy = 'autopilot' | 'eco' | 'balanced' | 'turbo' | 'custom';
+export type FleetStrategy = 'autopilot' | 'eco' | 'balanced' | 'turbo' | 'prior_parallel' | 'custom';
 export type AgentRole = 'layout_worker' | 'diagram_auditor' | 'answer_linker' | 'consensus_manager';
 
 export interface SwarmAgent {
@@ -287,7 +287,7 @@ Respond in MINIFIED JSON ONLY without markdown:
 export function allocateSwarmFleet(
   strategy: FleetStrategy = 'autopilot',
   triage?: TriageResult | null,
-  customOverrides?: { workers?: number; auditors?: number; managers?: number; totalPages?: number }
+  customOverrides?: { workers?: number; auditors?: number; managers?: number }
 ): FleetConfiguration {
   const snapshot = getKeyUsageSnapshot();
   const primaryKey = snapshot.primaryKey.trim();
@@ -340,27 +340,27 @@ export function allocateSwarmFleet(
   let ratePacingMs = 600;
   let batchSize = 2;
 
-  const totalPagesToExtract = customOverrides?.totalPages ?? 999;
-
   if (strategy === 'eco') {
     targetWorkers = 1;
     targetAuditors = 0;
     targetLinkers = 0;
     ratePacingMs = 1200; // Pacing for quota preservation
     batchSize = 2;
+  } else if (strategy === 'prior_parallel') {
+    // Prior Full Parallel Swarm: Saturate all available keys simultaneously (1 page per worker)
+    targetWorkers = Math.max(1, availableKeys.length);
+    targetAuditors = 0;
+    targetLinkers = 0;
+    ratePacingMs = 50; // Minimal inter-batch pacing since all workers launch concurrently
+    batchSize = 1; // 1 page per worker for perfect parallel distribution
   } else if (strategy === 'balanced') {
-    const maxPoss = Math.max(1, availableKeys.length - 1);
-    targetWorkers = Math.min(maxPoss, totalPagesToExtract);
-    if (totalPagesToExtract > 4 && availableKeys.length > 5) {
-      targetWorkers = Math.min(4, targetWorkers);
-    }
+    targetWorkers = Math.min(2, Math.max(1, availableKeys.length - 1));
     targetAuditors = availableKeys.length >= 4 ? 1 : 0;
     targetLinkers = 0;
     ratePacingMs = 600;
     batchSize = 2;
   } else if (strategy === 'turbo') {
-    const maxPoss = availableKeys.length; // Use all keys in turbo mode
-    targetWorkers = Math.min(maxPoss, totalPagesToExtract);
+    targetWorkers = Math.max(1, availableKeys.length - 1);
     targetAuditors = availableKeys.length >= 4 ? 1 : 0;
     targetLinkers = availableKeys.length >= 5 ? 1 : 0;
     ratePacingMs = 250;
@@ -372,20 +372,12 @@ export function allocateSwarmFleet(
       targetLinkers = 0;
       ratePacingMs = 1000;
     } else if (triage.complexityScore >= 8) {
-      const maxPoss = Math.max(1, availableKeys.length - 1);
-      targetWorkers = Math.min(maxPoss, totalPagesToExtract);
-      if (totalPagesToExtract > 6 && availableKeys.length > 7) {
-        targetWorkers = Math.min(6, targetWorkers);
-      }
+      targetWorkers = Math.min(3, Math.max(1, availableKeys.length - 1));
       targetAuditors = availableKeys.length >= 3 ? 1 : 0;
       targetLinkers = availableKeys.length >= 4 ? 1 : 0;
       ratePacingMs = 400;
     } else {
-      const maxPoss = Math.max(1, availableKeys.length - 1);
-      targetWorkers = Math.min(maxPoss, totalPagesToExtract);
-      if (totalPagesToExtract > 4 && availableKeys.length > 5) {
-        targetWorkers = Math.min(4, targetWorkers);
-      }
+      targetWorkers = Math.min(2, Math.max(1, availableKeys.length - 1));
       targetAuditors = availableKeys.length >= 4 ? 1 : 0;
       targetLinkers = 0;
       ratePacingMs = 600;
@@ -536,197 +528,3 @@ export async function auditDiagramBounds(
   xmax = Math.min(1.0, xmax + 0.03);
   return [ymin, xmin, ymax, xmax];
 }
-
-export interface DynamicBatchPlan {
-  batchIndex: number;
-  startPageIndex: number;
-  endPageIndex: number;
-  pageNumbers: number[];
-  assignedWorker: SwarmAgent;
-  allocatedPagesCount: number;
-}
-
-/**
- * Dynamic Page-Based Load Balancer Formula (P / K with RPM Capacity Weighting)
- * Evenly balances P pages among K active keys taking into account current RPM load.
- */
-export function planDynamicPageBatches(
-  pagesToProcess: number[],
-  fleet: FleetConfiguration
-): DynamicBatchPlan[] {
-  const totalPages = pagesToProcess.length;
-  if (totalPages === 0) return [];
-
-  const workers = fleet.workers.length > 0 ? fleet.workers : [fleet.manager];
-  const numWorkers = workers.length;
-
-  // Calculate RPM capacity weight per worker
-  const workerWeights = workers.map((w) => {
-    const rpm = w.rpm || 0;
-    if (rpm >= 14) return 0.2; // High load, allocate smaller batch
-    if (rpm >= 10) return 0.5;
-    if (rpm >= 6) return 0.8;
-    return 1.0; // High headroom
-  });
-
-  const maxPagesPerRequest = 8; // Safety payload ceiling
-  const plans: DynamicBatchPlan[] = [];
-
-  let startIdx = 0;
-  let batchIndex = 0;
-
-  while (startIdx < totalPages) {
-    const workerIdx = batchIndex % numWorkers;
-    const worker = workers[workerIdx];
-    const weight = workerWeights[workerIdx];
-
-    const remainingWorkers = Math.max(1, numWorkers - (batchIndex % numWorkers));
-    const rawTarget = Math.ceil((totalPages - startIdx) / remainingWorkers) * weight;
-
-    const allocatedPages = Math.min(
-      totalPages - startIdx,
-      Math.max(1, Math.min(maxPagesPerRequest, Math.round(rawTarget)))
-    );
-
-    const endIdx = startIdx + allocatedPages;
-    const pageNumbers = pagesToProcess.slice(startIdx, endIdx);
-
-    plans.push({
-      batchIndex,
-      startPageIndex: startIdx,
-      endPageIndex: endIdx,
-      pageNumbers,
-      assignedWorker: worker,
-      allocatedPagesCount: allocatedPages,
-    });
-
-    startIdx = endIdx;
-    batchIndex++;
-  }
-
-  return plans;
-}
-
-export interface QuestionValidationTarget {
-  qNo: number;
-  subject?: string;
-  box: [number, number, number, number];
-  pageIndex: number;
-  optionsFound?: string[];
-  completeness?: string;
-  isSplit?: boolean;
-}
-
-export interface VerifiedQuestionResult {
-  qNo: number;
-  box: [number, number, number, number];
-  doubleScanStatus: 'verified' | 'repaired' | 'flagged';
-  hasExtractionWarning: boolean;
-  warningReason?: string;
-  assignedAuditorLabel: string;
-}
-
-/**
- * Strict Parallel Double-Scan Verification Protocol
- * Mechanical bounding box & zero-clipping verification across all present API keys.
- */
-export function runParallelDoubleScanAudit(
-  questions: QuestionValidationTarget[],
-  fleet: FleetConfiguration
-): VerifiedQuestionResult[] {
-  const auditors =
-    fleet.auditors.length > 0
-      ? fleet.auditors
-      : fleet.workers.length > 0
-      ? fleet.workers
-      : [fleet.manager];
-
-  return questions.map((q, idx) => {
-    const auditor = auditors[idx % auditors.length];
-    const [ymin, xmin, ymax, xmax] = q.box || [0, 0, 1, 1];
-
-    const height = ymax - ymin;
-    const width = xmax - xmin;
-
-    const isFullWidthSpan = xmin < 0.25 && xmax > 0.70;
-    const isLeftCol = !isFullWidthSpan && xmin < 0.48;
-    const isRightCol = !isFullWidthSpan && xmin >= 0.48;
-
-    // Check for 3-Line Boundary Lock violations
-    const hasXBleed =
-      (!isFullWidthSpan && isLeftCol && xmax > 0.50) ||
-      (!isFullWidthSpan && isRightCol && xmin < 0.50);
-
-    const isTooTight = height < 0.04 || width < 0.12;
-    const isTruncatedAtBottom = ymax > 0.985 && (q.optionsFound?.length || 0) < 4;
-
-    if (isTruncatedAtBottom || isTooTight || hasXBleed) {
-      // Auto-repair attempt applying 3-line structural anchor locks and padding expansion
-      let repairedYmin = Math.max(0, ymin - 0.015);
-      let repairedYmax = Math.min(1.0, ymax + 0.025);
-      let repairedXmin = xmin;
-      let repairedXmax = xmax;
-
-      if (isLeftCol) {
-        repairedXmin = Math.min(xmin, 0.032);
-        repairedXmax = Math.min(xmax, 0.492);
-      } else if (isRightCol) {
-        repairedXmin = Math.max(xmin, 0.508);
-        repairedXmax = Math.max(xmax, 0.968);
-      } else if (isFullWidthSpan) {
-        repairedXmin = Math.min(xmin, 0.032);
-        repairedXmax = Math.max(xmax, 0.968);
-      }
-
-      if (repairedYmax - repairedYmin >= 0.04) {
-        return {
-          qNo: q.qNo,
-          box: [repairedYmin, repairedXmin, repairedYmax, repairedXmax],
-          doubleScanStatus: 'repaired',
-          hasExtractionWarning: false,
-          assignedAuditorLabel: auditor.label,
-        };
-      } else {
-        return {
-          qNo: q.qNo,
-          box: [ymin, xmin, ymax, xmax],
-          doubleScanStatus: 'flagged',
-          hasExtractionWarning: true,
-          warningReason:
-            'Needs Manual Image Review: Double-scan detected potential option truncation or 3-line boundary constraint.',
-          assignedAuditorLabel: auditor.label,
-        };
-      }
-    }
-
-    return {
-      qNo: q.qNo,
-      box: [ymin, xmin, ymax, xmax],
-      doubleScanStatus: 'verified',
-      hasExtractionWarning: false,
-      assignedAuditorLabel: auditor.label,
-    };
-  });
-}
-
-/**
- * Garbage Collector: Purge intermediate draft & scratch crop image files
- */
-export function purgeDraftImageArtifacts(
-  rawFiles: Map<string, { blob: Blob; url: string; size: number }>
-): Map<string, { blob: Blob; url: string; size: number }> {
-  const cleaned = new Map<string, { blob: Blob; url: string; size: number }>();
-  for (const [key, val] of rawFiles.entries()) {
-    if (/^(draft_|temp_|scratch_|crop_retry_)/i.test(key)) {
-      if (val.url && val.url.startsWith('blob:')) {
-        try {
-          URL.revokeObjectURL(val.url);
-        } catch (_) {}
-      }
-      continue;
-    }
-    cleaned.set(key, val);
-  }
-  return cleaned;
-}
-

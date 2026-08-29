@@ -24,8 +24,8 @@ function getErrorStatusCode(err: any): number {
 // API Route to extract test paper instructions blueprint & question ranges from Cover / Instructions page
 app.post('/api/extract-test-blueprint', async (req, res) => {
   try {
-    const { image, text, model: requestedModel } = req.body;
-    if (!image && !text) {
+    const { image, images, text, model: requestedModel } = req.body;
+    if (!image && (!images || images.length === 0) && !text) {
       return res.status(400).json({ error: 'Instruction page image or text is required' });
     }
 
@@ -115,7 +115,17 @@ CRITICAL DIRECTIVE ON MARKING SCHEME EXTRACTION:
    - Ensure all questions from 1 to Total Questions are mapped without gaps or overlapping ranges.`;
 
     const contents: any[] = [];
-    if (image) {
+    if (images && Array.isArray(images) && images.length > 0) {
+      images.forEach((imgStr: string) => {
+        const isJpeg = imgStr.startsWith('data:image/jpeg');
+        contents.push({
+          inlineData: {
+            data: imgStr.replace(/^data:image\/\w+;base64,/, ''),
+            mimeType: isJpeg ? 'image/jpeg' : 'image/png'
+          }
+        });
+      });
+    } else if (image) {
       const isJpeg = image.startsWith('data:image/jpeg');
       contents.push({
         inlineData: {
@@ -256,7 +266,7 @@ Use this blueprint to map question numbers accurately to subjects and verify exp
 app.post('/api/extract-pdf-structure', async (req, res) => {
   try {
     const { images, pageOffset = 0, options = {}, model: requestedModel } = req.body;
-    const { hasAnswerKey = true, extractEnglishOnly = false, manifest = null, targetQNos = null } = options;
+    const { hasAnswerKey = true, extractEnglishOnly = false, manifest = null, targetQNos = null, autoCorrectionInstruction = null, instructionDirective = null } = options;
     
     if (!images || !images.length) {
       return res.status(400).json({ error: 'No images provided' });
@@ -370,30 +380,48 @@ app.post('/api/extract-pdf-structure', async (req, res) => {
 Analyze the provided page images (up to 2-3 pages per batch).
 The document is an official exam paper with printed question numbers and formulas.
 
-CRITICAL BOUNDING BOX & COLUMN PROTOCOL (3-LINE STRUCTURAL & Q_n -> Q_n+1 PAIRING):
+CRITICAL BOUNDING BOX & 4-LINE GRID PROTOCOL:
+1. 4-Line Imaginary Grid for 2-Column Papers:
+   - Line 1 (Left Margin): x ≈ 0.035
+   - Line 2 (Center Divider Left): x ≈ 0.490
+   - Line 3 (Center Divider Right): x ≈ 0.508
+   - Line 4 (Right Margin): x ≈ 0.965
+   - Left Column Questions: [ymin, 0.035, ymax, 0.490]. NEVER cross past center divider into right column.
+   - Right Column Questions: [ymin, 0.508, ymax, 0.965]. NEVER cross into left column.
+   - Full-Width Questions (only for single column or full width headers): [ymin, 0.035, ymax, 0.965].
 
-1. 3-LINE STRUCTURAL BOUNDARY LOCK (X-Axis Zero Clipping):
-   - Locate the 3 vertical boundary lines across the page canvas: Left Margin Line (~0.035), Central Column Divider Line (~0.500), and Right Margin Line (~0.965).
-   - Left Column Questions:
-     * xmin MUST start to the LEFT of the printed question number label (e.g., "15.", "Q.15") at or near the Left Margin Line (xmin <= 0.035).
-     * xmax MUST extend to and clamp PRECISELY at the Central Column Divider (xmax <= 0.490). NEVER bleed into the right column text.
-   - Right Column Questions:
-     * xmin MUST start PRECISELY past the Central Column Divider (xmin >= 0.510).
-     * xmax MUST extend to the Right Margin Line (xmax >= 0.965).
-   - Full-Width Banners / Spanning Diagrams Override:
-     * If a question, table, or physics/chemistry diagram spans across the central divider, set xmin <= 0.035 and xmax >= 0.965 (full page width).
+2. Horizontal Question-to-Question Boundary Snapping:
+   - Top Boundary (ymin): Snapped precisely to the top of the question number (e.g. "1.", "Q.1") and its stem/diagram.
+   - Bottom Boundary (ymax): Snapped strictly ABOVE where the next question begins (ymax <= next_question.ymin - 0.005). NEVER include the next question in the current question's slice!
+   - Complete Options Enclosure: For MCQs, ymax must enclose the final option line completely without bleeding into subsequent question numbers.
+   - Exclude page headers, subject header banners (e.g. "SECTION - 1: PHYSICS"), and page numbers at bottom.
 
-2. VERTICAL QUESTION-PAIR PAIRING (Y-Axis Q_n to Q_n+1 Protocol):
-   - Y_MIN: Upper bound MUST start immediately before the start of Question Q_n label (e.g. "Q.15", "15.").
-   - Y_MAX: Lower bound MUST extend down to immediately before the start of the next question label Q_(n+1) in the same column/page.
-   - For the LAST question in a column/page, Y_MAX extends down to the column bottom margin line before the page footer.
+3. Reading Order & Question Sequence:
+   - Read columns strictly top-to-bottom for LEFT column first, then top-to-bottom for RIGHT column.
+   - Extract questions in strict ascending sequence according to printed numbers (Q1, Q2, Q3...).
+   - STRICT MANDATE: EVERY printed question number (e.g. "1.", "2.", "Q.1", "Q.2", "Question 2") MUST be emitted as its own distinct question in the array. NEVER merge Question N+1 into Question N if Question N+1 has its own printed question number!
 
-3. DYNAMIC COLUMN OVERFLOW & MULTI-PAGE SPLIT EXCEPTION:
-   - If Question Q_n ends before listing all options (or Q_(n+1) is in a different column or next page):
-     * Mark "isSplit": true, "completeness": "split".
-     * Set Part 1 Y_MAX to the bottom line of the current column.
-     * Locate Part 2 at the top of the next column or next page (from top margin line down to Q_(n+1) label).
-   - If the top of a column starts with orphaned options without a new Q-number, mark "isOrphanContinuation": true and "continuationForQNo" to preceding Q-number.
+4. MANDATORY PROTOCOL FOR MULTI-COLUMN & MULTI-PAGE SPLIT QUESTIONS:
+   - Exam questions often split across columns or pages due to page/column limits.
+   - Scenario A: Left Column Bottom -> Right Column Top:
+     * A question starts near the bottom of the left column (with stem/diagram) and ends before listing all options (or has 0, 1, or 2 options).
+     * The missing options (A-D, or C-D) appear at the VERY TOP of the RIGHT column WITHOUT any new question number.
+     * ACTION: Mark "isSplit": true, "completeness": "split".
+     * Provide "splitParts":
+       [
+         { "pageIndex": <page_index>, "box": [<ymin>, <xmin>, <ymax>, <xmax> on left column], "partLabel": "Part 1 (Stem)" },
+         { "pageIndex": <page_index>, "box": [<ymin>, <xmin>, <ymax>, <xmax> at top of right column], "partLabel": "Part 2 (Options)" }
+       ]
+   - Scenario B: Bottom of Page N -> Top of Page N+1:
+     * A question starts near the bottom of Page N, and its remaining options/stem continue at the top of Page N+1 (WITHOUT a new question number).
+     * ACTION: Mark "isSplit": true, "completeness": "split", and specify both parts across the pages in "splitParts".
+   - Scenario C: Unexpected Options at Top of Column / Page without Question Number:
+     * When beginning to read the top of a column or top of a page, if you see options like "(A)... (B)... (C)... (D)..." or "(C)... (D)..." WITHOUT a new question number (e.g. no "Q16"):
+     * THIS CONTENT BELONGS TO THE PREVIOUS QUESTION (e.g. Q15)!
+     * DO NOT ignore or drop it!
+     * DO NOT create a new question number for it!
+     * Attach it as Part 2 to the preceding question in "splitParts", or if outputting as a block, mark "isOrphanContinuation": true and "continuationForQNo": <previous_question_number>.
+   - STRICT FORBIDDEN RULE: NEVER mark a block as a split part or orphan continuation if it has its own printed question number (e.g. "Q.2", "2.", "Question 2"). Every block with a printed question number is an independent question.
 
 ${extractEnglishOnly ? 'BILINGUAL PAPER: Extract ONLY the English version of questions and options.' : ''}
 
@@ -406,6 +434,19 @@ Strictly enforce subject categorization (Physics/Chemistry/Mathematics/Biology/G
 ${targetQNos && Array.isArray(targetQNos) && targetQNos.length > 0 ? `PINPOINT RESCAN DIRECTIVE:
 Specifically search for missing question(s) Q${targetQNos.join(', Q')}.
 Focus on column margins, top/bottom boundaries, or unnumbered diagrams to locate and extract these specific question numbers!` : ''}
+
+${autoCorrectionInstruction ? `\n*************************************************************
+${autoCorrectionInstruction}
+*************************************************************\n` : ''}
+
+${instructionDirective ? `\n*************************************************************
+CRITICAL EXAM STRUCTURE & QUESTION TYPE DIRECTIVES FROM INSTRUCTION PAGE SCAN:
+${instructionDirective}
+
+MANDATORY OPTION ENCLOSURE RULE:
+- For MCQ sections identified in the directive above (e.g., Q1-Q20, Q26-Q45), the question bounding box [ymin, xmin, ymax, xmax] MUST EXTEND VERTICALLY TO ENCLOSE ALL 4 OPTIONS (Option A, B, C, D or 1, 2, 3, 4).
+- NEVER cut off options! If options wrap across columns or onto the next page, mark "isSplit": true and list the splitParts.
+*************************************************************\n` : ''}
 
 Output normalized bounding box [ymin, xmin, ymax, xmax] between 0.0 and 1.0 for each question.
 ${hasAnswerKey ? 'Extract printed answer key table if present on these pages.' : ''}`;

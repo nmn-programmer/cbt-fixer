@@ -56,9 +56,6 @@ import {
   runDocumentTriage,
   allocateSwarmFleet,
   auditDiagramBounds,
-  planDynamicPageBatches,
-  runParallelDoubleScanAudit,
-  purgeDraftImageArtifacts,
   getCachedTaskResult,
   setCachedTaskResult,
   getTaskCacheKey,
@@ -70,6 +67,19 @@ import {
   ReconciliationReport,
   AnswerKeyEntry,
 } from '../utils/streamingMerger';
+import {
+  analyzePageLayoutAndSpans,
+  cropBoxWithSpanAwareness,
+  rectifyQuestionBoundingBoxes,
+  determineDocumentLayoutConsensus,
+  detectAndInheritPassageStems,
+  PageLayoutAnalysis,
+} from '../utils/intelligentCvSplitter';
+import {
+  validateWorkerExtraction,
+  buildAutoCorrectionPrompt,
+  ExtractionValidationResult,
+} from '../utils/extractionValidator';
 
 interface QuestionDetection {
   pageIndex: number;
@@ -153,6 +163,35 @@ const PRESETS = [
   },
 ];
 
+function parsePageRangeString(inputStr: string, totalPages: number): number[] {
+  if (!inputStr || !inputStr.trim()) return [1];
+  const pages = new Set<number>();
+  const parts = inputStr.split(',');
+  for (const rawPart of parts) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    if (part.includes('-')) {
+      const [startStr, endStr] = part.split('-');
+      const start = parseInt(startStr.trim(), 10);
+      const end = parseInt(endStr.trim(), 10);
+      if (!isNaN(start) && !isNaN(end)) {
+        const from = Math.max(1, Math.min(start, end));
+        const to = Math.min(totalPages || 100, Math.max(start, end));
+        for (let i = from; i <= to; i++) {
+          pages.add(i);
+        }
+      }
+    } else {
+      const num = parseInt(part, 10);
+      if (!isNaN(num) && num >= 1) {
+        pages.add(Math.min(num, totalPages || 100));
+      }
+    }
+  }
+  const result = Array.from(pages).sort((a, b) => a - b);
+  return result.length > 0 ? result : [1];
+}
+
 export const AutoPdfConverterModal: React.FC = () => {
   const {
     isPdfConverterModalOpen,
@@ -186,7 +225,7 @@ export const AutoPdfConverterModal: React.FC = () => {
   const [durationMinutes, setDurationMinutes] = useState<number>(60);
   const [totalMarks, setTotalMarks] = useState<number>(96);
   const [isScanningInstructions, setIsScanningInstructions] = useState(false);
-  const [instructionPageNum, setInstructionPageNum] = useState<number>(1);
+  const [instructionPagesInput, setInstructionPagesInput] = useState<string>('1, 2');
   const [answerKeyMode, setAnswerKeyMode] = useState<'auto' | 'separate_file' | 'selected_pages'>('auto');
   const [answerKeyFile, setAnswerKeyFile] = useState<File | null>(null);
   const [answerKeySelectedPages, setAnswerKeySelectedPages] = useState<Set<number>>(new Set());
@@ -230,9 +269,8 @@ export const AutoPdfConverterModal: React.FC = () => {
       workers: customWorkers,
       auditors: customAuditors,
       managers: 1,
-      totalPages: selectedPages.size,
     });
-  }, [fleetStrategy, triageResult, customWorkers, customAuditors, selectedPages.size]);
+  }, [fleetStrategy, triageResult, customWorkers, customAuditors]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -454,15 +492,16 @@ export const AutoPdfConverterModal: React.FC = () => {
     setBlueprintRanges((prev) => prev.filter((r) => r.id !== id));
   };
 
-  // AI Scan Instructions Page from the uploaded PDF/ZIP (Page 1 or user-selected page)
-  const handleScanInstructionsFromPdf = async (targetPageNum?: number) => {
+  // AI Scan Instructions Pages from the uploaded PDF/ZIP
+  const handleScanInstructionsFromPdf = async (customPagesInput?: string) => {
     if (!file) return;
-    const pageToScan = Math.max(1, targetPageNum || instructionPageNum || 1);
+    const inputStr = customPagesInput || instructionPagesInput || '1, 2';
+    const pagesToScan = parsePageRangeString(inputStr, thumbnails.length || 100);
     try {
       setIsScanningInstructions(true);
-      setInstructionsScanStatus(`Rendering instruction page ${pageToScan}...`);
+      setInstructionsScanStatus(`Rendering instruction pages (${pagesToScan.join(', ')})...`);
 
-      let base64Image = '';
+      const base64Images: string[] = [];
       const isZip = file.name.toLowerCase().endsWith('.zip') || file.type.includes('zip');
 
       if (isZip) {
@@ -476,50 +515,60 @@ export const AutoPdfConverterModal: React.FC = () => {
           const pdfBuf = await loadedZip.files[pdfEntryName].async('arraybuffer');
           const pdfjsLib = await getPdfjsLib();
           const pdfDoc = await pdfjsLib.getDocument({ data: pdfBuf }).promise;
-          const validPageNum = Math.min(pageToScan, pdfDoc.numPages);
-          const page = await pdfDoc.getPage(validPageNum);
-          const viewport = page.getViewport({ scale: 2.0 });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) throw new Error('Canvas context error');
-          await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
-          base64Image = canvas.toDataURL('image/jpeg', 0.85);
+
+          for (const pageNum of pagesToScan) {
+            const validPageNum = Math.min(pageNum, pdfDoc.numPages);
+            const page = await pdfDoc.getPage(validPageNum);
+            const viewport = page.getViewport({ scale: 2.0 });
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
+              base64Images.push(canvas.toDataURL('image/jpeg', 0.85));
+            }
+          }
         } else {
           const imgEntries = Object.entries(loadedZip.files)
             .filter(([fn, entry]) => !entry.dir && /\.(png|jpe?g|webp|bmp)$/i.test(fn))
             .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 
-          if (imgEntries.length > 0) {
-            const validIdx = Math.min(pageToScan - 1, imgEntries.length - 1);
-            const targetBlob = await imgEntries[validIdx][1].async('blob');
-            base64Image = await new Promise<string>((resolve) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(reader.result as string);
-              reader.readAsDataURL(targetBlob);
-            });
+          for (const pageNum of pagesToScan) {
+            if (imgEntries.length > 0) {
+              const validIdx = Math.min(pageNum - 1, imgEntries.length - 1);
+              const targetBlob = await imgEntries[validIdx][1].async('blob');
+              const b64 = await new Promise<string>((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result as string);
+                reader.readAsDataURL(targetBlob);
+              });
+              if (b64) base64Images.push(b64);
+            }
           }
         }
       } else {
         const arrayBuffer = await file.arrayBuffer();
         const pdfjsLib = await getPdfjsLib();
         const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-        const validPageNum = Math.min(pageToScan, pdfDoc.numPages);
-        const page = await pdfDoc.getPage(validPageNum);
-        const viewport = page.getViewport({ scale: 2.0 });
 
-        const canvas = document.createElement('canvas');
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) throw new Error('Canvas context error');
+        for (const pageNum of pagesToScan) {
+          const validPageNum = Math.min(pageNum, pdfDoc.numPages);
+          const page = await pdfDoc.getPage(validPageNum);
+          const viewport = page.getViewport({ scale: 2.0 });
 
-        await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
-        base64Image = canvas.toDataURL('image/jpeg', 0.85);
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
+            base64Images.push(canvas.toDataURL('image/jpeg', 0.85));
+          }
+        }
       }
 
-      if (!base64Image) throw new Error(`Unable to render page ${pageToScan} for blueprint extraction`);
+      if (base64Images.length === 0) throw new Error(`Unable to render instruction pages for blueprint extraction`);
 
       setInstructionsScanStatus('Analyzing General Instructions & question ranges with Gemini Vision...');
 
@@ -528,7 +577,7 @@ export const AutoPdfConverterModal: React.FC = () => {
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image: base64Image }),
+          body: JSON.stringify({ images: base64Images, image: base64Images[0] }),
         },
         addToast,
         refreshUsageMetrics
@@ -624,6 +673,7 @@ export const AutoPdfConverterModal: React.FC = () => {
 
       const base64Images: string[] = [];
       const canvasImages: HTMLCanvasElement[] = [];
+      const pageLayouts: PageLayoutAnalysis[] = [];
 
       const pagesToProcess: number[] = Array.from<number>(selectedPages).sort((a, b) => a - b);
       if (pagesToProcess.length === 0) throw new Error('No pages selected for processing');
@@ -702,6 +752,10 @@ export const AutoPdfConverterModal: React.FC = () => {
         base64Images.push(base64ForAi);
         canvasImages.push(canvas); // Keep original 300 DPI native canvas for high-res bounding box cropping
 
+        // Deterministic Computer Vision scan for 2-column gutter and full-width diagram spans
+        const layoutAnalysis = analyzePageLayoutAndSpans(canvas);
+        pageLayouts.push(layoutAnalysis);
+
         const pagePercent = Math.min(35, Math.round(5 + ((i + 1) / pagesToProcess.length) * 30));
         setPercent(pagePercent);
         setProgressDetail(`Rendered page ${pageNum} (${i + 1}/${pagesToProcess.length})`);
@@ -768,7 +822,6 @@ export const AutoPdfConverterModal: React.FC = () => {
         workers: customWorkers,
         auditors: customAuditors,
         managers: 1,
-        totalPages: pagesToProcess.length,
       });
 
       // Phase 0: Global Blueprint Manifest Assembly (Scout Directive Agent)
@@ -789,14 +842,13 @@ export const AutoPdfConverterModal: React.FC = () => {
         message: `Global Blueprint Manifest Active: ${globalManifest.totalExpectedQuestions} questions target across ${globalManifest.sections.length} section range(s).`,
       });
 
-      const dynamicBatchPlans = planDynamicPageBatches(pagesToProcess, swarmFleet);
-      const totalBatches = dynamicBatchPlans.length;
+      const BATCH_SIZE = swarmFleet.batchSize || 2;
+      const totalBatches = Math.ceil(pagesToProcess.length / BATCH_SIZE);
 
       const initialPartitions: PagePartitionState[] = pagesToProcess.map((p, idx) => {
-        const plan =
-          dynamicBatchPlans.find((bp) => idx >= bp.startPageIndex && idx < bp.endPageIndex) ||
-          dynamicBatchPlans[0];
-        const assignedWorker = plan ? plan.assignedWorker : swarmFleet.manager;
+        const batchIndex = Math.floor(idx / BATCH_SIZE);
+        const assignedWorker =
+          swarmFleet.workers[batchIndex % Math.max(1, swarmFleet.workers.length)] || swarmFleet.manager;
         return {
           pageNumber: p,
           assignedWorkerId: assignedWorker.id,
@@ -928,182 +980,565 @@ export const AutoPdfConverterModal: React.FC = () => {
         let lastBatchError = '';
         const streamingMerger = new StreamingProducerConsumerMerger(handleSplitQuestions);
 
-        // Map batch plans to parallel dispatch promises
-        const batchPromises = dynamicBatchPlans.map(async (plan, batchIdx) => {
-          // Stagger the request dispatch to spread the network/API load beautifully
-          const staggerDelayMs = batchIdx * (swarmFleet.workers.length > 1 ? 150 : swarmFleet.ratePacingMs);
-          if (staggerDelayMs > 0) {
-            await new Promise((r) => setTimeout(r, staggerDelayMs));
+        // Determine if we run in True Concurrent Parallel Mode
+        const isParallelMode =
+          fleetStrategy === 'prior_parallel' ||
+          (swarmFleet.workers.length > 1 && swarmFleet.batchSize === 1);
+
+        // Build worker page slices
+        interface PageSlice {
+          startPage: number;
+          endPage: number;
+          workerIndex: number;
+          sliceId: number;
+        }
+
+        const slices: PageSlice[] = [];
+
+        if (isParallelMode) {
+          // Full Parallel Distribution: Distribute pagesToProcess among all available workers simultaneously
+          const count = Math.min(pagesToProcess.length, swarmFleet.workers.length);
+          const baseSize = Math.floor(pagesToProcess.length / count);
+          const remainder = pagesToProcess.length % count;
+          let current = 0;
+          for (let i = 0; i < count; i++) {
+            const size = baseSize + (i < remainder ? 1 : 0);
+            const start = current;
+            const end = current + size;
+            slices.push({ startPage: start, endPage: end, workerIndex: i, sliceId: i });
+            current = end;
           }
+        } else {
+          // Sequential Batches
+          for (let b = 0; b < totalBatches; b++) {
+            const start = b * BATCH_SIZE;
+            const end = Math.min(pagesToProcess.length, start + BATCH_SIZE);
+            slices.push({
+              startPage: start,
+              endPage: end,
+              workerIndex: b % Math.max(1, swarmFleet.workers.length),
+              sliceId: b,
+            });
+          }
+        }
 
-          const startPage = plan.startPageIndex;
-          const endPage = plan.endPageIndex;
-          const chunkImages = base64Images.slice(startPage, endPage);
+        const instructionDirectiveText =
+          blueprintRanges && blueprintRanges.length > 0
+            ? `INSTRUCTED EXAM BLUEPRINT & QUESTION SECTIONS:\n` +
+              blueprintRanges
+                .map(
+                  (r) =>
+                    `• Questions Q${r.fromQNo} to Q${r.toQNo}: Subject '${r.subjectName}', Section '${r.sectionName}', Format '${r.type.toUpperCase()}'. ${
+                      r.type === 'mcq'
+                        ? 'CRITICAL REQUIREMENT: MUST ENCLOSE ALL 4 OPTIONS (A, B, C, D) or (1, 2, 3, 4). Do NOT cut off options!'
+                        : 'Problem statement and numerical input space.'
+                    }`
+                )
+                .join('\n')
+            : '';
 
-          const realStartPage = plan.pageNumbers[0];
-          const realEndPage = plan.pageNumbers[plan.pageNumbers.length - 1];
-          const assignedWorker = plan.assignedWorker;
-
+        if (isParallelMode) {
+          // --- CONCURRENT PRIOR FULL PARALLEL EXECUTION ---
           emitWorkerLog({
-            workerId: assignedWorker.id,
-            workerLabel: assignedWorker.label,
+            workerId: swarmFleet.manager.id,
+            workerLabel: swarmFleet.manager.label,
             level: 'info',
-            pageNumber: realStartPage,
-            message: `Dispatching Batch ${batchIdx + 1}/${totalBatches} (Pages ${realStartPage}-${realEndPage}) to ${assignedWorker.roleTitle} (${assignedWorker.label})...`,
+            message: `🚀 Prior Full Parallel Swarm Launch: Starting ${slices.length} extractors simultaneously across all workers. All agents working together!`,
           });
 
+          // Mark all partitions as processing
           setPagePartitions((prev) =>
             prev.map((p) =>
-              p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
-                ? { ...p, status: 'processing' }
-                : p
+              pagesToProcess.includes(p.pageNumber) ? { ...p, status: 'processing' } : p
             )
           );
 
-          let batchSuccess = false;
-          let retryAttempt = 0;
-          const MAX_BATCH_RETRIES = 2;
-          let batchQuestions: any[] = [];
-          let batchKeys: any[] = [];
+          let completedParallelCount = 0;
 
-          while (!batchSuccess && retryAttempt <= MAX_BATCH_RETRIES) {
-            try {
-              // Pass X-Preferred-Key in the request headers to force the geminiKeyManager 
-              // to route this request strictly to the assigned worker's specific key!
-              const res = await fetchWithGeminiFallback(
-                '/api/extract-pdf-structure',
-                {
-                  method: 'POST',
-                  headers: { 
-                    'Content-Type': 'application/json',
-                    'X-Preferred-Key': assignedWorker.key
+          const parallelTasks = slices.map(async (slice) => {
+            const assignedWorker =
+              swarmFleet.workers[slice.workerIndex] || swarmFleet.manager;
+            const chunkImages = base64Images.slice(slice.startPage, slice.endPage);
+            const realStartPage = pagesToProcess[slice.startPage];
+            const realEndPage = pagesToProcess[slice.endPage - 1];
+
+            emitWorkerLog({
+              workerId: assignedWorker.id,
+              workerLabel: assignedWorker.label,
+              level: 'info',
+              message: `[Extractor ${slice.sliceId + 1}/${slices.length}] ${assignedWorker.roleTitle} (${assignedWorker.label}) starting Pages ${realStartPage}-${realEndPage}...`,
+              pageNumber: realStartPage,
+            });
+
+            let sliceSuccess = false;
+            let retryAttempt = 0;
+            const MAX_RETRIES = 2;
+            let detectedList: QuestionDetection[] = [];
+            let returnedKeys: AnswerKeyEntry[] = [];
+
+            while (!sliceSuccess && retryAttempt <= MAX_RETRIES) {
+              try {
+                const res = await fetchWithGeminiFallback(
+                  '/api/extract-pdf-structure',
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      images: chunkImages,
+                      pageOffset: slice.startPage,
+                      options: {
+                        hasAnswerKey,
+                        extractEnglishOnly,
+                        enableDoublePass: enableDoublePassRescan,
+                        manifest: globalManifest,
+                        instructionDirective: instructionDirectiveText,
+                      },
+                    }),
                   },
-                  body: JSON.stringify({
-                    images: chunkImages,
-                    pageOffset: startPage,
-                    options: {
-                      hasAnswerKey,
-                      extractEnglishOnly,
-                      enableDoublePass: enableDoublePassRescan,
-                      manifest: globalManifest,
-                    },
-                  }),
-                },
-                addToast,
-                refreshUsageMetrics
-              );
-
-              if (res.ok) {
-                const batchResponse = await res.json();
-                batchQuestions = batchResponse.questions && Array.isArray(batchResponse.questions)
-                  ? batchResponse.questions
-                  : [];
-                batchKeys = batchResponse.answerKeys && Array.isArray(batchResponse.answerKeys)
-                  ? batchResponse.answerKeys
-                  : [];
-
-                setPagePartitions((prev) =>
-                  prev.map((p) =>
-                    p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
-                      ? { ...p, status: 'done', detectedQuestionsCount: batchQuestions.length }
-                      : p
-                  )
+                  addToast,
+                  refreshUsageMetrics
                 );
 
-                emitWorkerLog({
-                  workerId: assignedWorker.id,
-                  workerLabel: assignedWorker.label,
-                  level: 'success',
-                  pageNumber: realStartPage,
-                  message: `Batch ${batchIdx + 1} completed: +${batchQuestions.length} items extracted on ${assignedWorker.label}.`,
-                });
+                if (res.ok) {
+                  const batchResponse = await res.json();
+                  detectedList =
+                    batchResponse.questions && Array.isArray(batchResponse.questions)
+                      ? batchResponse.questions
+                      : [];
 
-                batchSuccess = true;
-              } else {
-                const errData = await res.json().catch(() => ({}));
-                throw new Error(errData.error || `HTTP ${res.status}`);
+                  // Extraction Validation Middleware
+                  const validation: ExtractionValidationResult = validateWorkerExtraction(
+                    detectedList,
+                    slice.startPage
+                  );
+
+                  if (!validation.isValid && validation.autoCorrectNeeded) {
+                    emitWorkerLog({
+                      workerId: assignedWorker.id,
+                      workerLabel: assignedWorker.label,
+                      level: 'warning',
+                      message: `[Extractor ${slice.sliceId + 1}] Validation Warning: Detected ${validation.issues.length} anomaly/anomalies (${validation.issues.map((i) => i.type).join(', ')}). Auto-correcting worker...`,
+                      pageNumber: realStartPage,
+                    });
+
+                    try {
+                      const autoCorrectionPrompt = buildAutoCorrectionPrompt(
+                        validation.issues,
+                        detectedList.length
+                      );
+                      const autoCorrectRes = await fetchWithGeminiFallback(
+                        '/api/extract-pdf-structure',
+                        {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            images: chunkImages,
+                            pageOffset: slice.startPage,
+                            options: {
+                              hasAnswerKey,
+                              extractEnglishOnly,
+                              enableDoublePass: false,
+                              manifest: globalManifest,
+                              autoCorrectionInstruction: autoCorrectionPrompt,
+                            },
+                          }),
+                        },
+                        addToast,
+                        refreshUsageMetrics
+                      );
+
+                      if (autoCorrectRes.ok) {
+                        const autoCorrectData = await autoCorrectRes.json();
+                        if (
+                          autoCorrectData.questions &&
+                          Array.isArray(autoCorrectData.questions) &&
+                          autoCorrectData.questions.length > 0
+                        ) {
+                          const reValidation = validateWorkerExtraction(
+                            autoCorrectData.questions,
+                            slice.startPage
+                          );
+                          detectedList = reValidation.cleanQuestions;
+                          emitWorkerLog({
+                            workerId: assignedWorker.id,
+                            workerLabel: assignedWorker.label,
+                            level: 'success',
+                            message: `[Extractor ${slice.sliceId + 1}] Auto-Correction Successful: Cleaned to ${detectedList.length} questions.`,
+                            pageNumber: realStartPage,
+                          });
+                        } else {
+                          detectedList = validation.cleanQuestions;
+                        }
+                      } else {
+                        detectedList = validation.cleanQuestions;
+                      }
+                    } catch (autoErr) {
+                      detectedList = validation.cleanQuestions;
+                    }
+                  } else {
+                    detectedList = validation.cleanQuestions;
+                  }
+
+                  if (batchResponse.answerKeys && Array.isArray(batchResponse.answerKeys)) {
+                    returnedKeys = batchResponse.answerKeys;
+                  }
+
+                  completedParallelCount++;
+                  const curPercent = Math.round(
+                    36 + (completedParallelCount / slices.length) * 39
+                  );
+                  setPercent(curPercent);
+                  setStatus(
+                    `Parallel Swarm: ${completedParallelCount}/${slices.length} extractors completed...`
+                  );
+                  setProgressDetail(
+                    `Parallel Extractor on Pages ${realStartPage}-${realEndPage} completed (+${detectedList.length} questions).`
+                  );
+
+                  setPagePartitions((prev) =>
+                    prev.map((p) =>
+                      p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                        ? { ...p, status: 'done', detectedQuestionsCount: detectedList.length }
+                        : p
+                    )
+                  );
+
+                  emitWorkerLog({
+                    workerId: assignedWorker.id,
+                    workerLabel: assignedWorker.label,
+                    level: 'success',
+                    message: `[Extractor ${slice.sliceId + 1}/${slices.length}] Finished Pages ${realStartPage}-${realEndPage}: ${detectedList.length} questions.`,
+                    pageNumber: realStartPage,
+                  });
+
+                  sliceSuccess = true;
+                } else {
+                  const errData = await res.json().catch(() => ({}));
+                  throw new Error(errData.error || `HTTP ${res.status}`);
+                }
+              } catch (sliceErr: any) {
+                retryAttempt++;
+                lastBatchError = sliceErr?.message || `Slice ${slice.sliceId + 1} failed`;
+                if (retryAttempt <= MAX_RETRIES) {
+                  const backoffMs = calculateExponentialBackoffWithJitter(retryAttempt);
+                  emitWorkerLog({
+                    workerId: assignedWorker.id,
+                    workerLabel: assignedWorker.label,
+                    level: 'warning',
+                    message: `Rate limit on ${assignedWorker.label}. Retrying in ${backoffMs}ms...`,
+                    pageNumber: realStartPage,
+                  });
+                  await new Promise((r) => setTimeout(r, backoffMs));
+                } else {
+                  emitWorkerLog({
+                    workerId: assignedWorker.id,
+                    workerLabel: assignedWorker.label,
+                    level: 'error',
+                    message: `Extractor failed on Pages ${realStartPage}-${realEndPage}: ${lastBatchError}`,
+                    pageNumber: realStartPage,
+                  });
+                  break;
+                }
               }
-            } catch (batchErr: any) {
-              retryAttempt++;
-              const errMsg = batchErr?.message || `Batch ${batchIdx + 1} failed`;
-              if (retryAttempt <= MAX_BATCH_RETRIES) {
-                const backoffMs = calculateExponentialBackoffWithJitter(retryAttempt);
-                emitWorkerLog({
-                  workerId: assignedWorker.id,
-                  workerLabel: assignedWorker.label,
-                  level: 'warning',
-                  pageNumber: realStartPage,
-                  message: `Rate limit / warning on ${assignedWorker.label} (${errMsg}). Backing off ${backoffMs}ms before retry ${retryAttempt}/${MAX_BATCH_RETRIES}...`,
-                });
+            }
 
-                setPagePartitions((prev) =>
-                  prev.map((p) =>
-                    p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
-                      ? { ...p, status: 'backoff', retryAttempt, backoffRemainingMs: backoffMs }
-                      : p
-                  )
+            return { slice, questions: detectedList, answerKeys: returnedKeys };
+          });
+
+          const parallelResults = await Promise.all(parallelTasks);
+
+          // Collect all extracted items and sort strictly by pageIndex ascending, then qNo ascending
+          const collectedRaw: QuestionDetection[] = [];
+          parallelResults.forEach((res) => {
+            if (res.questions && res.questions.length > 0) {
+              collectedRaw.push(...res.questions);
+            }
+            if (res.answerKeys && res.answerKeys.length > 0) {
+              allAnswerKeys.push(...res.answerKeys);
+            }
+          });
+
+          collectedRaw.sort((a, b) => {
+            if (a.pageIndex !== b.pageIndex) return a.pageIndex - b.pageIndex;
+            return (a.qNo || 0) - (b.qNo || 0);
+          });
+
+          // Apply 4-Line Grid Rectifier (xmin=0.035, xmax=0.490 for left col, xmin=0.508, xmax=0.965 for right col)
+          const docIsTwoCol = determineDocumentLayoutConsensus(pageLayouts);
+          const rectifiedQuestions = rectifyQuestionBoundingBoxes(
+            collectedRaw,
+            docIsTwoCol
+          );
+
+          // Stream through Producer-Consumer Merger
+          rectifiedQuestions.forEach((q, idx) => {
+            const isLast = idx === rectifiedQuestions.length - 1;
+            streamingMerger.pushBatch([q], isLast);
+          });
+
+          allExtractedQuestions.push(...rectifiedQuestions);
+          setLiveStreamingCount(streamingMerger.getConfirmedQuestions().length);
+        } else {
+          // --- SEQUENTIAL BATCH EXTRACTION (FOR ECO / SINGLE WORKER) ---
+          for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+            if (batchIdx > 0) {
+              await ratePaceDelay(swarmFleet.ratePacingMs);
+            }
+
+            const startPage = batchIdx * BATCH_SIZE;
+            const endPage = Math.min(pagesToProcess.length, startPage + BATCH_SIZE);
+            const chunkImages = base64Images.slice(startPage, endPage);
+
+            const batchStartPercent = Math.round(36 + (batchIdx / totalBatches) * 39);
+            const batchEndPercent = Math.round(36 + ((batchIdx + 1) / totalBatches) * 39);
+
+            const realStartPage = pagesToProcess[startPage];
+            const realEndPage = pagesToProcess[endPage - 1];
+            const assignedWorker =
+              swarmFleet.workers[batchIdx % Math.max(1, swarmFleet.workers.length)] ||
+              swarmFleet.manager;
+
+            const batchStatus = `Gemini AI layout analysis & rescan (Pages ${realStartPage}-${realEndPage})...`;
+            setActiveBatchInfo(
+              `Batch ${batchIdx + 1}/${totalBatches} (${assignedWorker.label} • Pages ${realStartPage}-${realEndPage})`
+            );
+            setStatus(batchStatus);
+
+            setPercent(batchStartPercent);
+            setProgressDetail(
+              `Analyzing Pages ${realStartPage}-${realEndPage} via ${assignedWorker.label} (Found ${allExtractedQuestions.length} questions)...`
+            );
+            updateBackgroundTask({
+              percent: batchStartPercent,
+              statusText: `Batch ${batchIdx + 1}/${totalBatches}: ${batchStatus}`,
+            });
+
+            emitWorkerLog({
+              workerId: assignedWorker.id,
+              workerLabel: assignedWorker.label,
+              level: 'info',
+              message: `Dispatching Batch ${batchIdx + 1}/${totalBatches} (Pages ${realStartPage}-${realEndPage}) to ${assignedWorker.roleTitle} (${assignedWorker.label})...`,
+              pageNumber: realStartPage,
+            });
+
+            setPagePartitions((prev) =>
+              prev.map((p) =>
+                p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                  ? { ...p, status: 'processing' }
+                  : p
+              )
+            );
+
+            let batchSuccess = false;
+            let retryAttempt = 0;
+            const MAX_BATCH_RETRIES = 2;
+
+            while (!batchSuccess && retryAttempt <= MAX_BATCH_RETRIES) {
+              try {
+                const res = await fetchWithGeminiFallback(
+                  '/api/extract-pdf-structure',
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      images: chunkImages,
+                      pageOffset: startPage,
+                      options: {
+                        hasAnswerKey,
+                        extractEnglishOnly,
+                        enableDoublePass: enableDoublePassRescan,
+                        manifest: globalManifest,
+                        instructionDirective: instructionDirectiveText,
+                      },
+                    }),
+                  },
+                  addToast,
+                  refreshUsageMetrics
                 );
 
-                await new Promise((r) => setTimeout(r, backoffMs));
-              } else {
-                emitWorkerLog({
-                  workerId: assignedWorker.id,
-                  workerLabel: assignedWorker.label,
-                  level: 'error',
-                  pageNumber: realStartPage,
-                  message: `Batch ${batchIdx + 1} failed after ${MAX_BATCH_RETRIES} retries: ${errMsg}`,
-                });
-                setPagePartitions((prev) =>
-                  prev.map((p) =>
-                    p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
-                      ? { ...p, status: 'error', errorMessage: errMsg }
-                      : p
-                  )
-                );
-                throw new Error(`Batch ${batchIdx + 1} extraction failed: ${errMsg}`);
+                setPercent(batchEndPercent);
+
+                if (res.ok) {
+                  const batchResponse = await res.json();
+                  let detectedList =
+                    batchResponse.questions && Array.isArray(batchResponse.questions)
+                      ? batchResponse.questions
+                      : [];
+
+                  // Extraction Validation Middleware
+                  const validation: ExtractionValidationResult = validateWorkerExtraction(
+                    detectedList,
+                    startPage
+                  );
+
+                  if (!validation.isValid && validation.autoCorrectNeeded) {
+                    emitWorkerLog({
+                      workerId: assignedWorker.id,
+                      workerLabel: assignedWorker.label,
+                      level: 'warning',
+                      message: `Extraction Validation Warning: Detected ${validation.issues.length} anomaly/anomalies (${validation.issues.map((i) => i.type).join(', ')}). Triggering Auto-Correction Request to worker...`,
+                      pageNumber: realStartPage,
+                    });
+
+                    try {
+                      const autoCorrectionPrompt = buildAutoCorrectionPrompt(
+                        validation.issues,
+                        detectedList.length
+                      );
+                      const autoCorrectRes = await fetchWithGeminiFallback(
+                        '/api/extract-pdf-structure',
+                        {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            images: chunkImages,
+                            pageOffset: startPage,
+                            options: {
+                              hasAnswerKey,
+                              extractEnglishOnly,
+                              enableDoublePass: false,
+                              manifest: globalManifest,
+                              autoCorrectionInstruction: autoCorrectionPrompt,
+                            },
+                          }),
+                        },
+                        addToast,
+                        refreshUsageMetrics
+                      );
+
+                      if (autoCorrectRes.ok) {
+                        const autoCorrectData = await autoCorrectRes.json();
+                        if (
+                          autoCorrectData.questions &&
+                          Array.isArray(autoCorrectData.questions) &&
+                          autoCorrectData.questions.length > 0
+                        ) {
+                          const reValidation = validateWorkerExtraction(
+                            autoCorrectData.questions,
+                            startPage
+                          );
+                          detectedList = reValidation.cleanQuestions;
+                          emitWorkerLog({
+                            workerId: assignedWorker.id,
+                            workerLabel: assignedWorker.label,
+                            level: 'success',
+                            message: `Auto-Correction Successful: Worker re-parsed coordinates into ${detectedList.length} clean, validated questions.`,
+                            pageNumber: realStartPage,
+                          });
+                        } else {
+                          detectedList = validation.cleanQuestions;
+                        }
+                      } else {
+                        detectedList = validation.cleanQuestions;
+                      }
+                    } catch (autoErr) {
+                      detectedList = validation.cleanQuestions;
+                    }
+                  } else {
+                    detectedList = validation.cleanQuestions;
+                  }
+
+                  // 4-Line Grid Rectification on detected batch questions
+                  const docIsTwoCol = determineDocumentLayoutConsensus(pageLayouts);
+                  detectedList = rectifyQuestionBoundingBoxes(
+                    detectedList,
+                    docIsTwoCol
+                  );
+
+                  if (detectedList.length > 0) {
+                    allExtractedQuestions.push(...detectedList);
+                  }
+                  if (batchResponse.answerKeys && Array.isArray(batchResponse.answerKeys)) {
+                    allAnswerKeys.push(...batchResponse.answerKeys);
+                  }
+
+                  // Streaming Producer-Consumer Merger
+                  const isLastBatch = batchIdx === totalBatches - 1;
+                  const mergeRes = streamingMerger.pushBatch(detectedList, isLastBatch);
+                  setLiveStreamingCount(streamingMerger.getConfirmedQuestions().length);
+
+                  setPagePartitions((prev) =>
+                    prev.map((p) =>
+                      p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                        ? { ...p, status: 'done', detectedQuestionsCount: detectedList.length }
+                        : p
+                    )
+                  );
+
+                  emitWorkerLog({
+                    workerId: assignedWorker.id,
+                    workerLabel: assignedWorker.label,
+                    level: 'success',
+                    message: `Batch ${batchIdx + 1} completed: +${detectedList.length} items (Streaming Merger: ${streamingMerger.getConfirmedQuestions().length} confirmed, ${mergeRes.pendingBufferCount} pending boundary).`,
+                    pageNumber: realStartPage,
+                  });
+
+                  // Save checkpoint
+                  const completedPagesList = Array.from(
+                    new Set([
+                      ...(existingCheckpoint?.completedPages || []),
+                      ...pagesToProcess.slice(0, endPage),
+                    ])
+                  );
+                  await saveConversionCheckpoint({
+                    id: checkpointId,
+                    fileName: file.name,
+                    testTitle: testTitle || file.name,
+                    totalPages: thumbnails.length,
+                    completedPages: completedPagesList,
+                    extractedQuestions: allExtractedQuestions,
+                    answerKeys: allAnswerKeys,
+                    timestamp: Date.now(),
+                  });
+
+                  batchSuccess = true;
+                } else {
+                  const errData = await res.json().catch(() => ({}));
+                  throw new Error(errData.error || `HTTP ${res.status}`);
+                }
+              } catch (batchErr: any) {
+                retryAttempt++;
+                lastBatchError = batchErr?.message || `Batch ${batchIdx + 1} failed`;
+                if (retryAttempt <= MAX_BATCH_RETRIES) {
+                  const backoffMs = calculateExponentialBackoffWithJitter(retryAttempt);
+                  emitWorkerLog({
+                    workerId: assignedWorker.id,
+                    workerLabel: assignedWorker.label,
+                    level: 'warning',
+                    message: `Rate limit / warning on ${assignedWorker.label} (${batchErr?.message || 'Error'}). Backing off ${backoffMs}ms before retry ${retryAttempt}/${MAX_BATCH_RETRIES}...`,
+                    pageNumber: realStartPage,
+                  });
+
+                  setPagePartitions((prev) =>
+                    prev.map((p) =>
+                      p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                        ? { ...p, status: 'backoff', retryAttempt, backoffRemainingMs: backoffMs }
+                        : p
+                    )
+                  );
+
+                  await new Promise((r) => setTimeout(r, backoffMs));
+                } else {
+                  emitWorkerLog({
+                    workerId: assignedWorker.id,
+                    workerLabel: assignedWorker.label,
+                    level: 'error',
+                    message: `Batch ${batchIdx + 1} failed after ${MAX_BATCH_RETRIES} retries: ${lastBatchError}`,
+                    pageNumber: realStartPage,
+                  });
+                  setPagePartitions((prev) =>
+                    prev.map((p) =>
+                      p.pageNumber >= realStartPage && p.pageNumber <= realEndPage
+                        ? { ...p, status: 'error', errorMessage: lastBatchError }
+                        : p
+                    )
+                  );
+                  break;
+                }
               }
             }
           }
-
-          return { batchIdx, questions: batchQuestions, answerKeys: batchKeys, plan };
-        });
-
-        setStatus('Executing parallel swarm extraction across API keys...');
-        setPercent(45);
-        setActiveBatchInfo(`Processing ${totalBatches} batches in parallel...`);
-
-        const results = await Promise.all(batchPromises);
-
-        // Sort results by batch index to guarantee strict sequential integrity before merging
-        results.sort((a, b) => a.batchIdx - b.batchIdx);
-
-        // Push results to the streaming merger in strict sequential order
-        results.forEach((res, idx) => {
-          const isLastBatch = idx === results.length - 1;
-          allExtractedQuestions.push(...res.questions);
-          allAnswerKeys.push(...res.answerKeys);
-
-          const mergeRes = streamingMerger.pushBatch(res.questions, isLastBatch);
-          setLiveStreamingCount(streamingMerger.getConfirmedQuestions().length);
-        });
-
-        // Save final consolidated recovery checkpoint to IndexedDB
-        const completedPagesList = Array.from(
-          new Set([
-            ...(existingCheckpoint?.completedPages || []),
-            ...pagesToProcess,
-          ])
-        );
-        await saveConversionCheckpoint({
-          id: checkpointId,
-          fileName: file.name,
-          testTitle: testTitle || file.name,
-          totalPages: thumbnails.length,
-          completedPages: completedPagesList,
-          extractedQuestions: allExtractedQuestions,
-          answerKeys: allAnswerKeys,
-          timestamp: Date.now(),
-        });
+        }
 
         if (allExtractedQuestions.length === 0) {
           throw new Error(
@@ -1304,6 +1739,12 @@ export const AutoPdfConverterModal: React.FC = () => {
       });
 
       // Step 2: Intelligent Orphan Continuation Detection & Multi-Part Stitching
+      const isDuplicateBox = (p1: number, b1: [number, number, number, number], p2: number, b2: [number, number, number, number]) => {
+        if (p1 !== p2) return false;
+        return Math.abs(b1[0] - b2[0]) < 0.03 && Math.abs(b1[1] - b2[1]) < 0.03 &&
+               Math.abs(b1[2] - b2[2]) < 0.03 && Math.abs(b1[3] - b2[3]) < 0.03;
+      };
+
       const resolvedQuestions: QuestionDetection[] = [];
 
       for (let i = 0; i < allExtractedQuestions.length; i++) {
@@ -1312,27 +1753,32 @@ export const AutoPdfConverterModal: React.FC = () => {
 
         const prevQ = resolvedQuestions.length > 0 ? resolvedQuestions[resolvedQuestions.length - 1] : null;
 
-        // Check if this item is an orphan continuation:
-        // 1. Explicitly flagged as isOrphanContinuation: true OR continuationForQNo matching prevQ.qNo
-        // 2. Or: has no valid qNo (e.g. 0, null, or same qNo as prevQ) and is situated near the top of the column/page (ymin < 0.38)
-        // 3. Or: prevQ is an MCQ with completeness === 'split' or fewer than 3 options detected, AND this item is at the top of next column/page.
+        // A question with a valid distinct printed question number MUST NEVER be swallowed into prevQ
+        const hasDistinctValidQNo = Boolean(
+          item.qNo && item.qNo > 0 && prevQ && prevQ.qNo && item.qNo !== prevQ.qNo
+        );
+
+        // Check if this item is genuinely an unnumbered orphan continuation:
         const isExplicitOrphan = Boolean(
-          item.isOrphanContinuation ||
-          (item.continuationForQNo && prevQ && item.continuationForQNo === prevQ.qNo)
+          !hasDistinctValidQNo &&
+          (item.isOrphanContinuation ||
+            (item.continuationForQNo && prevQ && item.continuationForQNo === prevQ.qNo))
         );
 
         const isUnnumberedTopContinuation = Boolean(
+          !hasDistinctValidQNo &&
           prevQ &&
           (!item.qNo || item.qNo === 0 || item.qNo === prevQ.qNo) &&
           item.box[0] < 0.38
         );
 
         const isSplitPredecessorNeedsOptions = Boolean(
+          !hasDistinctValidQNo &&
           prevQ &&
           handleSplitQuestions &&
-          (prevQ.completeness === 'split' || prevQ.isSplit || (prevQ.type === 'mcq' && (!prevQ.optionsFound || prevQ.optionsFound.length < 3))) &&
+          (prevQ.completeness === 'split' || prevQ.isSplit) &&
           item.box[0] < 0.38 &&
-          (!item.qNo || item.qNo === prevQ.qNo || (item.optionsFound && item.optionsFound.length >= 1))
+          (!item.qNo || item.qNo === 0 || item.qNo === prevQ.qNo)
         );
 
         if (prevQ && (isExplicitOrphan || isUnnumberedTopContinuation || isSplitPredecessorNeedsOptions)) {
@@ -1344,18 +1790,28 @@ export const AutoPdfConverterModal: React.FC = () => {
 
           if (item.splitParts && item.splitParts.length > 0) {
             item.splitParts.forEach((sp) => {
-              prevQ.splitParts!.push({
-                pageIndex: sp.pageIndex,
-                box: sp.box,
-                partIndex: prevQ.splitParts!.length + 1,
-              });
+              const alreadyExists = prevQ.splitParts!.some(existingPart =>
+                isDuplicateBox(existingPart.pageIndex, existingPart.box, sp.pageIndex, sp.box)
+              );
+              if (!alreadyExists) {
+                prevQ.splitParts!.push({
+                  pageIndex: sp.pageIndex,
+                  box: sp.box,
+                  partIndex: prevQ.splitParts!.length + 1,
+                });
+              }
             });
           } else {
-            prevQ.splitParts.push({
-              pageIndex: item.pageIndex,
-              box: item.box,
-              partIndex: prevQ.splitParts!.length + 1,
-            });
+            const alreadyExists = prevQ.splitParts.some(existingPart =>
+              isDuplicateBox(existingPart.pageIndex, existingPart.box, item.pageIndex, item.box)
+            );
+            if (!alreadyExists) {
+              prevQ.splitParts.push({
+                pageIndex: item.pageIndex,
+                box: item.box,
+                partIndex: prevQ.splitParts.length + 1,
+              });
+            }
           }
 
           if (item.optionsFound && item.optionsFound.length > 0) {
@@ -1366,74 +1822,68 @@ export const AutoPdfConverterModal: React.FC = () => {
           continue; // Merged into previous question, do not create duplicate question entry
         }
 
-        // If item itself is already marked isSplit with splitParts, ensure part 1 is valid
-        if (item.isSplit && item.splitParts && item.splitParts.length > 0) {
-          if (!item.splitParts.some(p => p.pageIndex === item.pageIndex)) {
-            item.splitParts.unshift({ pageIndex: item.pageIndex, box: item.box, partIndex: 1 });
-          }
-        }
-
         resolvedQuestions.push(item);
       }
 
-      // Step 3: Final sequential numbering fix for any missing / zero Q-numbers
-      let nextExpectedQ = 1;
+      // Step 3: Deduplicate questions by qNo and resolve missing numbers
+      const deduplicatedQuestions: QuestionDetection[] = [];
+      const seenQNos = new Set<number>();
+
       resolvedQuestions.forEach((q) => {
+        const qNum = q.qNo || 0;
+        if (qNum > 0) {
+          if (seenQNos.has(qNum)) {
+            // Already have a question with this qNo, merge any extra splitParts if present
+            const existing = deduplicatedQuestions.find(eq => eq.qNo === qNum);
+            if (existing) {
+              if (q.splitParts && q.splitParts.length > 0) {
+                if (!existing.splitParts) existing.splitParts = [{ pageIndex: existing.pageIndex, box: existing.box, partIndex: 1 }];
+                q.splitParts.forEach(sp => {
+                  const exists = existing.splitParts!.some(ep => isDuplicateBox(ep.pageIndex, ep.box, sp.pageIndex, sp.box));
+                  if (!exists) {
+                    existing.splitParts!.push({ pageIndex: sp.pageIndex, box: sp.box, partIndex: existing.splitParts!.length + 1 });
+                    existing.isSplit = true;
+                  }
+                });
+              }
+            }
+          } else {
+            seenQNos.add(qNum);
+            deduplicatedQuestions.push(q);
+          }
+        } else {
+          deduplicatedQuestions.push(q);
+        }
+      });
+
+      // Ensure sequential numbering for any items with qNo <= 0
+      let nextExpectedQ = 1;
+      deduplicatedQuestions.forEach((q) => {
+        while (seenQNos.has(nextExpectedQ)) {
+          nextExpectedQ++;
+        }
         if (!q.qNo || q.qNo <= 0) {
           q.qNo = nextExpectedQ;
-        } else {
-          nextExpectedQ = q.qNo;
-        }
-        nextExpectedQ++;
-      });
-
-      // Strict Numerical Sorting Enforcement
-      resolvedQuestions.sort((a, b) => a.qNo - b.qNo);
-
-      // Execute Strict Parallel Double-Scan Verification Protocol across active keys
-      const doubleScanResults = runParallelDoubleScanAudit(
-        resolvedQuestions.map((q) => ({
-          qNo: q.qNo,
-          subject: q.subject,
-          box: q.box,
-          pageIndex: q.pageIndex,
-          optionsFound: q.optionsFound,
-          completeness: q.completeness,
-          isSplit: q.isSplit,
-        })),
-        swarmFleet
-      );
-
-      const doubleScanMap = new Map<number, any>();
-      doubleScanResults.forEach((r) => doubleScanMap.set(r.qNo, r));
-
-      let totalVerified = 0;
-      let totalRepaired = 0;
-      let totalFlagged = 0;
-
-      resolvedQuestions.forEach((q) => {
-        const audit = doubleScanMap.get(q.qNo);
-        if (audit) {
-          if (audit.doubleScanStatus === 'repaired') {
-            q.box = audit.box; // Auto-expanded bounding box (+20px padding)
-            totalRepaired++;
-          } else if (audit.doubleScanStatus === 'flagged') {
-            totalFlagged++;
-          } else {
-            totalVerified++;
-          }
-          (q as any).doubleScanStatus = audit.doubleScanStatus;
-          (q as any).hasExtractionWarning = audit.hasExtractionWarning;
-          (q as any).warningReason = audit.warningReason;
+          seenQNos.add(nextExpectedQ);
+          nextExpectedQ++;
         }
       });
 
-      emitWorkerLog({
-        workerId: swarmFleet.manager.id,
-        workerLabel: swarmFleet.manager.label,
-        level: totalFlagged > 0 ? 'warning' : 'success',
-        message: `Strict Double-Scan Audit Complete: ${totalVerified} Verified, ${totalRepaired} Auto-Repaired (+20px boundary expansion), ${totalFlagged} Flagged ("Needs Manual Image Review").`,
-      });
+      // Sort strictly by qNo ascending
+      deduplicatedQuestions.sort((a, b) => (a.qNo || 0) - (b.qNo || 0));
+
+      // Step 4: Comprehension & Linked Passage Context Inheritance (JEE / NEET Paragraphs)
+      const { questions: finalSequencedQuestions, detectedPassagesCount } =
+        detectAndInheritPassageStems(deduplicatedQuestions);
+
+      if (detectedPassagesCount > 0) {
+        emitWorkerLog({
+          workerId: swarmFleet.manager.id,
+          workerLabel: swarmFleet.manager.label,
+          level: 'info',
+          message: `Linked Passage Inheritor: Attached ${detectedPassagesCount} shared context passage(s) to related question cards.`,
+        });
+      }
 
       setStatus('Cropping questions and allocating strictly via Blueprint Ranges...');
 
@@ -1471,118 +1921,28 @@ export const AutoPdfConverterModal: React.FC = () => {
         size: file.size,
       });
 
-      // Helper function to crop a box on a canvas with column-aware padding & zero-clipping safeguards
+      // Helper function to crop a box on a canvas with column-aware padding, spanning diagram protection & whitening
       const cropBoxFromCanvas = (pageIndex: number, boxCoords: [number, number, number, number]) => {
         const pIdx = typeof pageIndex === 'number' ? Math.max(0, Math.min(canvasImages.length - 1, pageIndex)) : 0;
         const canvas = canvasImages[pIdx] || canvasImages[0];
         if (!canvas) return null;
 
-        let [ymin, xmin, ymax, xmax] = boxCoords;
-        ymin = Math.max(0, Math.min(0.98, Number(ymin) || 0));
-        xmin = Math.max(0, Math.min(0.98, Number(xmin) || 0));
-        ymax = Math.max(ymin + 0.02, Math.min(1, Number(ymax) || 1));
-        xmax = Math.max(xmin + 0.04, Math.min(1, Number(xmax) || 1));
+        const layout = pageLayouts[pIdx] || { isTwoColumn: true, spanningBands: [] };
+        const docIsTwoCol = determineDocumentLayoutConsensus(pageLayouts);
+        const effectiveIsTwoCol = docIsTwoCol || layout.isTwoColumn;
 
-        // 3-Line Structural Anchor Lock (Left Margin, Center Divider, Right Margin)
-        // Check if question spans full-width (banners, multi-column tables, wide physics/chem diagrams)
-        const isFullWidthSpan = xmin < 0.25 && xmax > 0.70;
-        const isLeftCol = !isFullWidthSpan && xmin < 0.48;
-        const isRightCol = !isFullWidthSpan && xmin >= 0.48;
+        const result = cropBoxWithSpanAwareness(
+          canvas,
+          boxCoords,
+          layout.spanningBands,
+          effectiveIsTwoCol
+        );
 
-        // Apply strict 3-Line Structural Boundaries
-        if (isLeftCol) {
-          // Lock X_MIN to Left Margin Line (~0.032) to enclose Q-numbers, Lock X_MAX right at Center Divider (~0.490)
-          xmin = Math.min(xmin, 0.032);
-          xmax = Math.min(Math.max(xmax, 0.465), 0.492);
-        } else if (isRightCol) {
-          // Lock X_MIN right after Center Divider (~0.508), Lock X_MAX to Right Margin Line (~0.968)
-          xmin = Math.max(Math.min(xmin, 0.528), 0.508);
-          xmax = Math.max(xmax, 0.968);
-        } else if (isFullWidthSpan) {
-          // Lock X_MIN to Left Margin Line (~0.032), Lock X_MAX to Right Margin Line (~0.968)
-          xmin = Math.min(xmin, 0.032);
-          xmax = Math.max(xmax, 0.968);
-        }
-
-        const pxYmin = Math.floor(ymin * canvas.height);
-        const pxXmin = Math.floor(xmin * canvas.width);
-        const pxHeight = Math.ceil((ymax - ymin) * canvas.height);
-        const pxWidth = Math.ceil((xmax - xmin) * canvas.width);
-
-        // Safe asymmetric padding: Top 12px, Bottom 22px (prevents cutting bottom options/subscripts), Left 16px, Right 14px
-        const padT = 12;
-        const padB = 22;
-        const padL = 16;
-        const padR = 14;
-
-        let cropY = Math.max(0, pxYmin - padT);
-        let cropX = Math.max(0, pxXmin - padL);
-        let cropW = Math.min(canvas.width - cropX, Math.max(30, pxWidth + padL + padR));
-        let cropH = Math.min(canvas.height - cropY, Math.max(30, pxHeight + padT + padB));
-
-        // Prevent cross-column bleeding across the central vertical divider line (unless full-width)
-        if (!isFullWidthSpan) {
-          if (isLeftCol) {
-            const maxRightPx = Math.floor(canvas.width * 0.495);
-            if (cropX + cropW > maxRightPx) {
-              cropW = Math.max(30, maxRightPx - cropX);
-            }
-          } else if (isRightCol) {
-            const minLeftPx = Math.floor(canvas.width * 0.505);
-            if (cropX < minLeftPx) {
-              const diff = minLeftPx - cropX;
-              cropX = minLeftPx;
-              cropW = Math.max(30, cropW - diff);
-            }
-          }
-        }
-
-        const cropCanvas = document.createElement('canvas');
-        cropCanvas.width = cropW;
-        cropCanvas.height = cropH;
-        const cropCtx = cropCanvas.getContext('2d');
-        if (cropCtx) {
-          cropCtx.imageSmoothingEnabled = true;
-          cropCtx.imageSmoothingQuality = 'high';
-          cropCtx.fillStyle = '#ffffff';
-          cropCtx.fillRect(0, 0, cropW, cropH);
-          cropCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
-
-          // Smooth tone-curve background whitening (preserves anti-aliased font edges & boosts dark ink)
-          const imgData = cropCtx.getImageData(0, 0, cropW, cropH);
-          const data = imgData.data;
-          for (let i = 0; i < data.length; i += 4) {
-            const r = data[i];
-            const g = data[i + 1];
-            const b = data[i + 2];
-            const avg = (r + g + b) / 3;
-
-            if (avg > 218) {
-              const factor = Math.min(1, (avg - 218) / 37);
-              data[i] = Math.round(r + (255 - r) * factor);
-              data[i + 1] = Math.round(g + (255 - g) * factor);
-              data[i + 2] = Math.round(b + (255 - b) * factor);
-            } else if (avg < 140) {
-              const boost = 0.84;
-              data[i] = Math.round(r * boost);
-              data[i + 1] = Math.round(g * boost);
-              data[i + 2] = Math.round(b * boost);
-            }
-          }
-          cropCtx.putImageData(imgData, 0, 0);
-        }
-
-        const dataUrl = cropCanvas.toDataURL('image/png');
-        const byteString = atob(dataUrl.split(',')[1]);
-        const ab = new ArrayBuffer(byteString.length);
-        const ia = new Uint8Array(ab);
-        for (let i = 0; i < byteString.length; i++) {
-          ia[i] = byteString.charCodeAt(i);
-        }
-        const blob = new Blob([ab], { type: 'image/png' });
-        const blobUrl = URL.createObjectURL(blob);
-
-        return { blob, blobUrl, cropCanvas, cropX, cropY, cropW, cropH, pIdx };
+        if (!result) return null;
+        return {
+          ...result,
+          pIdx,
+        };
       };
 
       // Helper to vertically stitch multi-part crops into one unified composite image
@@ -1645,10 +2005,10 @@ export const AutoPdfConverterModal: React.FC = () => {
 
       // Group into subjects and sections strictly matching the Blueprint ranges
       const subjectMap = new Map<string, any>();
-      const totalQuestions = resolvedQuestions.length;
+      const totalQuestions = finalSequencedQuestions.length;
 
       for (let qIdx = 0; qIdx < totalQuestions; qIdx++) {
-        const q = resolvedQuestions[qIdx];
+        const q = finalSequencedQuestions[qIdx];
         if (!q || !q.box || !Array.isArray(q.box) || q.box.length < 4) continue;
 
         const cropPercent = Math.min(95, Math.round(76 + ((qIdx + 1) / totalQuestions) * 20));
@@ -1695,9 +2055,25 @@ export const AutoPdfConverterModal: React.FC = () => {
         const pdfDataParts: any[] = [];
         const harvestedCrops: { cropCanvas: HTMLCanvasElement }[] = [];
 
+        // Deduplicate and validate split parts
+        let validSplitParts = (q.splitParts || []).filter((p: any) => p && p.box && p.box.length === 4);
+        const uniqueSplitParts: any[] = [];
+        validSplitParts.forEach((p: any) => {
+          const isDup = uniqueSplitParts.some((up: any) =>
+            up.pageIndex === p.pageIndex &&
+            Math.abs(up.box[0] - p.box[0]) < 0.03 &&
+            Math.abs(up.box[1] - p.box[1]) < 0.03 &&
+            Math.abs(up.box[2] - p.box[2]) < 0.03 &&
+            Math.abs(up.box[3] - p.box[3]) < 0.03
+          );
+          if (!isDup) uniqueSplitParts.push(p);
+        });
+
+        const isTrulySplit = handleSplitQuestions && q.isSplit && uniqueSplitParts.length > 1;
+
         // Check if question is split across columns or pages
-        if (handleSplitQuestions && q.isSplit && q.splitParts && q.splitParts.length > 0) {
-          q.splitParts.forEach((part, partIdx) => {
+        if (isTrulySplit) {
+          uniqueSplitParts.forEach((part: any, partIdx: number) => {
             const cropResult = cropBoxFromCanvas(part.pageIndex, part.box as any);
             if (cropResult) {
               harvestedCrops.push({ cropCanvas: cropResult.cropCanvas });
@@ -1751,8 +2127,10 @@ export const AutoPdfConverterModal: React.FC = () => {
             });
           }
         } else {
-          // Standard single bounding box
-          const cropResult = cropBoxFromCanvas(q.pageIndex, q.box);
+          // Standard single bounding box (use uniqueSplitParts[0] if present and precise, otherwise q.box)
+          const targetBox = (uniqueSplitParts.length === 1 ? uniqueSplitParts[0].box : q.box) as [number, number, number, number];
+          const targetPage = (uniqueSplitParts.length === 1 ? uniqueSplitParts[0].pageIndex : q.pageIndex) ?? 0;
+          const cropResult = cropBoxFromCanvas(targetPage, targetBox);
           if (cropResult) {
             const imgName = `${subjName}_${qType}_Q${qNoStr}.png`;
             newArchive.rawFiles.set(imgName, {
@@ -1770,10 +2148,10 @@ export const AutoPdfConverterModal: React.FC = () => {
             });
 
             const pNum = pagesToProcess[cropResult.pIdx] || 1;
-            const yminVal = q.box[0];
-            const xminVal = q.box[1];
-            const ymaxVal = q.box[2];
-            const xmaxVal = q.box[3];
+            const yminVal = targetBox[0];
+            const xminVal = targetBox[1];
+            const ymaxVal = targetBox[2];
+            const xmaxVal = targetBox[3];
 
             pdfDataParts.push({
               filename: imgName,
@@ -1807,19 +2185,12 @@ export const AutoPdfConverterModal: React.FC = () => {
           isSplitQuestion: Boolean(q.isSplit && q.splitParts && q.splitParts.length > 1),
           pdfData: pdfDataParts,
           images: imageAttachments,
-          doubleScanStatus: (q as any).doubleScanStatus || 'verified',
-          hasExtractionWarning: (q as any).hasExtractionWarning || false,
-          warningReason: (q as any).warningReason || undefined,
-          isFlagged: (q as any).doubleScanStatus === 'flagged',
         };
 
         section.questions.push(newQuestion);
       }
 
       newArchive.subjects = Array.from(subjectMap.values());
-
-      // Garbage Collection Pass: Purge intermediate draft & scratch crop image files
-      newArchive.rawFiles = purgeDraftImageArtifacts(newArchive.rawFiles);
 
       // Match extracted answer keys if found
       if (allAnswerKeys.length > 0) {
@@ -2244,6 +2615,94 @@ export const AutoPdfConverterModal: React.FC = () => {
                     </div>
                   </label>
 
+                  {/* Swarm Fleet Execution Strategy Selector */}
+                  <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-2.5 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-slate-200 flex items-center gap-1.5">
+                        <Cpu className="w-3.5 h-3.5 text-purple-400" />
+                        Extraction Swarm Strategy:
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setIsMonitorModalOpen(true)}
+                        className="text-[10px] text-purple-400 hover:text-purple-300 underline"
+                      >
+                        Inspect Topology
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setFleetStrategy('prior_parallel')}
+                        className={`p-2 rounded-lg border text-left transition-all ${
+                          fleetStrategy === 'prior_parallel'
+                            ? 'bg-purple-950/60 border-purple-500/80 text-purple-200 shadow-sm shadow-purple-900/40 ring-1 ring-purple-500'
+                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        <div className="font-bold flex items-center gap-1 text-purple-300">
+                          <span>🚀 Prior Parallel</span>
+                          <span className="text-[9px] bg-purple-500/20 text-purple-300 px-1 py-0.2 rounded font-mono">FASTEST</span>
+                        </div>
+                        <div className="text-[9.5px] text-slate-400 leading-tight mt-0.5">
+                          Starts all workers at once (1 page each), ending together. Combiners run at end.
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setFleetStrategy('turbo')}
+                        className={`p-2 rounded-lg border text-left transition-all ${
+                          fleetStrategy === 'turbo'
+                            ? 'bg-amber-950/50 border-amber-500/80 text-amber-200 shadow-sm ring-1 ring-amber-500'
+                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        <div className="font-bold flex items-center gap-1 text-amber-300">
+                          <span>⚡ Turbo Swarm</span>
+                        </div>
+                        <div className="text-[9.5px] text-slate-400 leading-tight mt-0.5">
+                          Multi-worker parallel batches with rapid RPM pacing.
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setFleetStrategy('balanced')}
+                        className={`p-2 rounded-lg border text-left transition-all ${
+                          fleetStrategy === 'balanced'
+                            ? 'bg-indigo-950/50 border-indigo-500/80 text-indigo-200 shadow-sm ring-1 ring-indigo-500'
+                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        <div className="font-bold flex items-center gap-1 text-indigo-300">
+                          <span>⚖️ Balanced</span>
+                        </div>
+                        <div className="text-[9.5px] text-slate-400 leading-tight mt-0.5">
+                          Adaptive workers with standard safety pacing.
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setFleetStrategy('eco')}
+                        className={`p-2 rounded-lg border text-left transition-all ${
+                          fleetStrategy === 'eco'
+                            ? 'bg-emerald-950/50 border-emerald-500/80 text-emerald-200 shadow-sm ring-1 ring-emerald-500'
+                            : 'bg-slate-950/60 border-slate-800 hover:border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        <div className="font-bold flex items-center gap-1 text-emerald-300">
+                          <span>🌿 Eco Mode</span>
+                        </div>
+                        <div className="text-[9.5px] text-slate-400 leading-tight mt-0.5">
+                          Single worker to conserve API free tier quotas.
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+
                   <label className="flex items-start gap-2 cursor-pointer group">
                     <input
                       type="checkbox"
@@ -2356,22 +2815,20 @@ export const AutoPdfConverterModal: React.FC = () => {
                   {/* Phase 0 Scout: Fast Instruction Directive Trigger */}
                   <div className="pt-2.5 border-t border-slate-800 space-y-2">
                     <div className="flex items-center justify-between text-[11px] text-slate-400">
-                      <span>Instruction Page:</span>
+                      <span>Instruction Pages:</span>
                       <div className="flex items-center gap-1.5">
-                        <span className="text-[10px] text-slate-400">Page</span>
                         <input
-                          type="number"
-                          min={1}
-                          max={thumbnails.length || 100}
-                          value={instructionPageNum}
-                          onChange={(e) => setInstructionPageNum(Math.max(1, Number(e.target.value)))}
-                          className="w-12 px-1.5 py-0.5 bg-slate-900 border border-slate-700 rounded text-xs text-center font-bold text-indigo-300"
+                          type="text"
+                          placeholder="e.g. 1, 2 or 1-3"
+                          value={instructionPagesInput}
+                          onChange={(e) => setInstructionPagesInput(e.target.value)}
+                          className="w-28 px-2 py-0.5 bg-slate-900 border border-slate-700 rounded text-xs text-center font-bold text-indigo-300 focus:outline-hidden focus:border-indigo-500"
                         />
                       </div>
                     </div>
                     <button
                       onClick={async () => {
-                        await handleScanInstructionsFromPdf(instructionPageNum);
+                        await handleScanInstructionsFromPdf(instructionPagesInput);
                         setStep('blueprint');
                       }}
                       disabled={isScanningInstructions}
@@ -2384,8 +2841,8 @@ export const AutoPdfConverterModal: React.FC = () => {
                       )}
                       <span>
                         {isScanningInstructions
-                          ? `Scanning Page ${instructionPageNum}...`
-                          : `Auto-Detect Blueprint (Page ${instructionPageNum})`}
+                          ? `Scanning Pages (${instructionPagesInput})...`
+                          : `Auto-Detect Blueprint (Pages ${instructionPagesInput})`}
                       </span>
                     </button>
                   </div>
