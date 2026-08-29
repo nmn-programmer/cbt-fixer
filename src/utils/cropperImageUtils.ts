@@ -350,3 +350,128 @@ export async function getTextInBoxFromPdfPage(pdfPage: any, box: BoxCoord): Prom
     return '';
   }
 }
+
+export interface PredictedBoundaryResult {
+  box: BoxCoord;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
+}
+
+/**
+ * Scans canvas pixels downward from startYmin within the specified column (xmin, xmax)
+ * to intelligently predict the bottom boundary (ymax) of the current question.
+ * It looks for text lines followed by a clean horizontal whitespace valley (gap between questions).
+ */
+export function predictNextQuestionBoundary(
+  canvas: HTMLCanvasElement,
+  startYmin: number,
+  xmin: number = 0.035,
+  xmax: number = 0.965,
+  inkThreshold: number = 220,
+  fallbackHeightFraction: number = 0.15
+): PredictedBoundaryResult {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const defaultYmax = Math.min(0.98, startYmin + fallbackHeightFraction);
+  const defaultBox: BoxCoord = { xmin, xmax, ymin: Math.max(0, startYmin), ymax: defaultYmax };
+
+  if (!ctx) {
+    return { box: defaultBox, confidence: 'low', reason: 'No canvas context' };
+  }
+
+  const w = canvas.width;
+  const h = canvas.height;
+
+  const pxXmin = Math.max(0, Math.floor(xmin * w));
+  const pxXmax = Math.min(w, Math.ceil(xmax * w));
+  const colWidth = Math.max(10, pxXmax - pxXmin);
+
+  let startYpx = Math.floor(startYmin * h);
+  if (startYpx < 0) startYpx = 0;
+  if (startYpx >= h - 20) {
+    return { box: defaultBox, confidence: 'low', reason: 'Reached bottom of page' };
+  }
+
+  const getLineInk = (yPx: number): number => {
+    if (yPx < 0 || yPx >= h) return 99999;
+    try {
+      const lineData = ctx.getImageData(pxXmin, yPx, colWidth, 1).data;
+      let darkCount = 0;
+      for (let i = 0; i < lineData.length; i += 4) {
+        const lum = 0.299 * lineData[i] + 0.587 * lineData[i + 1] + 0.114 * lineData[i + 2];
+        if (lum < inkThreshold) darkCount++;
+      }
+      return darkCount;
+    } catch {
+      return 0;
+    }
+  };
+
+  // 1. Find actual top of text (skip leading whitespace)
+  let actualTopYpx = startYpx;
+  let foundInk = false;
+  for (let y = startYpx; y < Math.min(h - 30, startYpx + 100); y++) {
+    if (getLineInk(y) > 2) {
+      actualTopYpx = Math.max(startYpx, y - 4); // 4px margin above first line
+      foundInk = true;
+      break;
+    }
+  }
+
+  if (!foundInk) {
+    actualTopYpx = startYpx;
+  }
+
+  // 2. Scan downwards to find text block & trailing whitespace valley
+  const minQuestionHeightPx = Math.max(30, Math.floor(h * 0.04));
+  let scanStartYpx = actualTopYpx + minQuestionHeightPx;
+  let maxScanYpx = Math.min(h - 10, actualTopYpx + Math.floor(h * 0.45));
+
+  let consecutiveWhitespacePx = 0;
+  let predictedCutYpx = 0;
+  let hasEncounteredText = false;
+  let textLineCount = 0;
+
+  for (let y = actualTopYpx; y <= maxScanYpx; y++) {
+    const ink = getLineInk(y);
+    if (ink > 3) {
+      hasEncounteredText = true;
+      textLineCount++;
+      consecutiveWhitespacePx = 0;
+    } else {
+      if (hasEncounteredText) {
+        consecutiveWhitespacePx++;
+        // If we hit at least 10px of continuous clean whitespace after text, this is the gap!
+        if (consecutiveWhitespacePx >= 12) {
+          predictedCutYpx = y - Math.floor(consecutiveWhitespacePx / 2); // cut right in the middle of gap
+          break;
+        }
+      }
+    }
+  }
+
+  if (predictedCutYpx > 0) {
+    const rawBox: BoxCoord = {
+      xmin,
+      xmax,
+      ymin: actualTopYpx / h,
+      ymax: predictedCutYpx / h,
+    };
+    const snapped = snapBoxToHorizontalWhitespaceValleys(canvas, rawBox, 15, inkThreshold);
+    return {
+      box: snapped,
+      confidence: textLineCount > 10 ? 'high' : 'medium',
+      reason: `Detected whitespace gap after ${textLineCount} text lines`,
+    };
+  }
+
+  // Fallback if no whitespace gap found
+  const fallbackYmax = Math.min(0.98, (actualTopYpx + Math.floor(h * fallbackHeightFraction)) / h);
+  const fallbackBox: BoxCoord = { xmin, xmax, ymin: actualTopYpx / h, ymax: fallbackYmax };
+  const snappedFallback = snapBoxToHorizontalWhitespaceValleys(canvas, fallbackBox, 20, inkThreshold);
+
+  return {
+    box: snappedFallback,
+    confidence: 'low',
+    reason: 'Used height heuristic fallback',
+  };
+}

@@ -305,15 +305,6 @@ export const QuestionEditor: React.FC = () => {
         {/* Action buttons & Prev/Next */}
         <div className="flex items-center gap-1.5 shrink-0">
           <button
-            onClick={() => openBoundaryOverlay({ questionId: currentQuestion!.id, partIndex: activePartIndex })}
-            className="flex items-center gap-1 px-2.5 py-1 text-xs bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 rounded-md border border-purple-500/40 transition-colors font-medium"
-            title="Inspect this question in the full-page layout overlay & check column alignment"
-          >
-            <Layers className="w-3.5 h-3.5 text-purple-400" />
-            <span className="hidden md:inline">Inspect in Layout</span>
-          </button>
-
-          <button
             onClick={() => openPdfRecrop({ questionId: currentQuestion!.id, partIndex: activePartIndex, mode: 'replace_part' })}
             className="flex items-center gap-1 px-2.5 py-1 text-xs bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-md border border-indigo-500/40 transition-colors font-medium"
             title="Re-crop this question directly from original PDF"
@@ -600,14 +591,7 @@ export const QuestionEditor: React.FC = () => {
                         onClick={() => {
                           const defaultMarks =
                             t.id === 'msq'
-                              ? {
-                                  cm: 4,
-                                  im: -2,
-                                  pm: 1,
-                                  max: 4,
-                                  partialTiers: { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 },
-                                  schemeType: 'jee_adv_msq' as const,
-                                }
+                              ? { cm: 4, im: -2, pm: 1, max: 4 }
                               : t.id === 'msm'
                               ? { cm: 3, im: -1, pm: 1, max: 12 }
                               : { cm: 4, im: -1, pm: 0, max: 4 };
@@ -821,101 +805,6 @@ export const QuestionEditor: React.FC = () => {
                   />
                 </div>
               </div>
-
-              {/* JEE Advanced MSQ Tiered Partial Marking Detail Panel */}
-              {currentQuestion.type === 'msq' && (
-                <div className="bg-slate-950/80 p-3 rounded-lg border border-purple-500/30 space-y-2 mt-2">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-semibold text-purple-300 flex items-center gap-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-purple-400" />
-                      <span>JEE Advanced MSQ Tiered Partial Marking Rules</span>
-                    </span>
-                    <span className="text-[10px] text-slate-400">Evaluates dynamically based on chosen count</span>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
-                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
-                      <span className="text-slate-400 text-[11px]">3 of 4 Correct:</span>
-                      <div className="flex items-center gap-1">
-                        <span className="text-emerald-400 font-mono font-bold">+</span>
-                        <input
-                          type="number"
-                          value={currentQuestion.marks.partialTiers?.threeCorrect ?? 3}
-                          onChange={(e) =>
-                            updateQuestion(
-                              currentQuestion!.id,
-                              {
-                                marks: {
-                                  ...currentQuestion!.marks,
-                                  partialTiers: {
-                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
-                                    threeCorrect: parseFloat(e.target.value) || 0,
-                                  },
-                                },
-                              },
-                              'Update 3-correct partial tier'
-                            )
-                          }
-                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
-                      <span className="text-slate-400 text-[11px]">2 of 3/4 Correct:</span>
-                      <div className="flex items-center gap-1">
-                        <span className="text-emerald-400 font-mono font-bold">+</span>
-                        <input
-                          type="number"
-                          value={currentQuestion.marks.partialTiers?.twoCorrect ?? 2}
-                          onChange={(e) =>
-                            updateQuestion(
-                              currentQuestion!.id,
-                              {
-                                marks: {
-                                  ...currentQuestion!.marks,
-                                  partialTiers: {
-                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
-                                    twoCorrect: parseFloat(e.target.value) || 0,
-                                  },
-                                },
-                              },
-                              'Update 2-correct partial tier'
-                            )
-                          }
-                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
-                      <span className="text-slate-400 text-[11px]">1 of 2/3/4 Correct:</span>
-                      <div className="flex items-center gap-1">
-                        <span className="text-emerald-400 font-mono font-bold">+</span>
-                        <input
-                          type="number"
-                          value={currentQuestion.marks.partialTiers?.oneCorrect ?? 1}
-                          onChange={(e) =>
-                            updateQuestion(
-                              currentQuestion!.id,
-                              {
-                                marks: {
-                                  ...currentQuestion!.marks,
-                                  partialTiers: {
-                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
-                                    oneCorrect: parseFloat(e.target.value) || 0,
-                                  },
-                                },
-                              },
-                              'Update 1-correct partial tier'
-                            )
-                          }
-                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
             </div>
 
             {/* Row 3: Answer Key & Option Responses */}

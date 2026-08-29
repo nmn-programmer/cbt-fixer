@@ -730,7 +730,7 @@ export const AnswerKeyStudioModal: React.FC = () => {
                     title="Select specific pages from single or multiple PDFs to extract answer keys"
                   >
                     <Layers className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Multi-PDF Page Selector (AI Suite)</span>
+                    <span>Select Pages (Automatic AI Extraction)</span>
                   </button>
 
                   <button

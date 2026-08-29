@@ -36,7 +36,7 @@ export const QuestionPageContextViewer: React.FC<QuestionPageContextViewerProps>
   const [pdfDoc, setPdfDoc] = useState<any>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
-  const [scale, setScale] = useState<number>(1.2);
+  const [scale, setScale] = useState<number>(0.75);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [totalPages, setTotalPages] = useState<number>(1);
   const [pdfFound, setPdfFound] = useState<boolean>(false);

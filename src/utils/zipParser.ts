@@ -209,10 +209,10 @@ export async function parseZipArchive(
     });
   }
 
-  // Ensure source PDF and answer key detection in rawFilesMap
-  let sourcePdfName = parsedJson.sourcePdfName || 'source_document.pdf';
+  // Ensure source PDF detection in rawFilesMap
+  let sourcePdfName = parsedJson.sourcePdfName || parsedJson.metadata?.sourcePdfName || 'source_document.pdf';
   for (const [pKey, pVal] of rawFilesMap.entries()) {
-    if (pKey.toLowerCase().endsWith('.pdf')) {
+    if (pKey.toLowerCase().endsWith('.pdf') || pKey.toLowerCase().includes('.pdf')) {
       sourcePdfName = pKey;
       if (!rawFilesMap.has('source_document.pdf')) {
         rawFilesMap.set('source_document.pdf', pVal);

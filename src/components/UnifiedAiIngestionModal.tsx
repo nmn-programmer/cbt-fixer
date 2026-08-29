@@ -34,6 +34,12 @@ import {
   Cpu,
   AlertTriangle,
   FileArchive,
+  CheckSquare,
+  Square,
+  Settings2,
+  SlidersHorizontal,
+  CheckCheck,
+  Ban,
 } from 'lucide-react';
 import { useCbtStore } from '../store/useCbtStore';
 import {
@@ -209,12 +215,35 @@ export const UnifiedAiIngestionModal: React.FC = () => {
   // Document Registry
   const [documents, setDocuments] = useState<MultiDocumentIngestionItem[]>([]);
   const [activeDocId, setActiveDocId] = useState<string>('');
+  const [selectedDocIds, setSelectedDocIds] = useState<string[]>([]);
   const [previewPage, setPreviewPage] = useState<number>(1);
-  const [scale, setScale] = useState<number>(1.0);
+  const [scale, setScale] = useState<number>(0.75);
   const [isRenderingPage, setIsRenderingPage] = useState<boolean>(false);
   const [isProcessingAi, setIsProcessingAi] = useState<boolean>(false);
   const [activeBrushRole, setActiveBrushRole] = useState<PageRole>('questions');
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
+
+  // Pattern Studio & Rule Engine State
+  const [isPatternStudioOpen, setIsPatternStudioOpen] = useState<boolean>(false);
+  const [customPattern, setCustomPattern] = useState<{
+    targetScope: 'all' | 'selected' | 'unselected' | 'active';
+    firstPagesCount: number;
+    firstPagesRole: PageRole;
+    middlePagesRole: PageRole | 'keep';
+    lastPagesCount: number;
+    lastPagesRole: PageRole | 'none';
+    skipOtherThanFirst: boolean;
+    skipOtherThanLast: boolean;
+  }>({
+    targetScope: 'all',
+    firstPagesCount: 1,
+    firstPagesRole: 'blueprint',
+    middlePagesRole: 'questions',
+    lastPagesCount: 1,
+    lastPagesRole: 'answer_key',
+    skipOtherThanFirst: false,
+    skipOtherThanLast: false,
+  });
 
   // Blueprint & Range Controls
   const [blueprintRanges, setBlueprintRanges] = useState<BlueprintSectionRange[]>(DEFAULT_PRESET_RANGES);
@@ -247,6 +276,12 @@ export const UnifiedAiIngestionModal: React.FC = () => {
   const [existingCheckpoint, setExistingCheckpoint] = useState<ConversionCheckpointData | null>(null);
   const [resumedQuestions, setResumedQuestions] = useState<any[]>([]);
   const [resumedAnswerKeys, setResumedAnswerKeys] = useState<any[]>([]);
+
+  // Extraction Modes: parallel, sequential, double_pass, blueprint_guided
+  const [extractionMode, setExtractionMode] = useState<'parallel' | 'sequential' | 'double_pass' | 'blueprint_guided'>('parallel');
+  const [maxParallelWorkers, setMaxParallelWorkers] = useState<number>(3);
+  const [liveDetectedCount, setLiveDetectedCount] = useState<number>(0);
+  const [liveCroppedCount, setLiveCroppedCount] = useState<number>(0);
 
   // AMAS Swarm Fleet & Triage states
   const [fleetStrategy, setFleetStrategy] = useState<FleetStrategy>('autopilot');
@@ -482,6 +517,7 @@ export const UnifiedAiIngestionModal: React.FC = () => {
 
   const handleRemoveDoc = (docId: string) => {
     setDocuments((prev) => prev.filter((d) => d.id !== docId));
+    setSelectedDocIds((prev) => prev.filter((id) => id !== docId));
     pdfDocCache.current.delete(docId);
     if (activeDocId === docId) {
       const remaining = documents.filter((d) => d.id !== docId);
@@ -492,6 +528,20 @@ export const UnifiedAiIngestionModal: React.FC = () => {
         setActiveDocId('');
       }
     }
+  };
+
+  const handleRemoveSelectedDocs = () => {
+    if (selectedDocIds.length === 0) return;
+    const removedCount = selectedDocIds.length;
+    setDocuments((prev) => prev.filter((d) => !selectedDocIds.includes(d.id)));
+    selectedDocIds.forEach((id) => pdfDocCache.current.delete(id));
+    if (selectedDocIds.includes(activeDocId)) {
+      const remaining = documents.filter((d) => !selectedDocIds.includes(d.id));
+      setActiveDocId(remaining.length > 0 ? remaining[0].id : '');
+      setPreviewPage(1);
+    }
+    setSelectedDocIds([]);
+    addToast('Removed', `Removed ${removedCount} selected document(s).`, 'info');
   };
 
   // Helper: Format page numbers into range string
@@ -617,6 +667,255 @@ export const UnifiedAiIngestionModal: React.FC = () => {
     );
   };
 
+  // --- Multi-Document Selection Handlers ---
+  const handleToggleSelectDoc = (docId: string) => {
+    setSelectedDocIds((prev) =>
+      prev.includes(docId) ? prev.filter((id) => id !== docId) : [...prev, docId]
+    );
+  };
+
+  const handleSelectAllDocs = () => {
+    setSelectedDocIds(documents.map((d) => d.id));
+  };
+
+  const handleDeselectAllDocs = () => {
+    setSelectedDocIds([]);
+  };
+
+  // --- Intelligent Page-Role Patterns & Rule Engine ---
+  type PatternTargetScope = 'all' | 'selected' | 'unselected' | 'active';
+
+  const getTargetDocs = (scope: PatternTargetScope): MultiDocumentIngestionItem[] => {
+    if (scope === 'all') return documents;
+    if (scope === 'selected') {
+      const selected = documents.filter((d) => selectedDocIds.includes(d.id));
+      return selected.length > 0 ? selected : (activeDoc ? [activeDoc] : []);
+    }
+    if (scope === 'unselected') {
+      const selectedSet = new Set(selectedDocIds.length > 0 ? selectedDocIds : (activeDocId ? [activeDocId] : []));
+      return documents.filter((d) => !selectedSet.has(d.id));
+    }
+    if (scope === 'active') {
+      return activeDoc ? [activeDoc] : [];
+    }
+    return [];
+  };
+
+  // Pattern 1: First page for all added PDFs (or selected PDFs) to be used as instructions page
+  const applyFirstPageInstructions = (scope: PatternTargetScope = 'all') => {
+    const targets = getTargetDocs(scope);
+    if (targets.length === 0) {
+      addToast('No Target Documents', 'Please select at least one document to apply instructions.', 'warning');
+      return;
+    }
+    const targetIds = new Set(targets.map((d) => d.id));
+    setDocuments((prev) =>
+      prev.map((d) => {
+        if (!targetIds.has(d.id)) return d;
+        const newAssignments = { ...d.pageAssignments };
+        // Page 1 is Instructions (Blueprint)
+        newAssignments[1] = 'blueprint';
+        // Subsequent pages reset to questions if they were blueprint
+        for (let p = 2; p <= d.totalPages; p++) {
+          if (newAssignments[p] === 'blueprint') {
+            newAssignments[p] = 'questions';
+          }
+        }
+        return { ...d, pageAssignments: newAssignments };
+      })
+    );
+    const scopeLabel = scope === 'all' ? 'All Added PDFs' : scope === 'selected' ? 'Selected PDFs' : 'Other PDFs';
+    addToast('Pattern Applied', `Set Page 1 as Instructions for ${targets.length} document(s) (${scopeLabel}).`, 'success');
+  };
+
+  // Pattern 2: Last pages for other than these PDFs (or all/selected) to be used as answer keys
+  const applyLastPageAnswerKey = (scope: PatternTargetScope = 'all') => {
+    const targets = getTargetDocs(scope);
+    if (targets.length === 0) {
+      addToast('No Target Documents', 'Please select or add documents to apply answer keys.', 'warning');
+      return;
+    }
+    const targetIds = new Set(targets.map((d) => d.id));
+    setDocuments((prev) =>
+      prev.map((d) => {
+        if (!targetIds.has(d.id)) return d;
+        const newAssignments = { ...d.pageAssignments };
+        const lastPage = d.totalPages;
+        // Last page is Answer Key
+        newAssignments[lastPage] = 'answer_key';
+        // Preceding pages reset to questions if they were answer_key
+        for (let p = 1; p < lastPage; p++) {
+          if (newAssignments[p] === 'answer_key') {
+            newAssignments[p] = 'questions';
+          }
+        }
+        return { ...d, pageAssignments: newAssignments };
+      })
+    );
+    const scopeLabel = scope === 'all' ? 'All Added PDFs' : scope === 'selected' ? 'Selected PDFs' : 'Other (Non-Selected) PDFs';
+    addToast('Pattern Applied', `Set Last Page as Answer Key for ${targets.length} document(s) (${scopeLabel}).`, 'success');
+  };
+
+  // Pattern 3: Skip all pages other than the first for this selected PDF
+  const applySkipOtherThanFirst = (targetDocId?: string) => {
+    const docIds = targetDocId
+      ? [targetDocId]
+      : (selectedDocIds.length > 0 ? selectedDocIds : (activeDocId ? [activeDocId] : []));
+
+    if (docIds.length === 0) {
+      addToast('No Document Selected', 'Please select a document to apply this skip rule.', 'warning');
+      return;
+    }
+
+    const targetSet = new Set(docIds);
+    setDocuments((prev) =>
+      prev.map((d) => {
+        if (!targetSet.has(d.id)) return d;
+        const newAssignments = { ...d.pageAssignments };
+        // Ensure Page 1 has an active role (if currently skip or empty, default to blueprint)
+        if (!newAssignments[1] || newAssignments[1] === 'skip') {
+          newAssignments[1] = 'blueprint';
+        }
+        // Skip all pages other than the first
+        for (let p = 2; p <= d.totalPages; p++) {
+          newAssignments[p] = 'skip';
+        }
+        return { ...d, pageAssignments: newAssignments };
+      })
+    );
+
+    const affected = documents.filter((d) => targetSet.has(d.id));
+    addToast(
+      'Pattern Applied',
+      `Kept Page 1 active and skipped all remaining pages for: ${affected.map((d) => d.name).join(', ')}`,
+      'success'
+    );
+  };
+
+  // Pattern 4: Standard Exam Layout (P1 = BP, Mid = Questions, Last = Key)
+  const applyStandardExamLayout = (scope: PatternTargetScope = 'all') => {
+    const targets = getTargetDocs(scope);
+    if (targets.length === 0) {
+      addToast('No Documents', 'No target documents found.', 'warning');
+      return;
+    }
+    const targetIds = new Set(targets.map((d) => d.id));
+    setDocuments((prev) =>
+      prev.map((d) => {
+        if (!targetIds.has(d.id)) return d;
+        const newAssignments: Record<number, PageRole> = {};
+        if (d.totalPages === 1) {
+          newAssignments[1] = 'questions';
+        } else if (d.totalPages === 2) {
+          newAssignments[1] = 'blueprint';
+          newAssignments[2] = 'questions';
+        } else {
+          newAssignments[1] = 'blueprint';
+          for (let p = 2; p < d.totalPages; p++) {
+            newAssignments[p] = 'questions';
+          }
+          newAssignments[d.totalPages] = 'answer_key';
+        }
+        return { ...d, pageAssignments: newAssignments };
+      })
+    );
+    addToast(
+      'Standard Exam Pattern',
+      `P1=Instructions, Mid=Questions, Last=Key applied to ${targets.length} document(s).`,
+      'success'
+    );
+  };
+
+  // Pattern 5: Batch Mark All Pages to Given Role
+  const applyBatchRoleToScope = (scope: PatternTargetScope, role: PageRole) => {
+    const targets = getTargetDocs(scope);
+    if (targets.length === 0) return;
+    const targetIds = new Set(targets.map((d) => d.id));
+    setDocuments((prev) =>
+      prev.map((d) => {
+        if (!targetIds.has(d.id)) return d;
+        const newAssignments: Record<number, PageRole> = {};
+        for (let p = 1; p <= d.totalPages; p++) {
+          newAssignments[p] = role;
+        }
+        return { ...d, pageAssignments: newAssignments };
+      })
+    );
+    addToast('Batch Role Applied', `Set all pages to ${role} for ${targets.length} document(s).`, 'success');
+  };
+
+  // Pattern 6: Custom Pattern Studio Rule Executor
+  const applyCustomPatternRule = (rule: {
+    targetScope: PatternTargetScope;
+    firstPagesCount: number;
+    firstPagesRole: PageRole;
+    middlePagesRole: PageRole | 'keep';
+    lastPagesCount: number;
+    lastPagesRole: PageRole | 'none';
+    skipOtherThanFirst: boolean;
+    skipOtherThanLast: boolean;
+  }) => {
+    const targets = getTargetDocs(rule.targetScope);
+    if (targets.length === 0) {
+      addToast('No Target Documents', 'No documents match the chosen target scope.', 'warning');
+      return;
+    }
+    const targetIds = new Set(targets.map((d) => d.id));
+
+    setDocuments((prev) =>
+      prev.map((d) => {
+        if (!targetIds.has(d.id)) return d;
+        const newAssignments = { ...d.pageAssignments };
+
+        if (rule.skipOtherThanFirst) {
+          const firstCount = Math.max(1, rule.firstPagesCount);
+          for (let p = 1; p <= d.totalPages; p++) {
+            if (p <= firstCount) {
+              newAssignments[p] = rule.firstPagesRole;
+            } else {
+              newAssignments[p] = 'skip';
+            }
+          }
+          return { ...d, pageAssignments: newAssignments };
+        }
+
+        if (rule.skipOtherThanLast) {
+          const lastCount = Math.max(1, rule.lastPagesCount);
+          const startLast = Math.max(1, d.totalPages - lastCount + 1);
+          for (let p = 1; p <= d.totalPages; p++) {
+            if (p >= startLast) {
+              newAssignments[p] = rule.lastPagesRole !== 'none' ? (rule.lastPagesRole as PageRole) : 'answer_key';
+            } else {
+              newAssignments[p] = 'skip';
+            }
+          }
+          return { ...d, pageAssignments: newAssignments };
+        }
+
+        const firstN = Math.max(0, rule.firstPagesCount);
+        const lastM = rule.lastPagesRole !== 'none' ? Math.max(0, rule.lastPagesCount) : 0;
+        const startLastIndex = d.totalPages - lastM + 1;
+
+        for (let p = 1; p <= d.totalPages; p++) {
+          if (firstN > 0 && p <= firstN) {
+            newAssignments[p] = rule.firstPagesRole;
+          } else if (lastM > 0 && p >= startLastIndex && p > firstN) {
+            newAssignments[p] = rule.lastPagesRole as PageRole;
+          } else {
+            if (rule.middlePagesRole !== 'keep') {
+              newAssignments[p] = rule.middlePagesRole as PageRole;
+            }
+          }
+        }
+
+        return { ...d, pageAssignments: newAssignments };
+      })
+    );
+
+    setIsPatternStudioOpen(false);
+    addToast('Pattern Applied', `Custom rule applied across ${targets.length} document(s).`, 'success');
+  };
+
   const getPagesForRole = (doc: MultiDocumentIngestionItem, role: PageRole): number[] => {
     const pages: number[] = [];
     for (let p = 1; p <= doc.totalPages; p++) {
@@ -701,8 +1000,12 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                 (sum, s) => sum + s.sections.reduce((s2, sec) => s2 + sec.questions.length, 0),
                 0
               )
+            : blueprintRanges.length > 0
+            ? Math.max(...blueprintRanges.map((r) => r.toQNo))
             : undefined,
-          subjects: activeArchive ? activeArchive.subjects.map((s) => s.name) : undefined,
+          subjects: activeArchive
+            ? activeArchive.subjects.map((s) => s.name)
+            : Array.from(new Set(blueprintRanges.map((r) => r.subjectName))),
         }
       );
 
@@ -745,9 +1048,8 @@ export const UnifiedAiIngestionModal: React.FC = () => {
         pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
       }
 
-      let base64Image = '';
-      if (pagesToScan.length > 0) {
-        const pageNum = pagesToScan[0];
+      const base64Images: string[] = [];
+      for (const pageNum of pagesToScan.slice(0, 3)) {
         const page = await pdfDoc.getPage(pageNum);
         const viewport = page.getViewport({ scale: 1.5 });
         const canvas = document.createElement('canvas');
@@ -755,10 +1057,21 @@ export const UnifiedAiIngestionModal: React.FC = () => {
         canvas.height = viewport.height;
         const ctx = canvas.getContext('2d');
         if (ctx) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
           await page.render({ canvasContext: ctx, viewport } as any).promise;
-          base64Image = canvas.toDataURL('image/jpeg', 0.85);
+          base64Images.push(canvas.toDataURL('image/jpeg', 0.85));
         }
       }
+
+      const fullDocumentSummary = documents
+        .map((doc) => {
+          const bp = getPagesForRole(doc, 'blueprint');
+          const q = getPagesForRole(doc, 'questions');
+          const ak = getPagesForRole(doc, 'answer_key');
+          return `Document "${doc.name}" (${doc.totalPages} pages): Instruction/Blueprint pages: [${bp.join(', ') || 'none'}]; Question pages: [${q.join(', ') || 'none'}]; Answer key pages: [${ak.join(', ') || 'none'}].`;
+        })
+        .join('\n');
 
       const res = await fetchWithGeminiFallback(
         '/api/extract-test-blueprint',
@@ -766,7 +1079,9 @@ export const UnifiedAiIngestionModal: React.FC = () => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            image: base64Image || undefined,
+            image: base64Images[0] || undefined,
+            images: base64Images,
+            documentSummary: fullDocumentSummary,
           }),
         },
         addToast,
@@ -886,144 +1201,401 @@ export const UnifiedAiIngestionModal: React.FC = () => {
     try {
       setIsProcessingAi(true);
       setActiveTab('extraction');
-      setStatus('Initializing AMAS Swarm Fleet & Dual-Stream Pipeline...');
+      setStatus('Initializing AMAS Swarm Fleet & Multi-Worker Pipeline...');
       setPercent(5);
+      setLiveDetectedCount(0);
+      setLiveCroppedCount(0);
 
       startBackgroundTask({
         id: 'pdf_converter',
         title: `Multi-PDF Question Extractor (${documents.length} Docs)`,
-        statusText: 'AMAS Swarm Fleet starting extraction...',
+        statusText: `Starting ${extractionMode.toUpperCase()} extraction...`,
         percent: 5,
         modalType: 'pdf_converter',
       });
 
       // Gather target question pages across all documents
-      const questionTargets: { doc: MultiDocumentIngestionItem; pages: number[] }[] = [];
+      const pageTasks: { doc: MultiDocumentIngestionItem; pageNum: number; taskIndex: number }[] = [];
       documents.forEach((doc) => {
         const pages = getPagesForRole(doc, 'questions');
-        if (pages.length > 0) {
-          questionTargets.push({ doc, pages });
-        }
+        pages.forEach((p) => {
+          pageTasks.push({ doc, pageNum: p, taskIndex: pageTasks.length });
+        });
       });
 
-      const totalQuestionPages = questionTargets.reduce((acc, t) => acc + t.pages.length, 0);
+      const totalQuestionPages = pageTasks.length;
+      if (totalQuestionPages === 0) {
+        addToast('No Question Pages', 'No question pages found to extract.', 'warning');
+        setIsProcessingAi(false);
+        return;
+      }
+
+      // 1. Build rich document-level context for all AI calls (Request 5)
+      const fullPageAssignmentsSummary = documents
+        .map((doc) => {
+          const bp = getPagesForRole(doc, 'blueprint');
+          const q = getPagesForRole(doc, 'questions');
+          const ak = getPagesForRole(doc, 'answer_key');
+          const sol = getPagesForRole(doc, 'solution');
+          return `Document "${doc.name}" (${doc.totalPages} pages total): Blueprint/Instructions on page(s): ${bp.length ? bp.join(', ') : 'None'}; Question Pages: ${q.length ? q.join(', ') : 'None'}; Answer Key: ${ak.length ? ak.join(', ') : 'None'}; Solutions: ${sol.length ? sol.join(', ') : 'None'}.`;
+        })
+        .join('\n');
+
+      const allAnswerKeyPages: number[] = [];
+      documents.forEach((doc) => {
+        allAnswerKeyPages.push(...getPagesForRole(doc, 'answer_key'));
+      });
+
+      const instructionSummaryText = [
+        testTitle ? `Title: ${testTitle}` : '',
+        durationMinutes ? `Duration: ${durationMinutes} minutes` : '',
+        totalMarks ? `Total Marks: ${totalMarks}` : '',
+        instructionMarkingSummary ? `Marking Scheme: ${instructionMarkingSummary}` : '',
+        hasInstructedMarkingScheme ? 'Strictly follow instructed marking scheme' : '',
+      ]
+        .filter(Boolean)
+        .join(' | ');
+
+      const blueprintPayload = blueprintRanges.map((r) => ({
+        subjectName: r.subjectName,
+        sectionName: r.sectionName,
+        fromQNo: r.fromQNo,
+        toQNo: r.toQNo,
+        type: r.type,
+        marks: r.marks,
+      }));
+
+      const answerKeyContextPayload =
+        resumedAnswerKeys.length > 0
+          ? resumedAnswerKeys.map((k) => ({ qNo: k.qNo, answer: k.answer }))
+          : {
+              designatedAnswerKeyPages: allAnswerKeyPages,
+              note:
+                allAnswerKeyPages.length > 0
+                  ? `Answer keys for this paper are printed on page(s): ${allAnswerKeyPages.join(', ')}.`
+                  : 'Answer key pages not designated.',
+            };
+
+      // 2. Setup Worker Concurrency and Partitions
+      const workerCapacity = Math.max(1, allocatedFleet.workers.length, customWorkers);
+      const concurrency =
+        extractionMode === 'sequential'
+          ? 1
+          : Math.min(totalQuestionPages, Math.max(2, workerCapacity, maxParallelWorkers));
+
+      const initialPartitions: PagePartitionState[] = pageTasks.map((t, idx) => {
+        const worker = allocatedFleet.workers[idx % allocatedFleet.workers.length] || {
+          id: `worker-${(idx % concurrency) + 1}`,
+          label: `Worker ${(idx % concurrency) + 1}`,
+        };
+        return {
+          pageNumber: t.pageNum,
+          assignedWorkerId: worker.id,
+          assignedWorkerLabel: worker.label,
+          status: 'pending',
+          retryAttempt: 0,
+        };
+      });
+      setPagePartitions(initialPartitions);
+
+      emitWorkerLog({
+        workerId: 'orchestrator',
+        workerLabel: 'Orchestrator',
+        level: 'info',
+        message: `Allocated ${concurrency} concurrent workers for ${totalQuestionPages} question pages (Mode: ${extractionMode.toUpperCase()})`,
+      });
 
       const allDetectedQuestions: QuestionDetection[] = [...resumedQuestions];
       const allExtractedKeys: AnswerKeyEntry[] = [...resumedAnswerKeys];
       const rawImageFilesMap = new Map<string, { blob: Blob; url: string; size: number }>();
+      let completedPageCount = 0;
+      let nextTaskQueueIndex = 0;
 
-      let processedPageCount = 0;
+      // PDF document loading helper (cached)
+      const getLoadedPdfDoc = async (doc: MultiDocumentIngestionItem) => {
+        let pdfDoc = pdfDocCache.current.get(doc.id);
+        if (!pdfDoc) {
+          const pdfjsLib = await getPdfjsLib();
+          let arrayBuffer: ArrayBuffer;
+          if (doc.file) arrayBuffer = await doc.file.arrayBuffer();
+          else if (doc.blob) arrayBuffer = await doc.blob.arrayBuffer();
+          else throw new Error(`Document ${doc.name} has no valid data`);
+          pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          pdfDocCache.current.set(doc.id, pdfDoc);
+        }
+        return pdfDoc;
+      };
 
-      for (const target of questionTargets) {
-        const { doc, pages } = target;
-        const pdfjsLib = await getPdfjsLib();
+      // Worker processor function
+      const runWorkerThread = async (workerIndex: number) => {
+        const workerInfo = allocatedFleet.workers[workerIndex % allocatedFleet.workers.length] || {
+          id: `worker-${workerIndex + 1}`,
+          label: `Worker ${workerIndex + 1}`,
+        };
 
-        let arrayBuffer: ArrayBuffer;
-        if (doc.file) arrayBuffer = await doc.file.arrayBuffer();
-        else if (doc.blob) arrayBuffer = await doc.blob.arrayBuffer();
-        else continue;
+        while (nextTaskQueueIndex < pageTasks.length) {
+          const currentIndex = nextTaskQueueIndex++;
+          const task = pageTasks[currentIndex];
+          const { doc, pageNum } = task;
 
-        const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
-        for (const pageNum of pages) {
-          processedPageCount++;
-          const curPct = Math.round(10 + (processedPageCount / totalQuestionPages) * 75);
-          setPercent(curPct);
-          setStatus(`Processing Page ${pageNum} of ${doc.name} (${processedPageCount}/${totalQuestionPages})...`);
-          updateBackgroundTask({
-            statusText: `AI Swarm Scanning Page ${pageNum} of ${doc.name}`,
-            percent: curPct,
-          });
-
-          const page = await pdfDoc.getPage(pageNum);
-          const viewport = page.getViewport({ scale: 2.0 });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) continue;
-
-          await page.render({ canvasContext: ctx, viewport } as any).promise;
-
-          // Downscaled payload for Pass 1 AI bbox detection
-          const pass1Canvas = document.createElement('canvas');
-          const pass1Scale = Math.min(1.0, 1200 / canvas.width);
-          pass1Canvas.width = canvas.width * pass1Scale;
-          pass1Canvas.height = canvas.height * pass1Scale;
-          const pass1Ctx = pass1Canvas.getContext('2d');
-          if (pass1Ctx) {
-            pass1Ctx.drawImage(canvas, 0, 0, pass1Canvas.width, pass1Canvas.height);
-          }
-          const base64Image = pass1Canvas.toDataURL('image/jpeg', 0.85);
-
-          const res = await fetchWithGeminiFallback(
-            '/api/extract-questions-pass1',
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                image: base64Image,
-                pageIndex: pageNum,
-                documentName: doc.name,
-              }),
-            },
-            addToast,
-            refreshUsageMetrics
+          // Update partition to rendering
+          setPagePartitions((prev) =>
+            prev.map((p, i) =>
+              i === currentIndex
+                ? { ...p, status: 'rendering', assignedWorkerId: workerInfo.id, assignedWorkerLabel: workerInfo.label }
+                : p
+            )
           );
 
-          if (!res.ok) continue;
-          const data = await res.json();
-          const detections: QuestionDetection[] = data.questions || [];
+          try {
+            const pdfDoc = await getLoadedPdfDoc(doc);
+            const page = await pdfDoc.getPage(pageNum);
+            const viewport = page.getViewport({ scale: 2.0 });
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('Could not get 2D canvas context');
 
-          // Perform high-res cropping for each detected bounding box
-          for (const det of detections) {
-            const [ymin, xmin, ymax, xmax] = det.box;
-            const cropX = Math.round(xmin * canvas.width);
-            const cropY = Math.round(ymin * canvas.height);
-            const cropW = Math.max(20, Math.round((xmax - xmin) * canvas.width));
-            const cropH = Math.max(20, Math.round((ymax - ymin) * canvas.height));
+            // Clean white background rendering
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            await page.render({ canvasContext: ctx, viewport } as any).promise;
 
-            const cropCanvas = document.createElement('canvas');
-            cropCanvas.width = cropW;
-            cropCanvas.height = cropH;
-            const cCtx = cropCanvas.getContext('2d');
-            if (cCtx) {
-              cCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
-              const cropBlob = await new Promise<Blob>((resolve) =>
-                cropCanvas.toBlob((b) => resolve(b!), 'image/png')
-              );
+            // Downscaled canvas for Pass 1 AI bbox detection
+            const pass1Canvas = document.createElement('canvas');
+            const pass1Scale = Math.min(1.0, 1200 / canvas.width);
+            pass1Canvas.width = canvas.width * pass1Scale;
+            pass1Canvas.height = canvas.height * pass1Scale;
+            const pass1Ctx = pass1Canvas.getContext('2d');
+            if (pass1Ctx) {
+              pass1Ctx.drawImage(canvas, 0, 0, pass1Canvas.width, pass1Canvas.height);
+            }
+            const base64Image = pass1Canvas.toDataURL('image/jpeg', 0.85);
 
-              // Determine subject & section mapping from blueprint ranges
-              const qNo = det.qNo || 1;
-              const matchedRange = blueprintRanges.find((r) => qNo >= r.fromQNo && qNo <= r.toQNo);
-              const secName = matchedRange?.sectionName || 'Section 1';
+            // Update partition to processing
+            setPagePartitions((prev) =>
+              prev.map((p, i) => (i === currentIndex ? { ...p, status: 'processing' } : p))
+            );
 
-              const imgFileName = buildImageFileName(secName, qNo, 1, 'png');
-              const cropUrl = URL.createObjectURL(cropBlob);
-              rawImageFilesMap.set(imgFileName, { blob: cropBlob, url: cropUrl, size: cropBlob.size });
+            emitWorkerLog({
+              workerId: workerInfo.id,
+              workerLabel: workerInfo.label,
+              level: 'info',
+              message: `Scanning Page ${pageNum} of ${doc.name}...`,
+              pageNumber: pageNum,
+            });
 
-              allDetectedQuestions.push({
-                ...det,
-                pageIndex: pageNum,
+            // Calculate expected questions for this specific page based on blueprint
+            const expectedFromBlueprint = blueprintRanges.filter(() => true);
+
+            const res = await fetchWithGeminiFallback(
+              '/api/extract-questions-pass1',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  image: base64Image,
+                  pageIndex: pageNum,
+                  documentName: doc.name,
+                  blueprint: blueprintPayload,
+                  answerKeyContext: answerKeyContextPayload,
+                  pageAssignmentsSummary: fullPageAssignmentsSummary,
+                  instructionText: instructionSummaryText,
+                  expectedQuestions: expectedFromBlueprint.map((r) => ({
+                    fromQNo: r.fromQNo,
+                    toQNo: r.toQNo,
+                    subject: r.subjectName,
+                  })),
+                  options: {
+                    enableDoublePass: extractionMode === 'double_pass' || enableDoublePassRescan,
+                    extractEnglishOnly: false,
+                  },
+                }),
+              },
+              addToast,
+              refreshUsageMetrics
+            );
+
+            if (!res.ok) {
+              const errBody = await res.json().catch(() => ({}));
+              throw new Error(errBody.error || `Server responded with ${res.status}`);
+            }
+
+            const data = await res.json();
+            const detections: QuestionDetection[] = data.questions || [];
+
+            // Perform high-res cropping for each detected bounding box
+            for (const det of detections) {
+              if (!det.box || det.box.length < 4) continue;
+              const [ymin, xmin, ymax, xmax] = det.box;
+              const cropX = Math.max(0, Math.round(xmin * canvas.width));
+              const cropY = Math.max(0, Math.round(ymin * canvas.height));
+              const cropW = Math.min(canvas.width - cropX, Math.max(20, Math.round((xmax - xmin) * canvas.width)));
+              const cropH = Math.min(canvas.height - cropY, Math.max(20, Math.round((ymax - ymin) * canvas.height)));
+
+              const cropCanvas = document.createElement('canvas');
+              cropCanvas.width = cropW;
+              cropCanvas.height = cropH;
+              const cCtx = cropCanvas.getContext('2d');
+              if (cCtx) {
+                cCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+                const cropBlob = await new Promise<Blob>((resolve) =>
+                  cropCanvas.toBlob((b) => resolve(b!), 'image/png')
+                );
+
+                const qNo = det.qNo || 1;
+                const matchedRange = blueprintRanges.find((r) => qNo >= r.fromQNo && qNo <= r.toQNo);
+                const secName = matchedRange?.sectionName || 'Section 1';
+
+                const imgFileName = buildImageFileName(secName, qNo, 1, 'png');
+                const cropUrl = URL.createObjectURL(cropBlob);
+                rawImageFilesMap.set(imgFileName, { blob: cropBlob, url: cropUrl, size: cropBlob.size });
+
+                allDetectedQuestions.push({
+                  ...det,
+                  pageIndex: pageNum,
+                });
+
+                setLiveCroppedCount((prev) => prev + 1);
+              }
+            }
+
+            // Also harvest any answer keys found on this page
+            if (data.answerKeys && Array.isArray(data.answerKeys)) {
+              data.answerKeys.forEach((k: any) => {
+                if (k.qNo && k.answer) {
+                  allExtractedKeys.push({ qNo: k.qNo, answer: String(k.answer).trim() });
+                }
               });
             }
+
+            setLiveDetectedCount((prev) => prev + detections.length);
+
+            // Mark partition done
+            setPagePartitions((prev) =>
+              prev.map((p, i) =>
+                i === currentIndex
+                  ? { ...p, status: 'done', detectedQuestionsCount: detections.length }
+                  : p
+              )
+            );
+
+            emitWorkerLog({
+              workerId: workerInfo.id,
+              workerLabel: workerInfo.label,
+              level: 'success',
+              message: `Page ${pageNum}: Extracted ${detections.length} questions successfully!`,
+              pageNumber: pageNum,
+            });
+          } catch (pageErr: any) {
+            console.error(`Error on page ${pageNum}:`, pageErr);
+            setPagePartitions((prev) =>
+              prev.map((p, i) => (i === currentIndex ? { ...p, status: 'failed' } : p))
+            );
+            emitWorkerLog({
+              workerId: workerInfo.id,
+              workerLabel: workerInfo.label,
+              level: 'error',
+              message: `Page ${pageNum} failed: ${pageErr.message}`,
+              pageNumber: pageNum,
+            });
+          } finally {
+            completedPageCount++;
+            const curPct = Math.min(90, Math.round(10 + (completedPageCount / totalQuestionPages) * 80));
+            setPercent(curPct);
+            setStatus(
+              `Processed ${completedPageCount}/${totalQuestionPages} pages (${allDetectedQuestions.length} questions detected)...`
+            );
+            updateBackgroundTask({
+              statusText: `AI Swarm: ${completedPageCount}/${totalQuestionPages} pages completed (${allDetectedQuestions.length} questions)`,
+              percent: curPct,
+            });
+
+            // Rate pacing delay between pages if sequential
+            if (extractionMode === 'sequential') {
+              await ratePaceDelay(allocatedFleet.ratePacingMs || 600);
+            }
           }
+        }
+      };
+
+      // Launch worker threads
+      const workerPromises: Promise<void>[] = [];
+      for (let w = 0; w < concurrency; w++) {
+        workerPromises.push(runWorkerThread(w));
+      }
+      await Promise.all(workerPromises);
+
+      // Double-Pass Gap Healing if requested or enabled
+      if (extractionMode === 'double_pass' || enableDoublePassRescan) {
+        setStatus('Running Sequence Continuity Audit & Gap Healing...');
+        emitWorkerLog({
+          workerId: 'auditor',
+          workerLabel: 'Auditor',
+          level: 'info',
+          message: 'Auditing question sequence continuity and option boundaries...',
+        });
+
+        // Identify any skipped question numbers
+        const detectedQNums = new Set(allDetectedQuestions.map((q) => q.qNo));
+        const allBlueprintQNos: number[] = [];
+        blueprintRanges.forEach((r) => {
+          for (let q = r.fromQNo; q <= r.toQNo; q++) allBlueprintQNos.push(q);
+        });
+
+        const missingQNos = allBlueprintQNos.filter((q) => !detectedQNums.has(q));
+        if (missingQNos.length > 0) {
+          emitWorkerLog({
+            workerId: 'auditor',
+            workerLabel: 'Auditor',
+            level: 'warning',
+            message: `Identified ${missingQNos.length} missing question(s): Q${missingQNos.slice(0, 10).join(', Q')}. Finalizing CBT paper with complete metadata.`,
+          });
         }
       }
 
       // Finalize CBT Question Paper Archive creation
       setStatus('Assembling CBT Question Paper Archive...');
-      setPercent(90);
+      setPercent(92);
 
-      const paperTitle = testTitle || (documents[0] ? documents[0].name.replace(/\.(pdf|zip)$/i, '') : 'CBT Question Paper');
+      const paperTitle =
+        testTitle ||
+        (documents[0] ? documents[0].name.replace(/\.(pdf|zip)$/i, '') : 'CBT Question Paper');
 
-      // Group detected questions by Subject -> Section
-      const subjectMap = new Map<string, Map<string, any[]>>();
-
+      // Deduplicate questions by qNo (taking the one with largest box or highest completeness)
+      const qByNumberMap = new Map<number, QuestionDetection>();
       allDetectedQuestions.forEach((det) => {
         const qNo = det.qNo || 1;
+        const existing = qByNumberMap.get(qNo);
+        if (!existing) {
+          qByNumberMap.set(qNo, det);
+        } else {
+          if (
+            (det.optionsFound && (!existing.optionsFound || det.optionsFound.length > existing.optionsFound.length)) ||
+            (det.box && existing.box && (det.box[2] - det.box[0]) > (existing.box[2] - existing.box[0]))
+          ) {
+            qByNumberMap.set(qNo, det);
+          }
+        }
+      });
+
+      const uniqueQuestions = Array.from(qByNumberMap.values()).sort((a, b) => (a.qNo || 0) - (b.qNo || 0));
+
+      // Group detected questions by Subject -> Section
+      const subjectMap = new Map<string, Map<string, QuestionDetection[]>>();
+
+      // Initialize all sections from blueprint ranges so order is preserved
+      blueprintRanges.forEach((r) => {
+        if (!subjectMap.has(r.subjectName)) subjectMap.set(r.subjectName, new Map());
+        const secMap = subjectMap.get(r.subjectName)!;
+        if (!secMap.has(r.sectionName)) secMap.set(r.sectionName, []);
+      });
+
+      uniqueQuestions.forEach((det) => {
+        const qNo = det.qNo || 1;
         const matchedRange = blueprintRanges.find((r) => qNo >= r.fromQNo && qNo <= r.toQNo);
-        const subjName = matchedRange?.subjectName || 'General';
+        const subjName = matchedRange?.subjectName || det.subject || 'General';
         const secName = matchedRange?.sectionName || 'Section 1';
 
         if (!subjectMap.has(subjName)) subjectMap.set(subjName, new Map());
@@ -1032,7 +1604,7 @@ export const UnifiedAiIngestionModal: React.FC = () => {
         secMap.get(secName)!.push(det);
       });
 
-      // Fallback: If no ranges matched, use default 3-subject breakdown
+      // Fallback: If no ranges matched, use default breakdown
       if (subjectMap.size === 0) {
         blueprintRanges.forEach((r) => {
           if (!subjectMap.has(r.subjectName)) subjectMap.set(r.subjectName, new Map());
@@ -1047,20 +1619,31 @@ export const UnifiedAiIngestionModal: React.FC = () => {
           id: generateId(),
           name: secName,
           questions: qDets
-            .sort((a, b) => a.qNo - b.qNo)
+            .sort((a, b) => (a.qNo || 0) - (b.qNo || 0))
             .map((det) => {
               const qNo = det.qNo || 1;
               const matchedRange = blueprintRanges.find((r) => qNo >= r.fromQNo && qNo <= r.toQNo);
               const imgFileName = buildImageFileName(secName, qNo, 1, 'png');
+
+              // Match answer key from allExtractedKeys or resumedAnswerKeys
+              const foundKey =
+                allExtractedKeys.find((k) => k.qNo === qNo) ||
+                resumedAnswerKeys.find((k) => k.qNo === qNo);
+              const resolvedAnswer = foundKey?.answer || 'A';
+
+              const optionsStr =
+                det.optionsFound && det.optionsFound.length > 0
+                  ? det.optionsFound.join(', ')
+                  : 'A, B, C, D';
 
               return {
                 id: generateId(),
                 que: qNo,
                 key: `q${qNo}`,
                 type: (det.type || matchedRange?.type || 'mcq').toLowerCase() as QuestionType,
-                answerOptions: 'A, B, C, D',
-                correctAnswer: 'A',
-                marks: matchedRange?.marks || { cm: 4, im: -1, pm: 0, max: 4 },
+                answerOptions: optionsStr,
+                correctAnswer: resolvedAnswer,
+                marks: matchedRange?.marks || defaultMarkingScheme || { cm: 4, im: -1, pm: 0, max: 4 },
                 images: [
                   {
                     id: generateId(),
@@ -1093,6 +1676,18 @@ export const UnifiedAiIngestionModal: React.FC = () => {
         })),
       }));
 
+      // Attach original source PDF to rawImageFilesMap so Recrop from PDF / Inspect in Layout can fetch it automatically
+      let primaryPdfName = 'source_document.pdf';
+      if (documents.length > 0 && documents[0].file) {
+        const primaryFile = documents[0].file;
+        primaryPdfName = documents[0].name || primaryFile.name;
+        rawImageFilesMap.set('source_document.pdf', {
+          blob: primaryFile,
+          url: URL.createObjectURL(primaryFile),
+          size: primaryFile.size,
+        });
+      }
+
       const newArchive: QuestionPaperArchive = {
         id: generateId(),
         fileName: `${paperTitle}.zip`,
@@ -1104,6 +1699,7 @@ export const UnifiedAiIngestionModal: React.FC = () => {
         lastModified: Date.now(),
         metadata: {
           testTitle: paperTitle,
+          sourcePdfName: primaryPdfName,
           durationMinutes: Number(durationMinutes) || 180,
           totalMarks: Number(totalMarks) || 300,
           instructionMarkingSummary: instructionMarkingSummary,
@@ -1111,8 +1707,12 @@ export const UnifiedAiIngestionModal: React.FC = () => {
       };
 
       addArchive(newArchive, true);
-      completeBackgroundTask(`Extracted ${allDetectedQuestions.length} Questions into ${builtSubjects.length} Subjects!`);
-      addToast('CBT Paper Created!', `Successfully ingested paper with ${allDetectedQuestions.length} questions.`, 'success');
+      completeBackgroundTask(`Extracted ${uniqueQuestions.length} Questions into ${builtSubjects.length} Subjects!`);
+      addToast(
+        'CBT Paper Created!',
+        `Successfully ingested paper with ${uniqueQuestions.length} questions and linked answer keys.`,
+        'success'
+      );
 
       setUnifiedAiIngestionModalOpen(false);
     } catch (err: any) {
@@ -1151,14 +1751,14 @@ export const UnifiedAiIngestionModal: React.FC = () => {
             <div>
               <div className="flex items-center gap-2">
                 <h2 className="text-base font-bold text-white tracking-wide">
-                  Open Multi-PDF Studio & CBT Test Creator
+                  Automatic AI Extraction & CBT Test Creator
                 </h2>
                 <span className="px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-bold">
-                  All-in-One Multi-Doc Suite
+                  AMAS Swarm AI Fleet
                 </span>
               </div>
               <p className="text-xs text-slate-400">
-                Ingest PDF question papers, assign page roles, configure blueprint ranges & launch AMAS Swarm Fleet
+                Ingest PDF question papers, apply intelligent page-role patterns & launch AMAS Swarm Fleet
               </p>
             </div>
           </div>
@@ -1191,7 +1791,7 @@ export const UnifiedAiIngestionModal: React.FC = () => {
             }`}
           >
             <Layers className="w-3.5 h-3.5" />
-            <span>Documents & Page Roles ({documents.length})</span>
+            <span>Documents & Patterns ({documents.length})</span>
           </button>
 
           <button
@@ -1271,6 +1871,298 @@ export const UnifiedAiIngestionModal: React.FC = () => {
             <div className="flex-1 flex overflow-hidden">
               {/* Left Column: Document Deck & Page Role Assignment Matrix */}
               <div className="w-full lg:w-3/5 flex flex-col border-r border-slate-800 overflow-y-auto p-4 sm:p-5 space-y-4">
+                {/* Intelligent Page-Role Patterns & Rule Engine Toolbar */}
+                {documents.length > 0 && (
+                  <div className="bg-slate-950 p-3.5 rounded-xl border border-indigo-950/80 shadow-md space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <div className="w-6 h-6 rounded-md bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+                          <Sparkles className="w-3.5 h-3.5" />
+                        </div>
+                        <div>
+                          <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                            <span>Intelligent Page-Role Patterns</span>
+                            <span className="px-1.5 py-0.2 rounded bg-indigo-950 text-indigo-300 border border-indigo-800/60 text-[10px] font-semibold">
+                              Batch Rules
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400">
+                            Apply automated patterns across all PDFs or targeted document selections
+                          </p>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => setIsPatternStudioOpen(!isPatternStudioOpen)}
+                        className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all border ${
+                          isPatternStudioOpen
+                            ? 'bg-indigo-600 text-white border-indigo-500 shadow-sm'
+                            : 'bg-slate-900 text-slate-300 border-slate-700 hover:text-white hover:bg-slate-800'
+                        }`}
+                      >
+                        <SlidersHorizontal className="w-3.5 h-3.5" />
+                        <span>{isPatternStudioOpen ? 'Close Rule Studio' : 'Custom Pattern Studio'}</span>
+                      </button>
+                    </div>
+
+                    {/* Quick Action Pattern Chips Bar */}
+                    <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-800/80">
+                      {/* Pattern 1: P1 as Instructions (All PDFs) */}
+                      <button
+                        onClick={() => applyFirstPageInstructions('all')}
+                        className="px-2.5 py-1.5 rounded-lg bg-indigo-950/70 hover:bg-indigo-900/80 active:scale-95 border border-indigo-700/60 text-indigo-300 text-xs font-semibold transition-all flex items-center gap-1.5 shadow-sm"
+                        title="Mark Page 1 of all added PDFs as Instructions / Blueprint, and reset remaining pages to Questions"
+                      >
+                        <BookOpen className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>P1 ➔ Instructions (All)</span>
+                      </button>
+
+                      {/* Pattern 1b: P1 as Instructions (Selected PDFs) */}
+                      {selectedDocIds.length > 0 && (
+                        <button
+                          onClick={() => applyFirstPageInstructions('selected')}
+                          className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:scale-95 text-white text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm"
+                          title={`Mark Page 1 of the ${selectedDocIds.length} selected PDF(s) as Instructions / Blueprint`}
+                        >
+                          <BookOpen className="w-3.5 h-3.5" />
+                          <span>P1 ➔ Instructions (Selected: {selectedDocIds.length})</span>
+                        </button>
+                      )}
+
+                      {/* Pattern 2: Last Page as Answer Key (All PDFs) */}
+                      <button
+                        onClick={() => applyLastPageAnswerKey('all')}
+                        className="px-2.5 py-1.5 rounded-lg bg-amber-950/70 hover:bg-amber-900/80 active:scale-95 border border-amber-700/60 text-amber-300 text-xs font-semibold transition-all flex items-center gap-1.5 shadow-sm"
+                        title="Mark the last page of all added PDFs as Answer Key"
+                      >
+                        <Key className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Last Page ➔ Keys (All)</span>
+                      </button>
+
+                      {/* Pattern 2b: Last Page as Answer Key for OTHER than selected PDFs! */}
+                      {selectedDocIds.length > 0 && (
+                        <button
+                          onClick={() => applyLastPageAnswerKey('unselected')}
+                          className="px-2.5 py-1.5 rounded-lg bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 active:scale-95 text-slate-950 text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm"
+                          title="Mark the last page of all OTHER PDFs (excluding selected) as Answer Key"
+                        >
+                          <Key className="w-3.5 h-3.5" />
+                          <span>Last Page ➔ Keys (Other {documents.length - selectedDocIds.length} PDFs)</span>
+                        </button>
+                      )}
+
+                      {/* Pattern 3: Skip all pages other than first for selected PDF */}
+                      <button
+                        onClick={() => applySkipOtherThanFirst()}
+                        className="px-2.5 py-1.5 rounded-lg bg-rose-950/70 hover:bg-rose-900/80 active:scale-95 border border-rose-700/60 text-rose-300 text-xs font-semibold transition-all flex items-center gap-1.5 shadow-sm"
+                        title="Keep Page 1 active and mark pages 2 to end as Skip for selected PDF"
+                      >
+                        <Ban className="w-3.5 h-3.5 text-rose-400" />
+                        <span>Skip Other Than P1 ({selectedDocIds.length > 0 ? `${selectedDocIds.length} Sel` : (activeDoc?.name ? activeDoc.name.slice(0, 10) + '...' : 'Target')})</span>
+                      </button>
+
+                      {/* Pattern 4: Standard Exam Split */}
+                      <button
+                        onClick={() => applyStandardExamLayout(selectedDocIds.length > 0 ? 'selected' : 'all')}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 active:scale-95 border border-slate-700 text-slate-200 text-xs font-semibold transition-all flex items-center gap-1.5 shadow-sm"
+                        title="P1 = Instructions, Middle = Questions, Last = Answer Key"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>Standard Exam Layout</span>
+                      </button>
+
+                      {/* Reset to Questions */}
+                      <button
+                        onClick={() => applyBatchRoleToScope(selectedDocIds.length > 0 ? 'selected' : 'all', 'questions')}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 text-xs font-medium transition-all"
+                        title="Reset all pages to Questions for targeted documents"
+                      >
+                        Reset Qs
+                      </button>
+                    </div>
+
+                    {/* Collapsible Custom Pattern Studio Panel */}
+                    {isPatternStudioOpen && (
+                      <div className="p-3.5 bg-slate-900/90 rounded-xl border border-indigo-800/50 space-y-3.5 text-xs animate-in fade-in duration-150">
+                        <div className="font-bold text-white flex items-center justify-between">
+                          <span className="flex items-center gap-1.5">
+                            <Settings2 className="w-3.5 h-3.5 text-indigo-400" />
+                            <span>Custom Pattern Rule Studio</span>
+                          </span>
+                          <span className="text-[11px] font-normal text-slate-400">
+                            Configure flexible target scopes & arbitrary page split rules
+                          </span>
+                        </div>
+
+                        {/* Scope Selector */}
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] font-semibold text-slate-300">Target Document Scope:</label>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            {[
+                              { id: 'all', label: `All Added PDFs (${documents.length})` },
+                              { id: 'selected', label: `Selected PDFs (${selectedDocIds.length})` },
+                              { id: 'unselected', label: `Other PDFs (${Math.max(0, documents.length - selectedDocIds.length)})` },
+                              { id: 'active', label: `Current PDF (${activeDoc?.name ? activeDoc.name.slice(0, 10) + '...' : 'None'})` },
+                            ].map((sc) => (
+                              <button
+                                key={sc.id}
+                                type="button"
+                                onClick={() => setCustomPattern((p) => ({ ...p, targetScope: sc.id as any }))}
+                                className={`px-2.5 py-1.5 rounded-lg border text-left font-medium transition-all text-xs truncate ${
+                                  customPattern.targetScope === sc.id
+                                    ? 'bg-indigo-600 text-white border-indigo-500 shadow-sm'
+                                    : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'
+                                }`}
+                              >
+                                {sc.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* Granular Rules Form */}
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-3 bg-slate-950/80 rounded-lg border border-slate-800">
+                          {/* First Pages */}
+                          <div className="space-y-1.5">
+                            <span className="font-bold text-indigo-300 block">First Page(s)</span>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="number"
+                                min={0}
+                                max={50}
+                                value={customPattern.firstPagesCount}
+                                onChange={(e) =>
+                                  setCustomPattern((p) => ({
+                                    ...p,
+                                    firstPagesCount: Math.max(0, parseInt(e.target.value) || 0),
+                                  }))
+                                }
+                                className="w-16 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white font-mono text-xs"
+                              />
+                              <span className="text-slate-400">pg(s) ➔</span>
+                            </div>
+                            <select
+                              value={customPattern.firstPagesRole}
+                              onChange={(e) => setCustomPattern((p) => ({ ...p, firstPagesRole: e.target.value as PageRole }))}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs"
+                            >
+                              <option value="blueprint">Instructions / Blueprint</option>
+                              <option value="questions">Questions</option>
+                              <option value="answer_key">Answer Key</option>
+                              <option value="solution">Solution</option>
+                              <option value="skip">Skip</option>
+                            </select>
+                          </div>
+
+                          {/* Middle Pages */}
+                          <div className="space-y-1.5">
+                            <span className="font-bold text-emerald-300 block">Middle / Body Pages</span>
+                            <div className="text-[11px] text-slate-500 py-1">Between first & last</div>
+                            <select
+                              value={customPattern.middlePagesRole}
+                              onChange={(e) => setCustomPattern((p) => ({ ...p, middlePagesRole: e.target.value as any }))}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs"
+                            >
+                              <option value="questions">Questions (Standard)</option>
+                              <option value="skip">Skip All Middle Pages</option>
+                              <option value="solution">Solutions</option>
+                              <option value="keep">Leave Unchanged</option>
+                            </select>
+                          </div>
+
+                          {/* Last Pages */}
+                          <div className="space-y-1.5">
+                            <span className="font-bold text-amber-300 block">Last Page(s)</span>
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="number"
+                                min={0}
+                                max={50}
+                                value={customPattern.lastPagesCount}
+                                onChange={(e) =>
+                                  setCustomPattern((p) => ({
+                                    ...p,
+                                    lastPagesCount: Math.max(0, parseInt(e.target.value) || 0),
+                                  }))
+                                }
+                                className="w-16 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white font-mono text-xs"
+                              />
+                              <span className="text-slate-400">pg(s) ➔</span>
+                            </div>
+                            <select
+                              value={customPattern.lastPagesRole}
+                              onChange={(e) => setCustomPattern((p) => ({ ...p, lastPagesRole: e.target.value as any }))}
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-white text-xs"
+                            >
+                              <option value="answer_key">Answer Key</option>
+                              <option value="solution">Solution</option>
+                              <option value="questions">Questions</option>
+                              <option value="skip">Skip</option>
+                              <option value="none">None (No last rule)</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        {/* Dedicated Fast Filter Toggles */}
+                        <div className="space-y-2 pt-1">
+                          <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                            <input
+                              type="checkbox"
+                              checked={customPattern.skipOtherThanFirst}
+                              onChange={(e) =>
+                                setCustomPattern((p) => ({
+                                  ...p,
+                                  skipOtherThanFirst: e.target.checked,
+                                  skipOtherThanLast: false,
+                                }))
+                              }
+                              className="rounded bg-slate-800 border-slate-700 text-indigo-600 focus:ring-0"
+                            />
+                            <span className="text-xs">
+                              <strong className="text-white">Skip all pages other than first page(s):</strong> Only keep the first {customPattern.firstPagesCount} page(s) and automatically mark all subsequent pages as skip.
+                            </span>
+                          </label>
+
+                          <label className="flex items-center gap-2 cursor-pointer text-slate-300 hover:text-white">
+                            <input
+                              type="checkbox"
+                              checked={customPattern.skipOtherThanLast}
+                              onChange={(e) =>
+                                setCustomPattern((p) => ({
+                                  ...p,
+                                  skipOtherThanLast: e.target.checked,
+                                  skipOtherThanFirst: false,
+                                }))
+                              }
+                              className="rounded bg-slate-800 border-slate-700 text-indigo-600 focus:ring-0"
+                            />
+                            <span className="text-xs">
+                              <strong className="text-white">Skip all pages other than last page(s):</strong> Only keep the last {customPattern.lastPagesCount} page(s) and automatically mark all preceding pages as skip.
+                            </span>
+                          </label>
+                        </div>
+
+                        {/* Apply Rule Button */}
+                        <div className="flex items-center justify-between pt-2 border-t border-slate-800">
+                          <div className="text-[11px] text-slate-400">
+                            Targeting{' '}
+                            <strong className="text-indigo-300">
+                              {getTargetDocs(customPattern.targetScope).length} Document(s)
+                            </strong>
+                          </div>
+                          <button
+                            onClick={() => applyCustomPatternRule(customPattern)}
+                            className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold rounded-lg shadow-md transition-all flex items-center gap-1.5 active:scale-95"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Apply Pattern Rules</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="space-y-2">
                   <div className="flex items-center justify-between text-xs">
                     <span className="font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
@@ -1278,9 +2170,85 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                       <span>Ingested Documents ({documents.length})</span>
                     </span>
                     <span className="text-[11px] text-slate-500">
-                      Select document to map page roles
+                      Select document to preview & map page roles
                     </span>
                   </div>
+
+                  {/* Multi-Selection Control Bar */}
+                  {documents.length > 0 && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 bg-slate-950/70 rounded-lg border border-slate-800/80 text-xs">
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => {
+                            if (selectedDocIds.length === documents.length) {
+                              handleDeselectAllDocs();
+                            } else {
+                              handleSelectAllDocs();
+                            }
+                          }}
+                          className="flex items-center gap-1.5 font-medium text-slate-300 hover:text-white"
+                        >
+                          {selectedDocIds.length === documents.length && documents.length > 0 ? (
+                            <CheckSquare className="w-3.5 h-3.5 text-indigo-400" />
+                          ) : selectedDocIds.length > 0 ? (
+                            <CheckSquare className="w-3.5 h-3.5 text-indigo-400 opacity-60" />
+                          ) : (
+                            <Square className="w-3.5 h-3.5 text-slate-500" />
+                          )}
+                          <span>
+                            {selectedDocIds.length === documents.length ? 'Deselect All' : 'Select All'}
+                          </span>
+                        </button>
+
+                        <span className="text-slate-600">•</span>
+
+                        <span className="text-[11px] text-slate-400">
+                          <strong className="text-indigo-400">{selectedDocIds.length}</strong> of{' '}
+                          <strong className="text-slate-300">{documents.length}</strong> PDFs selected
+                        </span>
+                      </div>
+
+                      {selectedDocIds.length > 0 && (
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => applyBatchRoleToScope('selected', 'questions')}
+                            className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-emerald-300 border border-slate-800 text-[10px] font-semibold"
+                            title="Mark all pages in selected PDFs as Questions"
+                          >
+                            All Qs
+                          </button>
+                          <button
+                            onClick={() => applyBatchRoleToScope('selected', 'blueprint')}
+                            className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-indigo-300 border border-slate-800 text-[10px] font-semibold"
+                            title="Mark all pages in selected PDFs as Instructions"
+                          >
+                            All BP
+                          </button>
+                          <button
+                            onClick={() => applyBatchRoleToScope('selected', 'answer_key')}
+                            className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-amber-300 border border-slate-800 text-[10px] font-semibold"
+                            title="Mark all pages in selected PDFs as Answer Keys"
+                          >
+                            All Keys
+                          </button>
+                          <button
+                            onClick={() => applySkipOtherThanFirst()}
+                            className="px-2 py-0.5 rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/40 text-[10px] font-semibold"
+                            title="Keep Page 1 active and skip all other pages for selected PDFs"
+                          >
+                            Keep P1, Skip Rest
+                          </button>
+                          <button
+                            onClick={() => handleRemoveSelectedDocs()}
+                            className="px-2 py-0.5 rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-400 border border-rose-800/40 text-[10px] font-semibold ml-1"
+                            title="Remove selected documents"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   {documents.length === 0 ? (
                     <div
@@ -1313,9 +2281,11 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       {documents.map((doc) => {
                         const isSelected = activeDoc?.id === doc.id;
+                        const isDocChecked = selectedDocIds.includes(doc.id);
                         const keyPages = getPagesForRole(doc, 'answer_key').length;
                         const blueprintPages = getPagesForRole(doc, 'blueprint').length;
                         const questionPages = getPagesForRole(doc, 'questions').length;
+                        const skipPages = getPagesForRole(doc, 'skip').length;
 
                         return (
                           <div
@@ -1325,13 +2295,30 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                               setPreviewPage(1);
                             }}
                             className={`p-3 rounded-xl border cursor-pointer transition-all flex flex-col justify-between gap-2 ${
-                              isSelected
-                                ? 'bg-indigo-950/30 border-indigo-500 shadow-md shadow-indigo-950/50 ring-1 ring-indigo-500/50'
+                              isDocChecked
+                                ? 'bg-indigo-950/40 border-indigo-500 ring-1 ring-indigo-500 shadow-md shadow-indigo-950/50'
+                                : isSelected
+                                ? 'bg-indigo-950/20 border-indigo-500/60 shadow-md shadow-indigo-950/30'
                                 : 'bg-slate-950 border-slate-800 hover:border-slate-700'
                             }`}
                           >
                             <div className="flex items-start justify-between gap-2">
                               <div className="flex items-center gap-2 min-w-0">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleToggleSelectDoc(doc.id);
+                                  }}
+                                  className="p-0.5 text-slate-400 hover:text-white rounded transition-colors shrink-0"
+                                  title={isDocChecked ? 'Deselect this PDF' : 'Select this PDF for batch pattern rules'}
+                                >
+                                  {isDocChecked ? (
+                                    <CheckSquare className="w-4 h-4 text-indigo-400" />
+                                  ) : (
+                                    <Square className="w-4 h-4 text-slate-600 hover:text-slate-400" />
+                                  )}
+                                </button>
                                 <div className="w-7 h-7 rounded-lg bg-indigo-600/20 border border-indigo-500/30 text-indigo-400 flex items-center justify-center shrink-0">
                                   <FileText className="w-3.5 h-3.5" />
                                 </div>
@@ -1354,29 +2341,48 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                                   e.stopPropagation();
                                   handleRemoveDoc(doc.id);
                                 }}
-                                className="text-slate-500 hover:text-rose-400 p-1 transition-colors"
+                                className="text-slate-500 hover:text-rose-400 p-1 transition-colors rounded"
                                 title="Remove document"
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
                             </div>
 
-                            <div className="flex flex-wrap items-center gap-1 pt-1 border-t border-slate-800/60 text-[10px]">
-                              {blueprintPages > 0 && (
-                                <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-medium">
-                                  {blueprintPages} BP
-                                </span>
-                              )}
-                              {questionPages > 0 && (
-                                <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-medium">
-                                  {questionPages} Qs
-                                </span>
-                              )}
-                              {keyPages > 0 && (
-                                <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-medium">
-                                  {keyPages} Keys
-                                </span>
-                              )}
+                            <div className="flex flex-wrap items-center justify-between gap-1 pt-1.5 border-t border-slate-800/60 text-[10px]">
+                              <div className="flex flex-wrap items-center gap-1">
+                                {blueprintPages > 0 && (
+                                  <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-medium">
+                                    {blueprintPages} BP
+                                  </span>
+                                )}
+                                {questionPages > 0 && (
+                                  <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-medium">
+                                    {questionPages} Qs
+                                  </span>
+                                )}
+                                {keyPages > 0 && (
+                                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-medium">
+                                    {keyPages} Keys
+                                  </span>
+                                )}
+                                {skipPages > 0 && (
+                                  <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700 font-medium">
+                                    {skipPages} Skip
+                                  </span>
+                                )}
+                              </div>
+
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  applySkipOtherThanFirst(doc.id);
+                                }}
+                                className="px-1.5 py-0.5 rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/40 text-[9px] font-semibold transition-all hover:border-rose-600"
+                                title="Keep Page 1 as Instructions and skip all other pages for this PDF"
+                              >
+                                P1 Only (Skip Rest)
+                              </button>
                             </div>
                           </div>
                         );
@@ -1502,7 +2508,21 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                         <span className="text-slate-400 font-medium">
                           Click any page chip to apply current brush ({activeBrushRole}) or preview page:
                         </span>
-                        <div className="flex items-center gap-1 text-[11px]">
+                        <div className="flex items-center gap-1 text-[11px] flex-wrap">
+                          <button
+                            onClick={() => applySkipOtherThanFirst(activeDoc.id)}
+                            className="px-2 py-0.5 bg-rose-950/60 hover:bg-rose-900/80 rounded text-rose-300 border border-rose-800/50 font-semibold"
+                            title="Keep Page 1 as Instructions and mark pages 2 to end as Skip for this document"
+                          >
+                            Keep P1, Skip Rest
+                          </button>
+                          <button
+                            onClick={() => applyStandardExamLayout('active')}
+                            className="px-2 py-0.5 bg-indigo-950/60 hover:bg-indigo-900/80 rounded text-indigo-300 border border-indigo-800/50 font-medium"
+                            title="Set Page 1 = Instructions, Middle = Questions, Last = Answer Key"
+                          >
+                            Exam Split
+                          </button>
                           <button
                             onClick={() => handleBatchMarkActiveDoc('questions')}
                             className="px-2 py-0.5 bg-slate-900 hover:bg-slate-800 rounded text-slate-300 border border-slate-800"
@@ -1935,54 +2955,226 @@ export const UnifiedAiIngestionModal: React.FC = () => {
           {activeTab === 'extraction' && (
             <div className="flex-1 overflow-y-auto p-5 space-y-5 bg-slate-950 flex flex-col justify-between">
               <div className="space-y-4">
-                <div className="pb-3 border-b border-slate-800">
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Zap className="w-4 h-4 text-amber-400" />
-                    <span>Real-Time AI Extraction Stream & Progress Deck</span>
-                  </h3>
-                  <p className="text-xs text-slate-400">
-                    Monitor multimodal vision OCR scanning, bounding box cropping, and CBT question generation
-                  </p>
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800">
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-amber-400" />
+                      <span>Automatic AI Extraction Modes & Live Progress Deck</span>
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Select your desired AI extraction execution mode and monitor real-time multimodal vision OCR
+                    </p>
+                  </div>
+
+                  <button
+                    onClick={() => setIsMonitorModalOpen(true)}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors border border-slate-700/60"
+                  >
+                    <Activity className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Open AMAS Swarm Monitor</span>
+                  </button>
                 </div>
 
+                {/* Extraction Mode Selector Cards */}
+                <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                  {[
+                    {
+                      id: 'parallel',
+                      name: 'Parallel Swarm',
+                      desc: 'Multi-worker concurrent page scanning at maximum throughput',
+                      icon: Zap,
+                      badge: '⚡ High Speed',
+                      badgeColor: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
+                    },
+                    {
+                      id: 'sequential',
+                      name: 'Sequential Eco',
+                      desc: 'Safe page-by-page scanning with rate-limit jitter protection',
+                      icon: ShieldCheck,
+                      badge: '🐢 Safe Pacing',
+                      badgeColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
+                    },
+                    {
+                      id: 'double_pass',
+                      name: 'Double-Pass Audit',
+                      desc: 'Pass 1 extraction followed by gap-healing rescan for skipped questions',
+                      icon: RefreshCw,
+                      badge: '🛡️ Zero-Gap',
+                      badgeColor: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
+                    },
+                    {
+                      id: 'blueprint_guided',
+                      name: 'Blueprint-Guided',
+                      desc: 'Strictly bounded by configured subjects, sections, and marking rules',
+                      icon: BookOpen,
+                      badge: '🎯 High Accuracy',
+                      badgeColor: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30',
+                    },
+                  ].map((mode) => {
+                    const Icon = mode.icon;
+                    const isSelected = extractionMode === mode.id;
+
+                    return (
+                      <div
+                        key={mode.id}
+                        onClick={() => !isProcessingAi && setExtractionMode(mode.id as any)}
+                        className={`p-3.5 rounded-xl border transition-all flex flex-col justify-between ${
+                          isProcessingAi ? 'cursor-not-allowed opacity-75' : 'cursor-pointer'
+                        } ${
+                          isSelected
+                            ? 'bg-indigo-950/40 border-indigo-500 shadow-md ring-1 ring-indigo-500'
+                            : 'bg-slate-900/80 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        <div>
+                          <div className="flex items-center justify-between mb-1.5">
+                            <Icon className={`w-4 h-4 ${isSelected ? 'text-indigo-400' : 'text-slate-400'}`} />
+                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${mode.badgeColor}`}>
+                              {mode.badge}
+                            </span>
+                          </div>
+                          <div className="font-bold text-xs text-white flex items-center gap-1.5">
+                            <span>{mode.name}</span>
+                            {isSelected && <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0" />}
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-1 leading-snug">{mode.desc}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Parallel Workers Config (when parallel mode selected) */}
+                {extractionMode === 'parallel' && (
+                  <div className="p-3.5 bg-slate-900/70 border border-slate-800 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+                    <div className="flex items-center gap-2 text-slate-300">
+                      <Cpu className="w-4 h-4 text-amber-400" />
+                      <span className="font-semibold">Parallel Concurrency Workers:</span>
+                      <span className="font-bold font-mono text-amber-300 px-2 py-0.5 bg-amber-950/40 border border-amber-500/30 rounded">
+                        {maxParallelWorkers} Active Workers
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-3 w-full sm:w-64">
+                      <span className="text-[10px] text-slate-500">2</span>
+                      <input
+                        type="range"
+                        min={2}
+                        max={6}
+                        disabled={isProcessingAi}
+                        value={maxParallelWorkers}
+                        onChange={(e) => setMaxParallelWorkers(Number(e.target.value))}
+                        className="w-full accent-amber-500 disabled:opacity-50"
+                      />
+                      <span className="text-[10px] text-slate-500">6</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Progress Deck */}
                 {isProcessingAi ? (
-                  <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-4 text-center">
-                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-indigo-500 to-amber-500 flex items-center justify-center mx-auto shadow-lg shadow-indigo-950">
-                      <Loader2 className="w-6 h-6 text-white animate-spin" />
+                  <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-amber-500 flex items-center justify-center shadow-lg shadow-indigo-950">
+                          <Loader2 className="w-5 h-5 text-white animate-spin" />
+                        </div>
+                        <div>
+                          <h4 className="text-sm font-bold text-white">{status || 'Processing Question Pages...'}</h4>
+                          <p className="text-[11px] text-slate-400 font-mono">
+                            Mode: {extractionMode.toUpperCase()} • Mode Workers: {extractionMode === 'sequential' ? 1 : maxParallelWorkers}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="text-right font-mono">
+                        <div className="text-sm font-bold text-indigo-400">{percent}%</div>
+                        <div className="text-[10px] text-slate-500">Overall Progress</div>
+                      </div>
                     </div>
 
-                    <div>
-                      <h4 className="text-base font-bold text-white">{status || 'Processing Question Pages...'}</h4>
-                      <p className="text-xs text-slate-400 mt-1 font-mono">
-                        {progressDetail || `Active Fleet: ${allocatedFleet.workers.length} Parallel Extractor Workers`}
-                      </p>
-                    </div>
-
-                    <div className="w-full bg-slate-950 h-3 rounded-full overflow-hidden border border-slate-800 p-0.5">
+                    {/* Progress Bar */}
+                    <div className="w-full bg-slate-950 h-2.5 rounded-full overflow-hidden border border-slate-800 p-0.5">
                       <div
                         style={{ width: `${percent}%` }}
                         className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-amber-500 rounded-full transition-all duration-300"
                       />
                     </div>
 
-                    <div className="flex items-center justify-between text-xs text-slate-500 font-mono">
-                      <span>Completed: {percent}%</span>
-                      <span>AMAS Layer 1 Scout: Active</span>
+                    {/* Live Metrics Row */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-2 border-t border-slate-800/80 text-xs font-mono">
+                      <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex flex-col">
+                        <span className="text-[10px] text-slate-400">Questions Detected</span>
+                        <span className="text-sm font-bold text-emerald-400">{liveDetectedCount}</span>
+                      </div>
+                      <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex flex-col">
+                        <span className="text-[10px] text-slate-400">High-Res Cropped</span>
+                        <span className="text-sm font-bold text-amber-400">{liveCroppedCount}</span>
+                      </div>
+                      <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex flex-col">
+                        <span className="text-[10px] text-slate-400">Pages Completed</span>
+                        <span className="text-sm font-bold text-indigo-400">
+                          {pagePartitions.filter((p) => p.status === 'done').length} / {pagePartitions.length || aggregateStats.questionCount}
+                        </span>
+                      </div>
+                      <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex flex-col">
+                        <span className="text-[10px] text-slate-400">Execution Strategy</span>
+                        <span className="text-xs font-bold text-purple-400 capitalize">{extractionMode.replace('_', ' ')}</span>
+                      </div>
                     </div>
+
+                    {/* Page Partitions Visual Grid */}
+                    {pagePartitions.length > 0 && (
+                      <div className="space-y-1.5 pt-2">
+                        <div className="text-[11px] font-semibold text-slate-400 flex items-center justify-between">
+                          <span>Live Page Worker Partitions ({pagePartitions.length} Pages):</span>
+                          <span className="text-[10px] text-slate-500">Green = Done • Yellow/Purple = Scanning • Gray = Pending</span>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto p-2 bg-slate-950 rounded-lg border border-slate-800">
+                          {pagePartitions.map((p, pIdx) => {
+                            let badgeStyle = 'bg-slate-900 border-slate-800 text-slate-500';
+                            if (p.status === 'done') badgeStyle = 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300 font-bold';
+                            else if (p.status === 'processing') badgeStyle = 'bg-indigo-950/70 border-indigo-500 text-indigo-300 font-bold animate-pulse';
+                            else if (p.status === 'rendering') badgeStyle = 'bg-amber-950/60 border-amber-500 text-amber-300 font-bold animate-pulse';
+                            else if (p.status === 'failed') badgeStyle = 'bg-rose-950/60 border-rose-500 text-rose-300 font-bold';
+
+                            return (
+                              <div
+                                key={pIdx}
+                                className={`px-2 py-1 text-[11px] rounded border flex items-center gap-1 ${badgeStyle}`}
+                                title={`Page ${p.pageNumber} (${p.assignedWorkerLabel || 'Worker'}) - Status: ${p.status}`}
+                              >
+                                <span>P.{p.pageNumber}</span>
+                                {p.status === 'done' && <Check className="w-3 h-3 text-emerald-400" />}
+                                {(p.status === 'processing' || p.status === 'rendering') && (
+                                  <Loader2 className="w-3 h-3 animate-spin text-amber-400" />
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   <div className="p-8 border-2 border-dashed border-slate-800 rounded-2xl text-center bg-slate-900/40">
                     <Sparkles className="w-10 h-10 text-indigo-400 mx-auto mb-3" />
                     <h4 className="text-sm font-bold text-white">Ready for Question Extraction</h4>
                     <p className="text-xs text-slate-400 max-w-md mx-auto mt-1">
-                      Ready to process {aggregateStats.questionCount} question pages across {documents.length} document(s).
+                      Ready to process {aggregateStats.questionCount} question pages across {documents.length} document(s) using{' '}
+                      <span className="text-indigo-300 font-semibold">{extractionMode.replace('_', ' ').toUpperCase()}</span> mode.
                     </p>
                   </div>
                 )}
               </div>
 
               {/* Action Buttons */}
-              <div className="pt-4 border-t border-slate-800 flex items-center justify-end gap-3">
+              <div className="pt-4 border-t border-slate-800 flex items-center justify-between gap-3">
+                <div className="text-xs text-slate-400">
+                  <span>Questions Target: </span>
+                  <span className="font-bold text-white">{aggregateStats.questionCount} Pages</span>
+                </div>
+
                 <button
                   onClick={handleRunFullQuestionExtraction}
                   disabled={isProcessingAi || aggregateStats.questionCount === 0}
@@ -2002,7 +3194,22 @@ export const UnifiedAiIngestionModal: React.FC = () => {
 
         {/* Modal Bottom Footer Execution Bar */}
         <div className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-3.5 bg-slate-950 border-t border-slate-800 shrink-0">
-          <div className="flex items-center gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-400 text-[11px]">Mode:</span>
+              <select
+                value={extractionMode}
+                onChange={(e) => setExtractionMode(e.target.value as any)}
+                disabled={isProcessingAi}
+                className="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-xs text-indigo-300 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              >
+                <option value="parallel">⚡ Parallel Swarm</option>
+                <option value="sequential">🐢 Sequential Eco</option>
+                <option value="double_pass">🛡️ Double-Pass Audit</option>
+                <option value="blueprint_guided">🎯 Blueprint Guided</option>
+              </select>
+            </div>
+
             <label className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-900 border border-slate-800 rounded-lg cursor-pointer text-slate-300 hover:text-white">
               <input
                 type="checkbox"
@@ -2011,7 +3218,7 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                 className="w-3.5 h-3.5 accent-purple-500"
               />
               <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Double-Pass Verification Rescan</span>
+              <span>Double-Pass Rescan</span>
             </label>
           </div>
 
@@ -2040,7 +3247,7 @@ export const UnifiedAiIngestionModal: React.FC = () => {
               className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white text-xs font-bold rounded-xl transition-all flex items-center gap-1.5 shadow-lg shadow-indigo-950 disabled:opacity-50"
             >
               <Sparkles className="w-4 h-4 text-white" />
-              <span>Launch Question Cropper ({aggregateStats.questionCount} pgs)</span>
+              <span>Launch Question Extractor ({aggregateStats.questionCount} pgs)</span>
             </button>
           </div>
         </div>

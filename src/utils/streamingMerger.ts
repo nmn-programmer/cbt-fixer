@@ -122,6 +122,8 @@ export function reconcileGroundTruthKeys(
 
   // Find range of question numbers present in ground truth keyMap
   const expectedQNos = Array.from(keyMap.keys()).sort((a, b) => a - b);
+  const maxExpectedQ = expectedQNos.length > 0 ? Math.max(...expectedQNos) : Math.max(...questions.map((q) => q.qNo || 0));
+
   const extractedQNosSet = new Set(questions.map((q) => q.qNo));
 
   // Identify Missing Question Gaps
@@ -143,21 +145,8 @@ export function reconcileGroundTruthKeys(
     const qCopy = { ...q };
     const ak = keyMap.get(qCopy.qNo);
 
-    // Check Blueprint range type lock if blueprint is supplied
-    if (blueprintRanges && blueprintRanges.length > 0) {
-      const matchedRange = blueprintRanges.find(
-        (r) => qCopy.qNo >= r.fromQNo && qCopy.qNo <= r.toQNo
-      );
-      if (matchedRange && matchedRange.type) {
-        qCopy.type = matchedRange.type.toLowerCase();
-      }
-    }
-
     if (ak) {
       report.matchedKeysCount++;
-
-      const rawAnswer = String(ak.answer || '').trim();
-      const isBonusOrDropped = /^(bonus|dropped|grace|all)$/i.test(rawAnswer);
 
       // Check for type match with blueprint / answer key
       if (ak.type && qCopy.type && ak.type.toLowerCase() !== qCopy.type.toLowerCase()) {
@@ -169,22 +158,15 @@ export function reconcileGroundTruthKeys(
         qCopy.type = ak.type.toLowerCase();
       }
 
-      // Check NAT numerical values or numerical strings
-      const isNumeric = !isNaN(Number(rawAnswer)) && rawAnswer !== '';
-      if (ak.natValue != null || isNumeric) {
-        const val = ak.natValue != null ? ak.natValue : Number(rawAnswer);
+      // Check NAT numerical values
+      if (ak.natValue != null || (ak.answer && !isNaN(Number(ak.answer.trim())))) {
+        const val = ak.natValue != null ? ak.natValue : Number(ak.answer.trim());
         report.natValidatedCount++;
         qCopy.type = 'nat';
         report.discrepancies.push({
           qNo: qCopy.qNo,
           issueType: 'nat_value_attached',
           details: `Q${qCopy.qNo} verified as Numerical/NAT with ground-truth value = ${val}`,
-        });
-      } else if (isBonusOrDropped) {
-        report.discrepancies.push({
-          qNo: qCopy.qNo,
-          issueType: 'nat_value_attached',
-          details: `Q${qCopy.qNo} marked as official [${rawAnswer.toUpperCase()}] in ground-truth answer key.`,
         });
       }
     }
@@ -266,32 +248,26 @@ export class StreamingProducerConsumerMerger {
           ? this.confirmedQuestions[this.confirmedQuestions.length - 1]
           : null;
 
-      // A question with a valid distinct printed question number MUST NEVER be swallowed into prevQ
-      const hasDistinctValidQNo = Boolean(
-        item.qNo && item.qNo > 0 && prevQ && prevQ.qNo && item.qNo !== prevQ.qNo
-      );
-
-      // Check if item is genuinely an orphan continuation without its own question number
+      // Check if item is an orphan continuation from previous page/batch boundary
       const isExplicitOrphan = Boolean(
-        !hasDistinctValidQNo &&
-          (item.isOrphanContinuation ||
-            (item.continuationForQNo && prevQ && item.continuationForQNo === prevQ.qNo))
+        item.isOrphanContinuation ||
+          (item.continuationForQNo && prevQ && item.continuationForQNo === prevQ.qNo)
       );
 
       const isUnnumberedTopContinuation = Boolean(
-        !hasDistinctValidQNo &&
-          prevQ &&
+        prevQ &&
           (!item.qNo || item.qNo === 0 || item.qNo === prevQ.qNo) &&
           item.box[0] < 0.38
       );
 
       const isSplitPredecessorNeedsOptions = Boolean(
-        !hasDistinctValidQNo &&
-          prevQ &&
+        prevQ &&
           this.handleSplitQuestions &&
-          (prevQ.completeness === 'split' || prevQ.isSplit) &&
+          (prevQ.completeness === 'split' ||
+            prevQ.isSplit ||
+            (prevQ.type === 'mcq' && (!prevQ.optionsFound || prevQ.optionsFound.length < 3))) &&
           item.box[0] < 0.38 &&
-          (!item.qNo || item.qNo === 0 || item.qNo === prevQ.qNo)
+          (!item.qNo || item.qNo === prevQ.qNo || (item.optionsFound && item.optionsFound.length >= 1))
       );
 
       if (prevQ && (isExplicitOrphan || isUnnumberedTopContinuation || isSplitPredecessorNeedsOptions)) {
@@ -301,36 +277,20 @@ export class StreamingProducerConsumerMerger {
           prevQ.splitParts = [{ pageIndex: prevQ.pageIndex, box: prevQ.box, partIndex: 1 }];
         }
 
-        const isDuplicateBox = (p1: number, b1: [number, number, number, number], p2: number, b2: [number, number, number, number]) => {
-          if (p1 !== p2) return false;
-          return Math.abs(b1[0] - b2[0]) < 0.03 && Math.abs(b1[1] - b2[1]) < 0.03 &&
-                 Math.abs(b1[2] - b2[2]) < 0.03 && Math.abs(b1[3] - b2[3]) < 0.03;
-        };
-
         if (item.splitParts && item.splitParts.length > 0) {
           item.splitParts.forEach((sp) => {
-            const alreadyExists = prevQ.splitParts!.some(existingPart =>
-              isDuplicateBox(existingPart.pageIndex, existingPart.box, sp.pageIndex, sp.box)
-            );
-            if (!alreadyExists) {
-              prevQ.splitParts!.push({
-                pageIndex: sp.pageIndex,
-                box: sp.box,
-                partIndex: prevQ.splitParts!.length + 1,
-              });
-            }
+            prevQ.splitParts!.push({
+              pageIndex: sp.pageIndex,
+              box: sp.box,
+              partIndex: prevQ.splitParts!.length + 1,
+            });
           });
         } else {
-          const alreadyExists = prevQ.splitParts.some(existingPart =>
-            isDuplicateBox(existingPart.pageIndex, existingPart.box, item.pageIndex, item.box)
-          );
-          if (!alreadyExists) {
-            prevQ.splitParts.push({
-              pageIndex: item.pageIndex,
-              box: item.box,
-              partIndex: prevQ.splitParts.length + 1,
-            });
-          }
+          prevQ.splitParts.push({
+            pageIndex: item.pageIndex,
+            box: item.box,
+            partIndex: prevQ.splitParts!.length + 1,
+          });
         }
 
         if (item.optionsFound && item.optionsFound.length > 0) {

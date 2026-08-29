@@ -67,11 +67,11 @@ export const ImportDropzone: React.FC = () => {
 
     try {
       if (pdfFiles.length > 0) {
-        // PDF dropped: open Multi-PDF Studio Suite Modal
+        // PDF dropped: open Automatic AI Extraction Modal
         useCbtStore.getState().setUnifiedAiIngestionModalOpen(true);
         addToast({
           title: 'PDF Detected',
-          description: 'Opening Open Multi-PDF Studio. Select your document to assign page roles and extract questions.',
+          description: 'Opening Automatic AI Extraction. Select your document to assign page roles and extract questions.',
           type: 'info',
         });
         return;
@@ -225,8 +225,8 @@ export const ImportDropzone: React.FC = () => {
               }}
               className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-md transition-colors flex items-center gap-2"
             >
-              <Wand2 className="w-4 h-4" />
-              <span>Multi-PDF Suite & CBT Creator</span>
+              <Sparkles className="w-4 h-4" />
+              <span>Automatic AI Extraction</span>
             </button>
 
             <button

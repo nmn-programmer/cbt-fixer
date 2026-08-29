@@ -288,6 +288,17 @@ interface CbtStoreState {
   fixInstructedMarkings: () => void;
   fixModernizeFormat: () => void;
   bulkApplyMarkingScheme: (sectionIds: string[], presetId: string) => void;
+  applyMarkingSchemeWithScope: (
+    scheme: MarksScheme,
+    scope: {
+      type: 'current' | 'all' | 'range' | 'subject' | 'section';
+      currentQuestionId?: string;
+      rangeStart?: number;
+      rangeEnd?: number;
+      subjectId?: string;
+      sectionId?: string;
+    }
+  ) => void;
   bulkRenumberPaper: () => void;
 
   // Undo / Redo
@@ -664,7 +675,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       set({
         isPdfStudioOpen: true,
         pdfStudioTarget: {
-          mode: target?.mode || 'layout',
+          mode: target?.mode || 'precision',
           pageNumber: extractedPageNumber || 1,
           questionId: targetQId || undefined,
           partIndex: target?.partIndex || 1,
@@ -675,8 +686,8 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           initialBox: target?.initialBox,
         },
         // Also keep legacy flags synchronized for any legacy listeners
-        isBoundaryOverlayOpen: target?.mode !== 'precision',
-        isPdfRecropModalOpen: target?.mode === 'precision',
+        isBoundaryOverlayOpen: target?.mode === 'layout',
+        isPdfRecropModalOpen: target?.mode !== 'layout',
       });
     },
     closePdfStudio: () => set({ isPdfStudioOpen: false, pdfStudioTarget: null, isBoundaryOverlayOpen: false, isPdfRecropModalOpen: false }),
@@ -871,7 +882,11 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           targetSubj = { id: generateId(), name: payload.subjectId.replace('new:', ''), sections: [] };
           active.subjects.push(targetSubj);
         } else if (payload.subjectId) {
-          targetSubj = active.subjects.find((s) => s.id === payload.subjectId);
+          targetSubj = active.subjects.find((s) => s.id === payload.subjectId || s.name.toLowerCase() === payload.subjectId.trim().toLowerCase());
+          if (!targetSubj) {
+            targetSubj = { id: generateId(), name: payload.subjectId.trim(), sections: [] };
+            active.subjects.push(targetSubj);
+          }
         }
         
         if (!targetSubj) {
@@ -889,7 +904,11 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           targetSec = { id: generateId(), name: payload.sectionId.replace('new:', ''), questions: [] };
           targetSubj.sections.push(targetSec);
         } else if (payload.sectionId) {
-          targetSec = targetSubj.sections.find((s: any) => s.id === payload.sectionId);
+          targetSec = targetSubj.sections.find((s: any) => s.id === payload.sectionId || s.name.toLowerCase() === payload.sectionId.trim().toLowerCase());
+          if (!targetSec) {
+            targetSec = { id: generateId(), name: payload.sectionId.trim(), questions: [] };
+            targetSubj.sections.push(targetSec);
+          }
         }
         
         if (!targetSec) {
@@ -972,6 +991,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           type: payload.newQuestionProps?.type || 'mcq',
           marks: payload.newQuestionProps?.marks || { cm: 4, im: -1, pm: 0, max: 4 },
           answerOptions: payload.newQuestionProps?.answerOptions || '',
+          correctAnswer: payload.newQuestionProps?.correctAnswer || payload.newQuestionProps?.answerOptions || '',
           pdfData: payload.pdfCoords ? [{ ...payload.pdfCoords, filename: imageName }] : [],
           images: [
             {
@@ -2518,6 +2538,53 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
         { ...active, subjects: updatedSubjects },
         `Bulk Apply Marking Scheme: ${preset.name}`
       );
+    },
+
+    applyMarkingSchemeWithScope: (scheme, scope) => {
+      const state = get();
+      const active = state.archives.find((a) => a.id === state.activeArchiveId);
+      if (!active) return;
+
+      let updatedCount = 0;
+      const updatedSubjects = active.subjects.map((sub) => ({
+        ...sub,
+        sections: sub.sections.map((sec) => ({
+          ...sec,
+          questions: sec.questions.map((q) => {
+            let shouldUpdate = false;
+            if (scope.type === 'current') {
+              shouldUpdate = q.id === scope.currentQuestionId;
+            } else if (scope.type === 'all') {
+              shouldUpdate = true;
+            } else if (scope.type === 'range') {
+              const start = scope.rangeStart || 1;
+              const end = scope.rangeEnd || 999;
+              shouldUpdate = q.que >= start && q.que <= end;
+            } else if (scope.type === 'subject') {
+              shouldUpdate = sub.id === scope.subjectId;
+            } else if (scope.type === 'section') {
+              shouldUpdate = sec.id === scope.sectionId;
+            }
+
+            if (shouldUpdate) {
+              updatedCount++;
+              return { ...q, marks: { ...scheme } };
+            }
+            return q;
+          }),
+        })),
+      }));
+
+      commitArchiveUpdate(
+        { ...active, subjects: updatedSubjects },
+        `Apply Marking Scheme to ${updatedCount} Question(s)`
+      );
+
+      state.addToast({
+        title: 'Marking Scheme Applied',
+        description: `Updated marks (+${scheme.cm}/${scheme.im}) across ${updatedCount} question${updatedCount === 1 ? '' : 's'}`,
+        type: 'success',
+      });
     },
 
     bulkRenumberPaper: () => {

@@ -68,9 +68,165 @@ export const AiQuestionRepairModal: React.FC = () => {
   } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>('');
 
-  // Image Enhancement State
+  // Image Enhancement & Filter Scope State
   const [enhancedPreview, setEnhancedPreview] = useState<string | null>(null);
   const [enhancementFilter, setEnhancementFilter] = useState<'clean' | 'sharpen' | 'high_contrast' | 'invert'>('clean');
+  const [filterScope, setFilterScope] = useState<'current' | 'all' | 'range'>('current');
+  const [rangeInput, setRangeInput] = useState<string>('');
+  const [isProcessingFilter, setIsProcessingFilter] = useState<boolean>(false);
+
+  // Parse comma-separated question range string like "1-10, 15, 18-20"
+  const parseQuestionRange = (str: string, allQuestions: any[]): any[] => {
+    if (!str.trim()) return [];
+    const parts = str.split(',').map((p) => p.trim()).filter(Boolean);
+    const matchedIds = new Set<string>();
+
+    for (const part of parts) {
+      if (part.includes('-')) {
+        const [startStr, endStr] = part.split('-').map((s) => parseInt(s.trim(), 10));
+        if (!isNaN(startStr) && !isNaN(endStr)) {
+          const min = Math.min(startStr, endStr);
+          const max = Math.max(startStr, endStr);
+          allQuestions.forEach((q) => {
+            if (q.que >= min && q.que <= max) {
+              matchedIds.add(q.id);
+            }
+          });
+        }
+      } else {
+        const qNum = parseInt(part, 10);
+        if (!isNaN(qNum)) {
+          allQuestions.forEach((q) => {
+            if (q.que === qNum) {
+              matchedIds.add(q.id);
+            }
+          });
+        }
+      }
+    }
+
+    return allQuestions.filter((q) => matchedIds.has(q.id));
+  };
+
+  // Process filter transformation on image blob
+  const applyFilterToQuestionBlob = async (q: any, filterType: 'clean' | 'sharpen' | 'high_contrast' | 'invert'): Promise<Blob | null> => {
+    if (!q || !q.images || q.images.length === 0) return null;
+    const imgUrl = q.images[0].blobUrl;
+    if (!imgUrl) return null;
+
+    return new Promise((resolve) => {
+      const imgElem = new Image();
+      imgElem.crossOrigin = 'anonymous';
+      imgElem.onload = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = imgElem.naturalWidth;
+        canvas.height = imgElem.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return resolve(null);
+
+        ctx.drawImage(imgElem, 0, 0);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imgData.data;
+
+        for (let i = 0; i < data.length; i += 4) {
+          const r = data[i];
+          const g = data[i + 1];
+          const b = data[i + 2];
+
+          if (filterType === 'clean') {
+            if (r > 205 && g > 205 && b > 205) {
+              data[i] = 255;
+              data[i + 1] = 255;
+              data[i + 2] = 255;
+            }
+          } else if (filterType === 'sharpen') {
+            if (r < 150 && g < 150 && b < 150) {
+              data[i] = Math.max(0, r - 40);
+              data[i + 1] = Math.max(0, g - 40);
+              data[i + 2] = Math.max(0, b - 40);
+            } else if (r > 200) {
+              data[i] = 255;
+              data[i + 1] = 255;
+              data[i + 2] = 255;
+            }
+          } else if (filterType === 'high_contrast') {
+            const avg = (r + g + b) / 3;
+            const val = avg < 160 ? 0 : 255;
+            data[i] = val;
+            data[i + 1] = val;
+            data[i + 2] = val;
+          } else if (filterType === 'invert') {
+            data[i] = 255 - r;
+            data[i + 1] = 255 - g;
+            data[i + 2] = 255 - b;
+          }
+        }
+
+        ctx.putImageData(imgData, 0, 0);
+        canvas.toBlob((blob) => resolve(blob), 'image/png');
+      };
+      imgElem.onerror = () => resolve(null);
+      imgElem.src = imgUrl;
+    });
+  };
+
+  // Batch Filter Execution over selected Scope
+  const handleApplyFilterToScope = async (filterType: 'clean' | 'sharpen' | 'high_contrast' | 'invert') => {
+    if (!activeArchive) return;
+
+    const allQuestions: any[] = [];
+    activeArchive.subjects.forEach((sub) => {
+      sub.sections.forEach((sec) => {
+        sec.questions.forEach((q) => allQuestions.push(q));
+      });
+    });
+
+    let targetsToProcess: any[] = [];
+    if (filterScope === 'current') {
+      if (targetQuestion) targetsToProcess = [targetQuestion];
+    } else if (filterScope === 'all') {
+      targetsToProcess = allQuestions;
+    } else if (filterScope === 'range') {
+      targetsToProcess = parseQuestionRange(rangeInput, allQuestions);
+    }
+
+    if (targetsToProcess.length === 0) {
+      addToast('Filter Scope Error', 'No questions matched the provided range or selection.', 'error');
+      return;
+    }
+
+    setIsProcessingFilter(true);
+    let successCount = 0;
+
+    for (const q of targetsToProcess) {
+      const blob = await applyFilterToQuestionBlob(q, filterType);
+      if (blob) {
+        await applyCroppedImage({
+          questionId: q.id,
+          partIndex: 1,
+          mode: 'replace_part',
+          blob,
+        });
+        successCount++;
+      }
+    }
+
+    setIsProcessingFilter(false);
+    const filterLabel =
+      filterType === 'clean'
+        ? 'Auto-Whiten'
+        : filterType === 'sharpen'
+        ? 'Sharpen'
+        : filterType === 'high_contrast'
+        ? 'Binarize'
+        : 'Invert';
+
+    addToast('Filter Processed!', `Applied ${filterLabel} filter to ${successCount} question(s).`, 'success');
+
+    if (filterScope === 'current' && targetQuestion) {
+      applyImageEnhancement(filterType);
+    }
+  };
 
   // Split question state
   const [splitYPercent, setSplitYPercent] = useState<number>(50);
@@ -488,7 +644,7 @@ export const AiQuestionRepairModal: React.FC = () => {
                 ) : null}
               </div>
 
-              {/* Image Enhancers */}
+              {/* Image Enhancers & Batch Scope Filters */}
               <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
@@ -497,39 +653,125 @@ export const AiQuestionRepairModal: React.FC = () => {
                       Scan Cleaning & Filters
                     </h3>
                   </div>
+                  {isProcessingFilter && (
+                    <div className="flex items-center gap-1.5 text-xs text-indigo-400 animate-pulse">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Applying filter...</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* Filter Target Scope Control */}
+                <div className="bg-slate-900 border border-slate-800 rounded-lg p-2 space-y-2">
+                  <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400">
+                    <span>Target Scope:</span>
+                    <span className="text-indigo-400">
+                      {filterScope === 'current'
+                        ? `Current Q${targetQuestion.que}`
+                        : filterScope === 'all'
+                        ? `All Questions (${
+                            activeArchive
+                              ? activeArchive.subjects.reduce(
+                                  (acc, sub) => acc + sub.sections.reduce((secAcc, sec) => secAcc + sec.questions.length, 0),
+                                  0
+                                )
+                              : 0
+                          })`
+                        : `${
+                            parseQuestionRange(
+                              rangeInput,
+                              activeArchive
+                                ? activeArchive.subjects.flatMap((s) => s.sections.flatMap((sec) => sec.questions))
+                                : []
+                            ).length
+                          } Selected`}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-1 text-[11px] font-medium">
+                    <button
+                      onClick={() => setFilterScope('current')}
+                      className={`py-1 px-2 rounded-md transition-all ${
+                        filterScope === 'current'
+                          ? 'bg-indigo-600 text-white font-bold shadow'
+                          : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                      }`}
+                    >
+                      Current Q{targetQuestion.que}
+                    </button>
+                    <button
+                      onClick={() => setFilterScope('all')}
+                      className={`py-1 px-2 rounded-md transition-all ${
+                        filterScope === 'all'
+                          ? 'bg-indigo-600 text-white font-bold shadow'
+                          : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                      }`}
+                    >
+                      All Questions
+                    </button>
+                    <button
+                      onClick={() => setFilterScope('range')}
+                      className={`py-1 px-2 rounded-md transition-all ${
+                        filterScope === 'range'
+                          ? 'bg-indigo-600 text-white font-bold shadow'
+                          : 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                      }`}
+                    >
+                      Custom Range
+                    </button>
+                  </div>
+
+                  {filterScope === 'range' && (
+                    <div className="space-y-1 pt-1">
+                      <input
+                        type="text"
+                        value={rangeInput}
+                        onChange={(e) => setRangeInput(e.target.value)}
+                        placeholder="e.g. 1-10, 15, 18-20"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-700 focus:border-indigo-500 rounded-md font-mono text-white placeholder-slate-500 outline-none"
+                      />
+                      <p className="text-[10px] text-slate-400">
+                        Enter comma-separated question numbers or ranges like <code className="text-indigo-300 font-mono">1-10, 12, 15-20</code>
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 text-xs">
                   <button
-                    onClick={() => applyImageEnhancement('clean')}
-                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 text-left"
+                    onClick={() => handleApplyFilterToScope('clean')}
+                    disabled={isProcessingFilter}
+                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 active:bg-slate-700 border border-slate-800 text-slate-300 text-left transition-colors disabled:opacity-50"
                   >
                     <span className="font-semibold block text-indigo-300">Auto-Whiten</span>
                     <span className="text-[10px] text-slate-400">Remove scanner grey shadows</span>
                   </button>
 
                   <button
-                    onClick={() => applyImageEnhancement('sharpen')}
-                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 text-left"
+                    onClick={() => handleApplyFilterToScope('sharpen')}
+                    disabled={isProcessingFilter}
+                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 active:bg-slate-700 border border-slate-800 text-slate-300 text-left transition-colors disabled:opacity-50"
                   >
                     <span className="font-semibold block text-emerald-300">Sharpen Text</span>
                     <span className="text-[10px] text-slate-400">Deepen faint math & formulas</span>
                   </button>
 
                   <button
-                    onClick={() => applyImageEnhancement('high_contrast')}
-                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 text-left"
+                    onClick={() => handleApplyFilterToScope('high_contrast')}
+                    disabled={isProcessingFilter}
+                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 active:bg-slate-700 border border-slate-800 text-slate-300 text-left transition-colors disabled:opacity-50"
                   >
                     <span className="font-semibold block text-amber-300">Binarize</span>
                     <span className="text-[10px] text-slate-400">Pure monochrome 1-bit scan</span>
                   </button>
 
                   <button
-                    onClick={() => setEnhancedPreview(null)}
-                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-400 text-left"
+                    onClick={() => handleApplyFilterToScope('invert')}
+                    disabled={isProcessingFilter}
+                    className="p-2 rounded-lg bg-slate-900 hover:bg-slate-800 active:bg-slate-700 border border-slate-800 text-slate-300 text-left transition-colors disabled:opacity-50"
                   >
-                    <span className="font-semibold block">Reset Image</span>
-                    <span className="text-[10px] text-slate-500">Revert back to original</span>
+                    <span className="font-semibold block text-purple-300">Invert Colors</span>
+                    <span className="text-[10px] text-slate-400">Dark mode / inverted scans</span>
                   </button>
                 </div>
               </div>

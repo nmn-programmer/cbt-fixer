@@ -9,7 +9,6 @@ import { Settings,
   Download,
   Eye,
   FileArchive,
-  FilePlus,
   FolderOpen,
   Home,
   Key,
@@ -43,7 +42,6 @@ export const Header: React.FC = () => {
     closeOtherArchives,
     closeTabsToRight,
     closeAllArchives,
-    createNewPaper,
     addArchive,
     diagnostics,
     setDiagnosticsOpen,
@@ -279,60 +277,70 @@ export const Header: React.FC = () => {
             className="hidden"
           />
 
-          {/* Import Archive Button */}
-          <button
-            id="import-zip-btn"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 active:bg-slate-600 rounded-md border border-slate-700 transition-colors shrink-0 shadow-sm"
-            title="Import one or more CBT ZIP archives"
-          >
-            <Download className="w-3.5 h-3.5 text-indigo-400" />
-            <span className="hidden sm:inline">Import ZIP</span>
-          </button>
+          {/* Non-paper view (Home / No active archive): Show creation and ingestion tools */}
+          {!activeArchive && (
+            <>
+              {/* Import Archive Button */}
+              <button
+                id="import-zip-btn"
+                onClick={() => fileInputRef.current?.click()}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 active:bg-slate-600 rounded-md border border-slate-700 transition-colors shrink-0 shadow-sm"
+                title="Import one or more CBT ZIP archives"
+              >
+                <Download className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">Import ZIP</span>
+              </button>
 
-          {/* Unified PDF Precision Studio & Layout Workbench */}
-          <button
-            id="unified-pdf-studio-btn"
-            onClick={() => openPdfStudio({ mode: 'layout' })}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-gradient-to-r from-purple-950/80 to-indigo-950/80 hover:from-purple-900/80 hover:to-indigo-900/80 active:opacity-90 text-indigo-200 rounded-md border border-indigo-500/40 transition-all shrink-0 shadow-sm"
-            title="Open Unified PDF Precision Studio & Layout Workbench"
-          >
-            <Layers className="w-3.5 h-3.5 text-indigo-400" />
-            <span className="hidden md:inline font-semibold">PDF Studio</span>
-          </button>
+              {/* Quick Precision Cropper Mode Direct Shortcut */}
+              <button
+                id="manual-cropper-btn"
+                onClick={() => openPdfStudio({ mode: 'precision' })}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-emerald-950/60 hover:bg-emerald-900/60 active:bg-emerald-850 text-emerald-300 rounded-md border border-emerald-700/60 transition-colors shrink-0 shadow-sm"
+                title="Open Precision PDF Cropper & Layout Studio"
+              >
+                <Crop className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="hidden md:inline font-semibold">Cropper</span>
+              </button>
 
-          {/* Quick Precision Cropper Mode Direct Shortcut */}
-          <button
-            id="manual-cropper-btn"
-            onClick={() => openPdfStudio({ mode: 'precision' })}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-emerald-950/60 hover:bg-emerald-900/60 active:bg-emerald-850 text-emerald-300 rounded-md border border-emerald-700/60 transition-colors shrink-0 shadow-sm"
-            title="Open Precision PDF Cropper Mode"
-          >
-            <Crop className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="hidden md:inline font-semibold">Cropper</span>
-          </button>
+              {/* AI Automatic Extraction / Question Converter */}
+              <button
+                id="automatic-ai-extraction-btn"
+                onClick={() => setUnifiedAiIngestionModalOpen(true)}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-gradient-to-r from-indigo-950/80 to-purple-950/80 hover:from-indigo-900/90 hover:to-purple-900/90 active:scale-95 text-indigo-200 hover:text-white rounded-md border border-indigo-500/40 transition-all shrink-0 shadow-sm"
+                title="Open Automatic AI Extraction & CBT Test Creator"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden md:inline font-bold">Automatic AI Extraction</span>
+              </button>
+            </>
+          )}
 
-          {/* AI Auto PDF Converter / Multi-PDF Suite */}
-          <button
-            id="ai-pdf-converter-btn"
-            onClick={() => setUnifiedAiIngestionModalOpen(true)}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-indigo-950/60 hover:bg-indigo-900/60 active:bg-indigo-850 text-indigo-300 rounded-md border border-indigo-700/60 transition-colors shrink-0 shadow-sm"
-            title="Open Multi-PDF Suite & CBT Test Creator"
-          >
-            <Wand2 className="w-3.5 h-3.5 text-indigo-400" />
-            <span className="hidden md:inline">Multi-PDF Suite</span>
-          </button>
+          {/* Paper view (Active question paper opened): Show paper-specific tools */}
+          {activeArchive && (
+            <>
+              {/* Inspect in Layout right at the front of paper tools */}
+              <button
+                id="inspect-layout-btn"
+                onClick={() => openBoundaryOverlay()}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-purple-950/60 hover:bg-purple-900/60 text-purple-300 rounded-md border border-purple-700/60 transition-colors shrink-0 shadow-sm"
+                title="Inspect entire question paper in full-page layout overlay"
+              >
+                <Layers className="w-3.5 h-3.5 text-purple-400" />
+                <span className="hidden sm:inline font-semibold">Inspect in Layout</span>
+              </button>
 
-          {/* Create New Paper Button */}
-          <button
-            id="new-paper-btn"
-            onClick={() => createNewPaper()}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 active:bg-slate-600 rounded-md border border-slate-700 transition-colors shrink-0 shadow-sm text-slate-200"
-            title="Create a new blank CBT Question Paper"
-          >
-            <FilePlus className="w-3.5 h-3.5 text-blue-400" />
-            <span className="hidden md:inline">New Paper</span>
-          </button>
+              {/* Re-Crop from PDF */}
+              <button
+                id="header-recrop-pdf-btn"
+                onClick={() => openPdfRecrop()}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-300 rounded-md border border-indigo-700/60 transition-colors shrink-0 shadow-sm"
+                title="Re-Crop questions or parts directly from PDF"
+              >
+                <Crop className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline font-semibold">Re-Crop PDF</span>
+              </button>
+            </>
+          )}
 
           {/* Undo / Redo buttons */}
           <div className="flex items-center bg-slate-800 rounded-md border border-slate-700 p-0.5 shrink-0">
@@ -364,18 +372,7 @@ export const Header: React.FC = () => {
             </button>
           </div>
 
-          {/* Unified Multi-PDF AI Ingestion & Page-Role Assignment Trigger */}
-          {activeArchive && (
-            <button
-              id="unified-ai-ingestion-btn"
-              onClick={() => setUnifiedAiIngestionModalOpen(true)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-gradient-to-r from-indigo-900/60 to-purple-900/60 hover:from-indigo-900 hover:to-purple-900 active:scale-95 rounded-md border border-indigo-500/40 transition-all shrink-0 shadow-sm text-indigo-200 hover:text-white"
-              title="Multi-PDF Document Ingestion & Arbitrary Page-Role Assignment Suite"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-              <span className="hidden md:inline font-bold">AI Multi-PDF Suite</span>
-            </button>
-          )}
+
 
           {/* Blueprint & Subject Range Studio Trigger */}
           {activeArchive && (

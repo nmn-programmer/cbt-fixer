@@ -23,6 +23,9 @@ import { PrecisionLoupe } from './manualCropper/PrecisionLoupe';
 import { LiveCroppedPreviewModal } from './manualCropper/LiveCroppedPreviewModal';
 import { ManualCropperHelpAccordions } from './manualCropper/ManualCropperHelpAccordions';
 import { BottomQuestionTimeline } from './manualCropper/BottomQuestionTimeline';
+import { MarkingSchemeModal, MarkingScopeConfig } from './manualCropper/MarkingSchemeModal';
+import { LineCropperOverlay } from './manualCropper/LineCropperOverlay';
+import { AnswerKeyInputBar } from './manualCropper/AnswerKeyInputBar';
 import {
   X,
   ChevronLeft,
@@ -66,7 +69,33 @@ import {
   Wand2,
   Loader2,
   ArrowRight,
+  Award,
+  CornerDownLeft,
+  BookOpen,
 } from 'lucide-react';
+
+const PRESET_SUBJECTS = [
+  'Physics',
+  'Chemistry',
+  'Mathematics',
+  'Biology',
+  'Logical Reasoning',
+  'General Knowledge',
+  'English / Verbal Ability',
+  'Computer Science',
+  'Aptitude',
+];
+
+const PRESET_SECTIONS = [
+  'Section A',
+  'Section B',
+  'Section 1',
+  'Section 2',
+  'Mandatory',
+  'Optional / Numerical',
+  'Part 1',
+  'Part 2',
+];
 
 interface QuestionBoxItem {
   questionId: string;
@@ -96,14 +125,30 @@ export const UnifiedPdfStudioModal: React.FC = () => {
     activeArchiveId,
     applyCroppedImage,
     updateQuestion,
+    applyMarkingSchemeWithScope,
     addToast,
     attachSourcePdfToArchive,
   } = useCbtStore();
 
   const activeArchive = archives.find((a) => a.id === activeArchiveId);
 
-  // Studio Mode: 'layout' (Multi-box overlay & audit) vs 'precision' (Single/Multi-part surgical cropper)
-  const [studioMode, setStudioMode] = useState<'layout' | 'precision'>('layout');
+  // Studio Mode: default to 'precision' (Manual Precision Cropper)
+  const [studioMode, setStudioMode] = useState<'layout' | 'precision'>('precision');
+
+  // Precision Cropper Sub-Mode: 'crop' (Cropping Mode - default) vs 'edit' (Edit Mode)
+  const [precisionSubMode, setPrecisionSubMode] = useState<'crop' | 'edit'>('crop');
+
+  // Cropping Tool: 'box' vs 'line' (Horizontal/Vertical line based cropper)
+  const [cropToolType, setCropToolType] = useState<'box' | 'line'>('box');
+  const [lineColumnMode, setLineColumnMode] = useState<'double' | 'single'>('double');
+
+  // Marking Scheme Modal Open State
+  const [isMarkingModalOpen, setIsMarkingModalOpen] = useState<boolean>(false);
+
+  // Mandatory Subject validation & custom field toggles
+  const [subjectError, setSubjectError] = useState<boolean>(false);
+  const [isCustomSubject, setIsCustomSubject] = useState<boolean>(false);
+  const [isCustomSection, setIsCustomSection] = useState<boolean>(false);
 
   // PDF Document & Page State
   const [pdfDoc, setPdfDoc] = useState<any>(null);
@@ -114,7 +159,7 @@ export const UnifiedPdfStudioModal: React.FC = () => {
   const [renderingPage, setRenderingPage] = useState<boolean>(false);
 
   // Zoom & Canvas Viewport
-  const [scale, setScale] = useState<number>(1.25);
+  const [scale, setScale] = useState<number>(0.75);
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
 
   // Visual Guides & Guardrails Toggles
@@ -137,6 +182,9 @@ export const UnifiedPdfStudioModal: React.FC = () => {
   const [activeBox, setActiveBox] = useState<BoxCoord>({ ymin: 0.1, xmin: 0.035, ymax: 0.35, xmax: 0.49 });
   const [isDrawingNewBox, setIsDrawingNewBox] = useState<boolean>(false);
   const [drawStartPos, setDrawStartPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // Undo Stack for Line Cropper
+  const [lineCutHistory, setLineCutHistory] = useState<Array<{ box: BoxCoord; questionNumber: number }>>([]);
 
   // Box Dragging & Resizing State
   const [isDragging, setIsDragging] = useState<boolean>(false);
@@ -197,6 +245,8 @@ export const UnifiedPdfStudioModal: React.FC = () => {
     if (isPdfStudioOpen && activeArchive) {
       if (pdfStudioTarget?.mode) {
         setStudioMode(pdfStudioTarget.mode);
+      } else {
+        setStudioMode('precision');
       }
       if (pdfStudioTarget?.pageNumber) {
         setCurrentPage(pdfStudioTarget.pageNumber);
@@ -204,9 +254,37 @@ export const UnifiedPdfStudioModal: React.FC = () => {
       if (pdfStudioTarget?.questionId) {
         setSelectedQuestionId(pdfStudioTarget.questionId);
         setSelectedPartIndex(pdfStudioTarget.partIndex || 1);
+        setPrecisionSubMode('edit');
       }
       if (pdfStudioTarget?.cropMode) {
         setTargetOperation(pdfStudioTarget.cropMode === 'stitch' ? 'add_part' : pdfStudioTarget.cropMode);
+      }
+
+      // Compute next available question number
+      let maxQ = 0;
+      activeArchive.subjects.forEach((s) => {
+        s.sections.forEach((sec) => {
+          sec.questions.forEach((q) => {
+            if (q.que > maxQ) maxQ = q.que;
+          });
+        });
+      });
+      const nextQ = maxQ > 0 ? maxQ + 1 : 1;
+
+      if (pdfStudioTarget?.defaultQNo) {
+        setQuestionNumber(pdfStudioTarget.defaultQNo);
+      } else if (questionNumber === '') {
+        setQuestionNumber(nextQ);
+      }
+
+      // Default subject and section if empty
+      if (!subjectName) {
+        const firstSub = activeArchive.subjects[0]?.name || 'Physics';
+        setSubjectName(firstSub);
+      }
+      if (!sectionName) {
+        const firstSec = activeArchive.subjects[0]?.sections[0]?.name || 'Section 1';
+        setSectionName(firstSec);
       }
 
       if (!pdfDoc) {
@@ -323,6 +401,29 @@ export const UnifiedPdfStudioModal: React.FC = () => {
 
     return list.sort((a, b) => a.que - b.que);
   }, [activeArchive]);
+
+  // Available subjects (Preset + Archive existing)
+  const availableSubjects = useMemo(() => {
+    const list = new Set<string>();
+    if (activeArchive) {
+      activeArchive.subjects.forEach((s) => list.add(s.name));
+    }
+    PRESET_SUBJECTS.forEach((s) => list.add(s));
+    return Array.from(list);
+  }, [activeArchive]);
+
+  // Available sections for chosen subject (Preset + Archive existing)
+  const availableSections = useMemo(() => {
+    const list = new Set<string>();
+    if (activeArchive) {
+      const matchingSub = activeArchive.subjects.find((s) => s.name === subjectName);
+      if (matchingSub) {
+        matchingSub.sections.forEach((sec) => list.add(sec.name));
+      }
+    }
+    PRESET_SECTIONS.forEach((s) => list.add(s));
+    return Array.from(list);
+  }, [activeArchive, subjectName]);
 
   // 2b. Extract and Classify all question boxes on the CURRENT page
   const pageBoxes: QuestionBoxItem[] = useMemo(() => {
@@ -658,8 +759,36 @@ export const UnifiedPdfStudioModal: React.FC = () => {
     }
   };
 
-  // 5. Apply / Commit Crop to Active Question
-  const handleApplyCrop = async () => {
+  // Undo Last Line Cut for Line Cropper Mode
+  const handleUndoLineCut = () => {
+    if (lineCutHistory.length === 0) {
+      addToast({ title: 'Undo', description: 'No line cuts in history', type: 'info' });
+      return;
+    }
+    const last = lineCutHistory[lineCutHistory.length - 1];
+    setLineCutHistory((prev) => prev.slice(0, -1));
+    setActiveBox(last.box);
+    setQuestionNumber(last.questionNumber);
+    addToast({
+      title: 'Line Cut Undone',
+      description: `Restored Q.${last.questionNumber} line position`,
+      type: 'info',
+    });
+  };
+
+  // 5. Apply / Commit Crop to Active Question with Auto-Continuation
+  const handleApplyCropAndAdvance = async (advanceQuestion: boolean = true) => {
+    if (!subjectName || !subjectName.trim()) {
+      setSubjectError(true);
+      addToast({
+        title: 'Subject Required',
+        description: 'Subject selection is mandatory before saving a question.',
+        type: 'warning',
+      });
+      return;
+    }
+    setSubjectError(false);
+
     if (!canvasRef.current) return;
     setIsSavingCrop(true);
 
@@ -689,42 +818,85 @@ export const UnifiedPdfStudioModal: React.FC = () => {
         ],
       };
 
-      if (selectedQuestionId && targetOperation === 'replace_part') {
-        // Replace existing part in active question
+      const currentQNum = Number(questionNumber) || 1;
+      const targetSecName = sectionName.trim() || 'Section 1';
+
+      if (precisionSubMode === 'edit' && selectedQuestionId) {
+        // Edit mode: update existing question image slice and metadata
         await applyCroppedImage({
           questionId: selectedQuestionId,
           partIndex: selectedPartIndex,
           mode: 'replace_part',
           blob,
           pdfCoords: coordPart,
+          newQuestionProps: {
+            que: currentQNum,
+            type: questionType,
+            answerOptions,
+            correctAnswer: answerOptions,
+            marks: marksScheme,
+          },
+        });
+
+        // Also update store question metadata
+        updateQuestion(selectedQuestionId, {
+          que: currentQNum,
+          type: questionType,
+          answerOptions,
+          correctAnswer: answerOptions,
+          marks: marksScheme,
         });
 
         addToast({
-          title: 'Crop Updated',
-          description: `Successfully re-cropped Question slice on Page ${currentPage}`,
+          title: 'Question Updated',
+          description: `Updated Q.${currentQNum} on Page ${currentPage}`,
           type: 'success',
         });
-      } else if (targetOperation === 'new_question') {
-        // Create new question in active archive
+      } else {
+        // Cropping Mode: create new question
         await applyCroppedImage({
           mode: 'new_question',
           blob,
           pdfCoords: coordPart,
           newQuestionProps: {
-            que: Number(questionNumber) || undefined,
+            que: currentQNum,
             type: questionType,
             answerOptions,
+            correctAnswer: answerOptions,
             marks: marksScheme,
           },
-          subjectId: subjectName,
-          sectionId: sectionName,
+          subjectId: subjectName.trim(),
+          sectionId: targetSecName,
         });
 
-        addToast({
-          title: 'New Question Created',
-          description: `Added Q.${questionNumber || ''} to ${subjectName} > ${sectionName}`,
-          type: 'success',
-        });
+        if (advanceQuestion) {
+          const nextQ = currentQNum + 1;
+          setQuestionNumber(nextQ);
+          setAnswerOptions(''); // ready for next answer key!
+          setTargetOperation('new_question');
+
+          // Advance activeBox down slightly on page
+          const boxHeight = activeBox.ymax - activeBox.ymin;
+          const nextYmin = Math.min(0.85, activeBox.ymax + 0.015);
+          const nextYmax = Math.min(0.99, nextYmin + boxHeight);
+          setActiveBox((b) => ({
+            ...b,
+            ymin: nextYmin,
+            ymax: nextYmax,
+          }));
+
+          addToast({
+            title: `Q.${currentQNum} Saved`,
+            description: `Saved to ${subjectName.trim()} > ${targetSecName}! Auto-advanced to Q.${nextQ}`,
+            type: 'success',
+          });
+        } else {
+          addToast({
+            title: `Q.${currentQNum} Saved`,
+            description: `Saved to ${subjectName.trim()} > ${targetSecName}`,
+            type: 'success',
+          });
+        }
       }
 
       // Generate Live Preview URL
@@ -741,6 +913,8 @@ export const UnifiedPdfStudioModal: React.FC = () => {
       setIsSavingCrop(false);
     }
   };
+
+  const handleApplyCrop = () => handleApplyCropAndAdvance(false);
 
   // 1-Click Gap to Question Creator
   const handleCreateQuestionFromGap = (gap: { ymin: number; xmin: number; ymax: number; xmax: number }) => {
@@ -761,6 +935,22 @@ export const UnifiedPdfStudioModal: React.FC = () => {
     if (!isPdfStudioOpen) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Enter shortcut to save and auto-advance to next question number!
+      if (e.key === 'Enter') {
+        if (document.activeElement?.tagName === 'TEXTAREA') {
+          return;
+        }
+        e.preventDefault();
+        handleApplyCropAndAdvance(true);
+        return;
+      }
+
+      if (e.ctrlKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        handleApplyCropAndAdvance(false);
+        return;
+      }
+
       if (
         document.activeElement?.tagName === 'INPUT' ||
         document.activeElement?.tagName === 'SELECT' ||
@@ -771,12 +961,6 @@ export const UnifiedPdfStudioModal: React.FC = () => {
 
       if (e.key === 'Escape') {
         closePdfStudio();
-        return;
-      }
-
-      if (e.key === 'Enter' || (e.ctrlKey && e.key.toLowerCase() === 's')) {
-        e.preventDefault();
-        handleApplyCrop();
         return;
       }
 
@@ -1008,6 +1192,19 @@ export const UnifiedPdfStudioModal: React.FC = () => {
             <span className="hidden sm:inline">Loupe</span>
           </button>
 
+          {/* Marking Scheme Studio Trigger */}
+          <button
+            onClick={() => setIsMarkingModalOpen(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-lg bg-emerald-950/80 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-900 transition-all shadow-sm"
+            title="Configure Marking Scheme (+cm, -im) for question, range, subject, or entire paper"
+          >
+            <Award className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden sm:inline">Marking Scheme</span>
+            <span className="text-[10px] px-1 rounded bg-emerald-500/20 text-emerald-200 font-mono">
+              +{marksScheme.cm}/{marksScheme.im}
+            </span>
+          </button>
+
           {/* Zoom Controls */}
           <div className="flex items-center bg-slate-950 rounded-lg border border-slate-800 p-0.5 text-xs">
             <button
@@ -1148,15 +1345,24 @@ export const UnifiedPdfStudioModal: React.FC = () => {
                   </div>
                 ))}
 
-              {/* ALL QUESTION BOUNDING BOXES (IN LAYOUT AUDIT MODE) */}
+              {/* ALL QUESTION BOUNDING BOXES (ON CURRENT PAGE - PAST CROPPED REGIONS & EDIT TARGETS) */}
               {pageBoxes.map((item) => {
                 const isSelected = selectedQuestionId === item.questionId && selectedPartIndex === item.partIndex;
-                const isHovered = hoveredQId === item.questionId;
+                const isEditMode = precisionSubMode === 'edit';
 
-                let borderStyle = 'border-emerald-500 bg-emerald-500/15 text-emerald-300';
-                if (item.status === 'split') borderStyle = 'border-yellow-500 bg-yellow-500/15 text-yellow-300';
-                if (item.status === 'overlap') borderStyle = 'border-red-500 bg-red-500/25 text-red-300 animate-pulse';
-                if (isSelected) borderStyle = 'border-purple-400 bg-purple-500/20 text-purple-200 ring-2 ring-purple-400/50';
+                let borderStyle = isEditMode
+                  ? 'border-purple-500/80 bg-purple-500/15 text-purple-200 cursor-pointer hover:bg-purple-500/30 hover:border-purple-300'
+                  : 'border-emerald-500/70 bg-emerald-500/10 text-emerald-300 pointer-events-auto hover:bg-emerald-500/20';
+
+                if (item.status === 'split') {
+                  borderStyle = 'border-yellow-500/80 bg-yellow-500/15 text-yellow-300';
+                }
+                if (item.status === 'overlap') {
+                  borderStyle = 'border-red-500 bg-red-500/25 text-red-300 animate-pulse';
+                }
+                if (isSelected && isEditMode) {
+                  borderStyle = 'border-purple-400 bg-purple-500/25 text-white ring-2 ring-purple-400 shadow-xl shadow-purple-500/20';
+                }
 
                 return (
                   <div
@@ -1168,108 +1374,174 @@ export const UnifiedPdfStudioModal: React.FC = () => {
                       setSelectedQuestionId(item.questionId);
                       setSelectedPartIndex(item.partIndex);
                       setActiveBox({ ...item.box });
+                      setSubjectName(item.subjectName);
+                      setSectionName(item.sectionName);
+                      setQuestionNumber(item.que);
+                      setQuestionType(item.type as any);
+                      setAnswerOptions(item.answerOptions || '');
+                      setMarksScheme(item.marks || MARKING_PRESETS[0].marks);
+                      if (!isEditMode) {
+                        setPrecisionSubMode('edit');
+                        setTargetOperation('replace_part');
+                        addToast({
+                          title: `Selected Q.${item.que}`,
+                          description: 'Switched to Edit Mode for this question.',
+                          type: 'info',
+                        });
+                      }
                     }}
-                    className={`absolute border-2 rounded transition-all cursor-pointer z-20 ${borderStyle}`}
+                    className={`absolute border-2 rounded-lg transition-all z-20 ${borderStyle}`}
                     style={{
                       left: `${item.box.xmin * 100}%`,
                       top: `${item.box.ymin * 100}%`,
                       width: `${(item.box.xmax - item.box.xmin) * 100}%`,
                       height: `${(item.box.ymax - item.box.ymin) * 100}%`,
                     }}
+                    title={`Q.${item.que} (${item.subjectName} > ${item.sectionName}) - Click to inspect/edit`}
                   >
                     {/* Floating Question Tag Badge */}
                     <div
-                      className={`absolute -top-5 left-0 px-1.5 py-0.5 rounded text-[10px] font-bold shadow flex items-center gap-1 whitespace-nowrap ${
-                        isSelected ? 'bg-purple-600 text-white' : 'bg-slate-900/90 border border-slate-700'
+                      className={`absolute -top-5 left-0 px-2 py-0.5 rounded text-[10px] font-bold shadow flex items-center gap-1.5 whitespace-nowrap ${
+                        isSelected && isEditMode
+                          ? 'bg-purple-600 text-white ring-1 ring-purple-300'
+                          : isEditMode
+                          ? 'bg-purple-950/90 text-purple-200 border border-purple-700/60'
+                          : 'bg-emerald-950/90 text-emerald-300 border border-emerald-700/60'
                       }`}
                     >
-                      <span>Q.{item.que}</span>
+                      <span className="font-mono">Q.{item.que}</span>
+                      <span className="text-[9px] opacity-75 font-normal">({item.subjectName})</span>
+                      <span className="text-[9px] px-1 rounded bg-black/40 font-mono uppercase">{item.type}</span>
+                      {item.answerOptions && (
+                        <span className="text-[9px] px-1 rounded bg-emerald-600/60 text-emerald-100 font-mono">
+                          Ans: {item.answerOptions}
+                        </span>
+                      )}
                       {item.isSplit && <span className="text-[9px] opacity-80">(Part {item.partIndex})</span>}
                       {item.status === 'overlap' && (
                         <span className="text-[9px] text-red-400 font-normal">⚠️ Overlap</span>
                       )}
+                      {isEditMode && <span className="text-[9px] opacity-75">✏️ edit</span>}
                     </div>
+
+                    {/* Bottom Right Past Question Badge */}
+                    {!isEditMode && (
+                      <div className="absolute bottom-1 right-1 px-1.5 py-0.5 bg-emerald-950/90 border border-emerald-600/50 rounded text-[9px] font-semibold text-emerald-300 pointer-events-none opacity-90 flex items-center gap-1">
+                        <Check className="w-2.5 h-2.5" />
+                        <span>Cropped</span>
+                      </div>
+                    )}
                   </div>
                 );
               })}
 
-              {/* ACTIVE SELECTION RESIZABLE CROP BOX */}
-              <div
-                className="absolute border-2 border-indigo-400 bg-indigo-500/20 rounded shadow-xl pointer-events-auto z-30 ring-2 ring-indigo-400/40"
-                style={{
-                  left: `${activeBox.xmin * 100}%`,
-                  top: `${activeBox.ymin * 100}%`,
-                  width: `${(activeBox.xmax - activeBox.xmin) * 100}%`,
-                  height: `${(activeBox.ymax - activeBox.ymin) * 100}%`,
-                }}
-              >
-                {/* 8-Point Interactive Resizing Handles */}
-                {['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map((handle) => {
-                  let handleClasses = 'absolute w-3 h-3 bg-white border-2 border-indigo-600 rounded-xs shadow-md z-40';
-                  let posStyle: React.CSSProperties = {};
+              {/* LINE-BASED CROPPER OVERLAY */}
+              {cropToolType === 'line' && (
+                <LineCropperOverlay
+                  activeBox={activeBox}
+                  onChangeBox={(newBox) => setActiveBox(newBox)}
+                  containerWidth={canvasDimensions.width || canvasRef.current?.width || 800}
+                  containerHeight={canvasDimensions.height || canvasRef.current?.height || 1100}
+                  questionNumber={Number(questionNumber) || 1}
+                  onApplyCrop={() => handleApplyCropAndAdvance(true)}
+                  onUndoLineCut={handleUndoLineCut}
+                  columnMode={lineColumnMode}
+                  onColumnModeChange={(mode) => setLineColumnMode(mode)}
+                  onSetColumnPreset={(preset) => {
+                    if (preset === 'left') {
+                      setActiveBox((b) => ({ ...b, xmin: 0.035, xmax: 0.49 }));
+                      addToast({ title: 'Column Preset', description: 'Left Column (0.035 - 0.49)', type: 'info' });
+                    } else if (preset === 'right') {
+                      setActiveBox((b) => ({ ...b, xmin: 0.508, xmax: 0.965 }));
+                      addToast({ title: 'Column Preset', description: 'Right Column (0.508 - 0.965)', type: 'info' });
+                    } else {
+                      setActiveBox((b) => ({ ...b, xmin: 0.035, xmax: 0.965 }));
+                      addToast({ title: 'Column Preset', description: 'Full Width (0.035 - 0.965)', type: 'info' });
+                    }
+                  }}
+                />
+              )}
 
-                  if (handle === 'nw') posStyle = { top: -6, left: -6, cursor: 'nwse-resize' };
-                  if (handle === 'n') posStyle = { top: -6, left: '50%', transform: 'translateX(-50%)', cursor: 'ns-resize' };
-                  if (handle === 'ne') posStyle = { top: -6, right: -6, cursor: 'nesw-resize' };
-                  if (handle === 'e') posStyle = { top: '50%', right: -6, transform: 'translateY(-50%)', cursor: 'ew-resize' };
-                  if (handle === 'se') posStyle = { bottom: -6, right: -6, cursor: 'nwse-resize' };
-                  if (handle === 's') posStyle = { bottom: -6, left: '50%', transform: 'translateX(-50%)', cursor: 'ns-resize' };
-                  if (handle === 'sw') posStyle = { bottom: -6, left: -6, cursor: 'nesw-resize' };
-                  if (handle === 'w') posStyle = { top: '50%', left: -6, transform: 'translateY(-50%)', cursor: 'ew-resize' };
-
-                  return (
-                    <div
-                      key={handle}
-                      onMouseDown={(e) => handleHandleMouseDown(e, handle)}
-                      className={handleClasses}
-                      style={posStyle}
-                    />
-                  );
-                })}
-
-                {/* Move Center Anchor */}
+              {/* ACTIVE SELECTION RESIZABLE CROP BOX (BOX CROPPER MODE) */}
+              {cropToolType === 'box' && (
                 <div
-                  onMouseDown={(e) => handleHandleMouseDown(e, 'move')}
-                  className="absolute inset-0 cursor-move flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity"
+                  className="absolute border-2 border-indigo-400 bg-indigo-500/20 rounded shadow-xl pointer-events-auto z-30 ring-2 ring-indigo-400/40"
+                  style={{
+                    left: `${activeBox.xmin * 100}%`,
+                    top: `${activeBox.ymin * 100}%`,
+                    width: `${(activeBox.xmax - activeBox.xmin) * 100}%`,
+                    height: `${(activeBox.ymax - activeBox.ymin) * 100}%`,
+                  }}
                 >
-                  <div className="px-2 py-1 bg-indigo-950/90 text-indigo-200 text-[10px] font-bold rounded border border-indigo-500/40 flex items-center gap-1 shadow-lg">
-                    <Move className="w-3 h-3" />
-                    <span>Drag to Reposition</span>
+                  {/* 8-Point Interactive Resizing Handles */}
+                  {['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map((handle) => {
+                    let handleClasses = 'absolute w-3 h-3 bg-white border-2 border-indigo-600 rounded-xs shadow-md z-40';
+                    let posStyle: React.CSSProperties = {};
+
+                    if (handle === 'nw') posStyle = { top: -6, left: -6, cursor: 'nwse-resize' };
+                    if (handle === 'n') posStyle = { top: -6, left: '50%', transform: 'translateX(-50%)', cursor: 'ns-resize' };
+                    if (handle === 'ne') posStyle = { top: -6, right: -6, cursor: 'nesw-resize' };
+                    if (handle === 'e') posStyle = { top: '50%', right: -6, transform: 'translateY(-50%)', cursor: 'ew-resize' };
+                    if (handle === 'se') posStyle = { bottom: -6, right: -6, cursor: 'nwse-resize' };
+                    if (handle === 's') posStyle = { bottom: -6, left: '50%', transform: 'translateX(-50%)', cursor: 'ns-resize' };
+                    if (handle === 'sw') posStyle = { bottom: -6, left: -6, cursor: 'nesw-resize' };
+                    if (handle === 'w') posStyle = { top: '50%', left: -6, transform: 'translateY(-50%)', cursor: 'ew-resize' };
+
+                    return (
+                      <div
+                        key={handle}
+                        onMouseDown={(e) => handleHandleMouseDown(e, handle)}
+                        className={handleClasses}
+                        style={posStyle}
+                      />
+                    );
+                  })}
+
+                  {/* Move Center Anchor */}
+                  <div
+                    onMouseDown={(e) => handleHandleMouseDown(e, 'move')}
+                    className="absolute inset-0 cursor-move flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity"
+                  >
+                    <div className="px-2 py-1 bg-indigo-950/90 text-indigo-200 text-[10px] font-bold rounded border border-indigo-500/40 flex items-center gap-1 shadow-lg">
+                      <Move className="w-3 h-3" />
+                      <span>Drag to Reposition</span>
+                    </div>
+                  </div>
+
+                  {/* In-Canvas Floating HUD Bar */}
+                  <div className="absolute -top-9 right-0 flex items-center gap-1 bg-slate-900/95 border border-slate-700 rounded-lg p-1 shadow-2xl z-50">
+                    <button
+                      onClick={() => {
+                        if (canvasRef.current) {
+                          const snapped = snapBoxToHorizontalWhitespaceValleys(canvasRef.current, activeBox);
+                          setActiveBox(snapped);
+                          addToast({ title: 'Snapped', description: 'Boundaries snapped to whitespace valleys', type: 'info' });
+                        }
+                      }}
+                      className="p-1 hover:bg-slate-800 text-emerald-400 rounded"
+                      title="Smart Whitespace Snap"
+                    >
+                      <Magnet className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={() => setStudioMode('precision')}
+                      className="p-1 hover:bg-slate-800 text-indigo-400 rounded"
+                      title="Open in Precision Mode"
+                    >
+                      <Crosshair className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={() => handleApplyCropAndAdvance(true)}
+                      disabled={isSavingCrop}
+                      className="flex items-center gap-1 px-2.5 py-0.5 bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold rounded shadow"
+                      title="Save & Advance to next question (Enter)"
+                    >
+                      {isSavingCrop ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+                      <span>Save & Next</span>
+                    </button>
                   </div>
                 </div>
-
-                {/* In-Canvas Floating HUD Bar */}
-                <div className="absolute -top-9 right-0 flex items-center gap-1 bg-slate-900/95 border border-slate-700 rounded-lg p-1 shadow-2xl z-50">
-                  <button
-                    onClick={() => {
-                      if (canvasRef.current) {
-                        const snapped = snapBoxToHorizontalWhitespaceValleys(canvasRef.current, activeBox);
-                        setActiveBox(snapped);
-                        addToast({ title: 'Snapped', description: 'Boundaries snapped to whitespace valleys', type: 'info' });
-                      }
-                    }}
-                    className="p-1 hover:bg-slate-800 text-emerald-400 rounded"
-                    title="Smart Whitespace Snap"
-                  >
-                    <Magnet className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={() => setStudioMode('precision')}
-                    className="p-1 hover:bg-slate-800 text-indigo-400 rounded"
-                    title="Open in Precision Mode"
-                  >
-                    <Crosshair className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={handleApplyCrop}
-                    disabled={isSavingCrop}
-                    className="flex items-center gap-1 px-2 py-0.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold rounded shadow"
-                  >
-                    {isSavingCrop ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-                    <span>Apply</span>
-                  </button>
-                </div>
-              </div>
+              )}
             </div>
           )}
 
@@ -1390,29 +1662,70 @@ export const UnifiedPdfStudioModal: React.FC = () => {
                 </span>
               </div>
 
-              {/* Target Operation Selector */}
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Operation</label>
-                <div className="grid grid-cols-2 gap-1.5">
+              {/* Sub-Mode Switcher: Cropping vs Edit */}
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Cropper Mode</label>
+                <div className="grid grid-cols-2 gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800">
                   <button
-                    onClick={() => setTargetOperation('replace_part')}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
-                      targetOperation === 'replace_part'
-                        ? 'bg-indigo-600 text-white border-indigo-500'
-                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                    type="button"
+                    onClick={() => {
+                      setPrecisionSubMode('crop');
+                      setTargetOperation('new_question');
+                    }}
+                    className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-bold rounded-lg transition-all ${
+                      precisionSubMode === 'crop'
+                        ? 'bg-indigo-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    Replace Part
+                    <Crop className="w-3.5 h-3.5" />
+                    <span>Cropping Mode</span>
                   </button>
                   <button
-                    onClick={() => setTargetOperation('new_question')}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
-                      targetOperation === 'new_question'
-                        ? 'bg-indigo-600 text-white border-indigo-500'
-                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                    type="button"
+                    onClick={() => {
+                      setPrecisionSubMode('edit');
+                      setTargetOperation('replace_part');
+                    }}
+                    className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-bold rounded-lg transition-all ${
+                      precisionSubMode === 'edit'
+                        ? 'bg-purple-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    New Question
+                    <Edit3 className="w-3.5 h-3.5" />
+                    <span>Edit Mode ({pageBoxes.length})</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Tool Style: Box vs Line Cropper */}
+              <div className="space-y-1">
+                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Tool Style</label>
+                <div className="grid grid-cols-2 gap-1 p-1 bg-slate-950 rounded-xl border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setCropToolType('box')}
+                    className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition-all ${
+                      cropToolType === 'box'
+                        ? 'bg-slate-800 text-white border border-slate-700'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Crop className="w-3.5 h-3.5" />
+                    <span>Box Cropper</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCropToolType('line')}
+                    className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-lg transition-all ${
+                      cropToolType === 'line'
+                        ? 'bg-slate-800 text-white border border-slate-700'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Scissors className="w-3.5 h-3.5" />
+                    <span>Line-Based</span>
                   </button>
                 </div>
               </div>
@@ -1442,56 +1755,195 @@ export const UnifiedPdfStudioModal: React.FC = () => {
                 </div>
               </div>
 
-              {/* Question Properties Form */}
+              {/* Marking Scheme Quick Bar */}
+              <div className="p-2.5 bg-slate-950 rounded-xl border border-slate-800 flex items-center justify-between">
+                <div>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Marking Scheme</span>
+                  <div className="text-xs font-bold text-emerald-400 flex items-center gap-1.5 mt-0.5">
+                    <span>+{marksScheme.cm}</span>
+                    <span className="text-slate-500">/</span>
+                    <span className="text-rose-400">{marksScheme.im}</span>
+                    {marksScheme.schemeType && (
+                      <span className="text-[10px] text-slate-400 font-normal capitalize">({marksScheme.schemeType.replace('_', ' ')})</span>
+                    )}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsMarkingModalOpen(true)}
+                  className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-indigo-950 hover:bg-indigo-900 text-indigo-300 border border-indigo-500/40 flex items-center gap-1.5 transition-all"
+                >
+                  <Award className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>Configure...</span>
+                </button>
+              </div>
+
+              {/* Mandatory Subject & Optional Section Form */}
               <div className="space-y-3 pt-2 border-t border-slate-800 text-xs">
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="text-[10px] text-slate-400 block mb-1">Subject</label>
+                {/* Subject */}
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1">
+                      <span>Subject</span>
+                      <span className="text-rose-400 text-xs">*</span>
+                      <span className="text-[9px] font-normal text-rose-400/80">(Mandatory)</span>
+                    </label>
+                    {!isCustomSubject ? (
+                      <button
+                        type="button"
+                        onClick={() => setIsCustomSubject(true)}
+                        className="text-[10px] text-indigo-400 hover:text-indigo-300 font-medium"
+                      >
+                        + Custom
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setIsCustomSubject(false)}
+                        className="text-[10px] text-slate-400 hover:text-slate-300 font-medium"
+                      >
+                        ← Preset List
+                      </button>
+                    )}
+                  </div>
+
+                  {isCustomSubject ? (
                     <input
                       type="text"
                       value={subjectName}
-                      onChange={(e) => setSubjectName(e.target.value)}
-                      className="w-full px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-white font-medium"
-                      placeholder="e.g. Physics"
+                      onChange={(e) => {
+                        setSubjectName(e.target.value);
+                        if (e.target.value.trim()) setSubjectError(false);
+                      }}
+                      placeholder="Type custom subject name..."
+                      className={`w-full px-2.5 py-1.5 bg-slate-950 rounded-lg text-xs text-white font-medium border ${
+                        subjectError ? 'border-rose-500 ring-1 ring-rose-500/50' : 'border-slate-800 focus:border-indigo-500'
+                      }`}
                     />
+                  ) : (
+                    <select
+                      value={subjectName}
+                      onChange={(e) => {
+                        if (e.target.value === '__custom__') {
+                          setIsCustomSubject(true);
+                        } else {
+                          setSubjectName(e.target.value);
+                          if (e.target.value.trim()) setSubjectError(false);
+                        }
+                      }}
+                      className={`w-full px-2.5 py-1.5 bg-slate-950 rounded-lg text-xs text-white font-medium border ${
+                        subjectError ? 'border-rose-500 ring-1 ring-rose-500/50' : 'border-slate-800 focus:border-indigo-500'
+                      }`}
+                    >
+                      <option value="" disabled>-- Select Subject (Mandatory) --</option>
+                      {availableSubjects.map((sub) => (
+                        <option key={sub} value={sub}>{sub}</option>
+                      ))}
+                      <option value="__custom__">+ Add Custom Subject...</option>
+                    </select>
+                  )}
+
+                  {subjectError && (
+                    <p className="text-[10px] text-rose-400 flex items-center gap-1 mt-1 font-medium">
+                      <AlertTriangle className="w-3 h-3" />
+                      Subject is mandatory before saving.
+                    </p>
+                  )}
+                </div>
+
+                {/* Section (Optional) */}
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[10px] font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1">
+                      <span>Section</span>
+                      <span className="text-[9px] font-normal text-slate-500">(Optional)</span>
+                    </label>
+                    {!isCustomSection ? (
+                      <button
+                        type="button"
+                        onClick={() => setIsCustomSection(true)}
+                        className="text-[10px] text-indigo-400 hover:text-indigo-300 font-medium"
+                      >
+                        + Custom
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setIsCustomSection(false)}
+                        className="text-[10px] text-slate-400 hover:text-slate-300 font-medium"
+                      >
+                        ← Preset List
+                      </button>
+                    )}
                   </div>
-                  <div>
-                    <label className="text-[10px] text-slate-400 block mb-1">Section</label>
+
+                  {isCustomSection ? (
                     <input
                       type="text"
                       value={sectionName}
                       onChange={(e) => setSectionName(e.target.value)}
-                      className="w-full px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-white font-medium"
-                      placeholder="e.g. Section 1"
+                      placeholder="Section 1"
+                      className="w-full px-2.5 py-1.5 bg-slate-950 rounded-lg text-xs text-white font-medium border border-slate-800 focus:border-indigo-500"
                     />
-                  </div>
+                  ) : (
+                    <select
+                      value={sectionName}
+                      onChange={(e) => {
+                        if (e.target.value === '__custom__') {
+                          setIsCustomSection(true);
+                        } else {
+                          setSectionName(e.target.value);
+                        }
+                      }}
+                      className="w-full px-2.5 py-1.5 bg-slate-950 rounded-lg text-xs text-white font-medium border border-slate-800 focus:border-indigo-500"
+                    >
+                      {availableSections.map((sec) => (
+                        <option key={sec} value={sec}>{sec}</option>
+                      ))}
+                      <option value="__custom__">+ Add Custom Section...</option>
+                    </select>
+                  )}
                 </div>
 
+                {/* Question Number & Operation */}
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <label className="text-[10px] text-slate-400 block mb-1">Question Number</label>
                     <input
                       type="number"
+                      min={1}
                       value={questionNumber}
                       onChange={(e) => setQuestionNumber(e.target.value === '' ? '' : parseInt(e.target.value))}
-                      className="w-full px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-white font-mono"
+                      className="w-full px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-white font-mono text-xs"
                       placeholder="e.g. 1"
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] text-slate-400 block mb-1">Type</label>
+                    <label className="text-[10px] text-slate-400 block mb-1">Target Action</label>
                     <select
-                      value={questionType}
-                      onChange={(e) => setQuestionType(e.target.value as any)}
-                      className="w-full px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-white font-medium"
+                      value={targetOperation}
+                      onChange={(e) => setTargetOperation(e.target.value as any)}
+                      className="w-full px-2 py-1 bg-slate-950 border border-slate-800 rounded-lg text-white text-xs font-medium"
                     >
-                      <option value="mcq">Single Choice (MCQ)</option>
-                      <option value="msq">Multiple Choice (MSQ)</option>
-                      <option value="nat">Numerical (NAT)</option>
-                      <option value="msm">Matrix Match (MSM)</option>
+                      <option value="new_question">New Question</option>
+                      <option value="replace_part">Replace Image</option>
+                      <option value="add_part">Append Part</option>
                     </select>
                   </div>
                 </div>
+              </div>
+
+              {/* Answer Key Input Bar */}
+              <div className="pt-2 border-t border-slate-800">
+                <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
+                  Question Type & Answer Key
+                </label>
+                <AnswerKeyInputBar
+                  questionType={questionType}
+                  answerValue={answerOptions}
+                  onChangeAnswer={(ans) => setAnswerOptions(ans)}
+                  onChangeType={(type) => setQuestionType(type)}
+                />
               </div>
 
               {/* Live Preview Thumbnail Box */}
@@ -1553,15 +2005,32 @@ export const UnifiedPdfStudioModal: React.FC = () => {
                 </label>
               </div>
 
-              {/* Commit / Save Action */}
-              <div className="pt-3">
+              {/* Commit / Save Actions */}
+              <div className="pt-3 border-t border-slate-800 space-y-2">
                 <button
-                  onClick={handleApplyCrop}
+                  type="button"
+                  onClick={() => handleApplyCropAndAdvance(true)}
                   disabled={isSavingCrop}
-                  className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-lg shadow-indigo-600/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                  className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-lg shadow-emerald-600/30 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                  title="Save current question crop and advance to next question number (Enter)"
                 >
-                  {isSavingCrop ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
-                  <span>Commit Crop to Archive</span>
+                  {isSavingCrop ? <Loader2 className="w-4 h-4 animate-spin" /> : <CornerDownLeft className="w-4 h-4" />}
+                  <span>
+                    {precisionSubMode === 'edit'
+                      ? `Update Q.${questionNumber || ''} (Enter ↵)`
+                      : `Save & Next Question (Enter ↵)`}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleApplyCropAndAdvance(false)}
+                  disabled={isSavingCrop}
+                  className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white font-semibold text-xs rounded-xl border border-slate-700 flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+                  title="Save current question crop and stay on current question number"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Save Only (Stay on Q.{questionNumber || ''})</span>
                 </button>
               </div>
             </div>
@@ -1597,6 +2066,30 @@ export const UnifiedPdfStudioModal: React.FC = () => {
           />
         </div>
       )}
+
+      {/* 4. MARKING SCHEME CONFIGURATION MODAL */}
+      <MarkingSchemeModal
+        isOpen={isMarkingModalOpen}
+        onClose={() => setIsMarkingModalOpen(false)}
+        activeArchive={activeArchive}
+        subjects={activeArchive?.subjects || []}
+        activeQuestionId={selectedQuestionId || undefined}
+        activeQuestionNumber={typeof questionNumber === 'number' ? questionNumber : undefined}
+        activeSubjectId={activeArchive?.subjects?.find((s) => s.name === subjectName)?.id}
+        activeSectionId={activeArchive?.subjects
+          ?.find((s) => s.name === subjectName)
+          ?.sections?.find((sec) => sec.name === sectionName)?.id}
+        currentScheme={marksScheme}
+        onApply={(scheme, scope) => {
+          applyMarkingSchemeWithScope(scheme, scope);
+          setMarksScheme(scheme);
+          addToast({
+            title: 'Marking Scheme Applied',
+            description: `Applied +${scheme.cm} / ${scheme.im} scheme across ${scope.type.replace('_', ' ')}`,
+            type: 'success',
+          });
+        }}
+      />
     </div>
   );
 };
