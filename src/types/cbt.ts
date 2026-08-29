@@ -50,6 +50,7 @@ export interface QuestionData {
   type: QuestionType;
   marks: MarksScheme;
   answerOptions: string; // e.g. "4", "1,2,3", "5.25", "A->P,Q; B->R"
+  correctAnswer?: string; // Explicit ground truth answer string (e.g. "A", "1", "42", "A,C")
   isSplitQuestion?: boolean;
   pdfData: PdfDataPart[];
   images: ImageAttachment[];
@@ -73,6 +74,19 @@ export interface SubjectData {
 }
 
 export type ArchiveFormat = 'pdfCropper' | 'ultimate' | 'dpp' | 'quessbank' | 'custom';
+
+export type PageRole = 'blueprint' | 'questions' | 'answer_key' | 'solution' | 'skip';
+
+export interface MultiDocumentIngestionItem {
+  id: string;
+  name: string;
+  size: number;
+  file?: File;
+  blob?: Blob;
+  totalPages: number;
+  pageAssignments: Record<number, PageRole>;
+  isSourceArchiveFile?: boolean;
+}
 
 export interface BlueprintSectionRange {
   id: string;

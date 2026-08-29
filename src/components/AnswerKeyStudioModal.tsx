@@ -65,6 +65,7 @@ export const AnswerKeyStudioModal: React.FC = () => {
     activeArchiveId,
     isAnswerKeyModalOpen,
     setAnswerKeyModalOpen,
+    setUnifiedAiIngestionModalOpen,
     applyAnswerKeyClassification,
     clearAllAnswersInActiveArchive,
     updateQuestion,
@@ -719,6 +720,18 @@ export const AnswerKeyStudioModal: React.FC = () => {
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
                     <span>Double-Pass Rescan</span>
                   </label>
+
+                  <button
+                    onClick={() => {
+                      setAnswerKeyModalOpen(false);
+                      setUnifiedAiIngestionModalOpen(true, 'answer_key');
+                    }}
+                    className="px-3 py-1.5 bg-gradient-to-r from-amber-600/20 to-purple-600/20 hover:from-amber-600/30 hover:to-purple-600/30 border border-amber-500/40 text-amber-300 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 shadow-sm"
+                    title="Select specific pages from single or multiple PDFs to extract answer keys"
+                  >
+                    <Layers className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Multi-PDF Page Selector (AI Suite)</span>
+                  </button>
 
                   <button
                     onClick={() => aiKeyFileInputRef.current?.click()}

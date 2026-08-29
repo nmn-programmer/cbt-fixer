@@ -51,9 +51,12 @@ export const Header: React.FC = () => {
     setExportModalOpen,
     setBlueprintModalOpen,
     setAnswerKeyModalOpen,
+    setUnifiedAiIngestionModalOpen,
     setCbtSimulatorOpen,
     setMobileSidebarOpen,
+    openPdfStudio,
     openPdfRecrop,
+    openBoundaryOverlay,
     setPdfConverterModalOpen,
     past,
     future,
@@ -254,7 +257,7 @@ export const Header: React.FC = () => {
                   ZIP Inspector
                 </span>
                 <span className="text-[10px] font-mono font-medium px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
-                  v2.5.0
+                  v2.6.0
                 </span>
               </h1>
               <p className="text-[10px] text-slate-400 hidden xl:block">
@@ -287,26 +290,37 @@ export const Header: React.FC = () => {
             <span className="hidden sm:inline">Import ZIP</span>
           </button>
 
-          {/* Manual PDF Cropper Studio */}
+          {/* Unified PDF Precision Studio & Layout Workbench */}
           <button
-            id="manual-cropper-btn"
-            onClick={() => openPdfRecrop()}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-emerald-950/60 hover:bg-emerald-900/60 active:bg-emerald-850 text-emerald-300 rounded-md border border-emerald-700/60 transition-colors shrink-0 shadow-sm"
-            title="Open Manual PDF Cropper & Test Maker Studio"
+            id="unified-pdf-studio-btn"
+            onClick={() => openPdfStudio({ mode: 'layout' })}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-gradient-to-r from-purple-950/80 to-indigo-950/80 hover:from-purple-900/80 hover:to-indigo-900/80 active:opacity-90 text-indigo-200 rounded-md border border-indigo-500/40 transition-all shrink-0 shadow-sm"
+            title="Open Unified PDF Precision Studio & Layout Workbench"
           >
-            <Crop className="w-3.5 h-3.5 text-emerald-400" />
-            <span className="hidden md:inline font-semibold">Manual Cropper</span>
+            <Layers className="w-3.5 h-3.5 text-indigo-400" />
+            <span className="hidden md:inline font-semibold">PDF Studio</span>
           </button>
 
-          {/* AI Auto PDF Converter */}
+          {/* Quick Precision Cropper Mode Direct Shortcut */}
+          <button
+            id="manual-cropper-btn"
+            onClick={() => openPdfStudio({ mode: 'precision' })}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-emerald-950/60 hover:bg-emerald-900/60 active:bg-emerald-850 text-emerald-300 rounded-md border border-emerald-700/60 transition-colors shrink-0 shadow-sm"
+            title="Open Precision PDF Cropper Mode"
+          >
+            <Crop className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="hidden md:inline font-semibold">Cropper</span>
+          </button>
+
+          {/* AI Auto PDF Converter / Multi-PDF Suite */}
           <button
             id="ai-pdf-converter-btn"
-            onClick={() => setPdfConverterModalOpen(true)}
+            onClick={() => setUnifiedAiIngestionModalOpen(true)}
             className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-indigo-950/60 hover:bg-indigo-900/60 active:bg-indigo-850 text-indigo-300 rounded-md border border-indigo-700/60 transition-colors shrink-0 shadow-sm"
-            title="Auto AI PDF to CBT Archive Extractor"
+            title="Open Multi-PDF Suite & CBT Test Creator"
           >
             <Wand2 className="w-3.5 h-3.5 text-indigo-400" />
-            <span className="hidden md:inline">AI Converter</span>
+            <span className="hidden md:inline">Multi-PDF Suite</span>
           </button>
 
           {/* Create New Paper Button */}
@@ -349,6 +363,19 @@ export const Header: React.FC = () => {
               <Redo2 className="w-3.5 h-3.5" />
             </button>
           </div>
+
+          {/* Unified Multi-PDF AI Ingestion & Page-Role Assignment Trigger */}
+          {activeArchive && (
+            <button
+              id="unified-ai-ingestion-btn"
+              onClick={() => setUnifiedAiIngestionModalOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium bg-gradient-to-r from-indigo-900/60 to-purple-900/60 hover:from-indigo-900 hover:to-purple-900 active:scale-95 rounded-md border border-indigo-500/40 transition-all shrink-0 shadow-sm text-indigo-200 hover:text-white"
+              title="Multi-PDF Document Ingestion & Arbitrary Page-Role Assignment Suite"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="hidden md:inline font-bold">AI Multi-PDF Suite</span>
+            </button>
+          )}
 
           {/* Blueprint & Subject Range Studio Trigger */}
           {activeArchive && (

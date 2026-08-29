@@ -38,6 +38,7 @@ import { useCbtStore } from '../store/useCbtStore';
 import { QuestionData, QuestionType, SubjectData, SectionData } from '../types/cbt';
 import { MARKING_PRESETS, parseImageFileName } from '../utils/constants';
 import { QuestionHoverTrigger } from './QuestionHoverTrigger';
+import { QuestionPageContextViewer } from './QuestionPageContextViewer';
 
 export const QuestionEditor: React.FC = () => {
   const {
@@ -63,11 +64,12 @@ export const QuestionEditor: React.FC = () => {
     jumpToDiagnostic,
     setAnswerKeyModalOpen,
     openPdfRecrop,
+    openBoundaryOverlay,
     openAiRepair,
     addToast,
   } = useCbtStore();
 
-  const [activeTab, setActiveTab] = useState<'editor' | 'json'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'context' | 'json'>('editor');
   const [activePartIndex, setActivePartIndex] = useState<number>(1);
   const [viewMode, setViewMode] = useState<'single' | 'stacked'>('single');
   const [zoomLevel, setZoomLevel] = useState<number>(100);
@@ -152,19 +154,81 @@ export const QuestionEditor: React.FC = () => {
   };
 
   // Helper for MSQ Option Selection
-  const toggleMsqOption = (optNumber: string) => {
+  const toggleMsqOption = (optNumberOrLetter: string) => {
     if (!currentQuestion) return;
-    const currentList = currentQuestion.answerOptions
-      ? currentQuestion.answerOptions.split(',').map((s) => s.trim()).filter(Boolean)
-      : [];
+    const isNum = /^[1-4]$/.test(optNumberOrLetter);
+    const letter = isNum ? String.fromCharCode(64 + parseInt(optNumberOrLetter, 10)) : optNumberOrLetter.toUpperCase();
+    const num = isNum ? optNumberOrLetter : String(optNumberOrLetter.charCodeAt(0) - 64);
+
+    const rawStr = currentQuestion.answerOptions || currentQuestion.correctAnswer || '';
+    const currentList = rawStr
+      .split(/[,\s;/]+/)
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean);
+
+    const isCurrentlyPresent = currentList.includes(optNumberOrLetter.toUpperCase()) || 
+                               currentList.includes(letter) || 
+                               currentList.includes(num);
 
     let updatedList: string[];
-    if (currentList.includes(optNumber)) {
-      updatedList = currentList.filter((item) => item !== optNumber);
+    if (isCurrentlyPresent) {
+      updatedList = currentList.filter(
+        (item) => item !== optNumberOrLetter.toUpperCase() && item !== letter && item !== num
+      );
     } else {
-      updatedList = [...currentList, optNumber].sort();
+      updatedList = [...currentList, letter].sort();
     }
-    updateQuestion(currentQuestion.id, { answerOptions: updatedList.join(',') }, 'Update MSQ Options');
+    const joined = updatedList.join(',');
+    updateQuestion(
+      currentQuestion.id,
+      { answerOptions: joined, correctAnswer: joined },
+      'Update MSQ Options'
+    );
+  };
+
+  const isMcqOptionSelected = (opt: string) => {
+    if (!currentQuestion) return false;
+    const letter = String.fromCharCode(64 + parseInt(opt, 10)); // 1->A, 2->B, etc.
+    const candidates = [
+      currentQuestion.answerOptions,
+      currentQuestion.correctAnswer,
+    ].filter(Boolean) as string[];
+
+    for (const raw of candidates) {
+      const trimmed = raw.trim().toUpperCase();
+      if (trimmed === opt || trimmed === letter) return true;
+      if (trimmed === `OPTION ${opt}` || trimmed === `OPTION ${letter}`) return true;
+      if (trimmed === `OPT ${opt}` || trimmed === `OPT ${letter}`) return true;
+      if (trimmed === `${opt}.` || trimmed === `${letter}.`) return true;
+      if (trimmed === `(${opt})` || trimmed === `(${letter})`) return true;
+    }
+    return false;
+  };
+
+  const isMsqOptionSelected = (opt: string) => {
+    if (!currentQuestion) return false;
+    const letter = String.fromCharCode(64 + parseInt(opt, 10));
+    const rawStrings = [
+      currentQuestion.answerOptions,
+      currentQuestion.correctAnswer,
+    ].filter(Boolean) as string[];
+
+    const tokens: string[] = [];
+    for (const s of rawStrings) {
+      s.split(/[,\s;/]+/).forEach((t) => {
+        const trimmed = t.trim().toUpperCase();
+        if (trimmed) tokens.push(trimmed);
+      });
+    }
+
+    return (
+      tokens.includes(opt) ||
+      tokens.includes(letter) ||
+      tokens.includes(`OPTION ${opt}`) ||
+      tokens.includes(`OPTION ${letter}`) ||
+      tokens.includes(`${letter}.`) ||
+      tokens.includes(`${opt}.`)
+    );
   };
 
   // Helper for MSM (Matrix Match) toggle
@@ -240,6 +304,15 @@ export const QuestionEditor: React.FC = () => {
 
         {/* Action buttons & Prev/Next */}
         <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            onClick={() => openBoundaryOverlay({ questionId: currentQuestion!.id, partIndex: activePartIndex })}
+            className="flex items-center gap-1 px-2.5 py-1 text-xs bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 rounded-md border border-purple-500/40 transition-colors font-medium"
+            title="Inspect this question in the full-page layout overlay & check column alignment"
+          >
+            <Layers className="w-3.5 h-3.5 text-purple-400" />
+            <span className="hidden md:inline">Inspect in Layout</span>
+          </button>
+
           <button
             onClick={() => openPdfRecrop({ questionId: currentQuestion!.id, partIndex: activePartIndex, mode: 'replace_part' })}
             className="flex items-center gap-1 px-2.5 py-1 text-xs bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-md border border-indigo-500/40 transition-colors font-medium"
@@ -320,6 +393,16 @@ export const QuestionEditor: React.FC = () => {
               }`}
             >
               Visual
+            </button>
+            <button
+              onClick={() => setActiveTab('context')}
+              className={`px-2 py-0.5 text-xs rounded flex items-center gap-1 transition-colors ${
+                activeTab === 'context' ? 'bg-indigo-600 text-white font-medium shadow-xs' : 'text-slate-400 hover:text-slate-200'
+              }`}
+              title="Full PDF page spatial context"
+            >
+              <Layers className="w-3 h-3" />
+              <span>Context</span>
             </button>
             <button
               onClick={() => setActiveTab('json')}
@@ -407,7 +490,42 @@ export const QuestionEditor: React.FC = () => {
           </div>
         )}
 
-        {activeTab === 'json' ? (
+        {activeTab === 'context' ? (
+          /* Full PDF Page Spatial Context Tab */
+          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 space-y-3">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800 text-xs">
+              <div className="flex items-center gap-2">
+                <Layers className="w-4 h-4 text-indigo-400" />
+                <span className="font-semibold text-slate-200">
+                  Full PDF Page Context • Question {currentQuestion.que}
+                </span>
+              </div>
+              <span className="text-slate-400 text-[11px]">
+                Showing question crop bounding box in original PDF vector page
+              </span>
+            </div>
+            <QuestionPageContextViewer
+              question={currentQuestion}
+              partIndex={activePartIndex}
+              rawFiles={activeArchive.rawFiles}
+              onOpenOverlay={(pageNum) => {
+                openBoundaryOverlay({
+                  pageNumber: pageNum || (currentQuestion.pdfData?.[0]?.pageNumber ?? 1),
+                  questionId: currentQuestion.id,
+                  partIndex: activePartIndex,
+                });
+              }}
+              onOpenRecrop={(pageNum) => {
+                openPdfRecrop({
+                  questionId: currentQuestion.id,
+                  partIndex: activePartIndex,
+                  pageNumber: pageNum || (currentQuestion.pdfData?.[0]?.pageNumber ?? 1),
+                  mode: 'replace_part',
+                });
+              }}
+            />
+          </div>
+        ) : activeTab === 'json' ? (
           /* JSON Raw Inspector Tab */
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 font-mono text-xs text-slate-300">
             <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-800 text-slate-400">
@@ -846,16 +964,17 @@ export const QuestionEditor: React.FC = () => {
                 <div className="flex flex-wrap items-center gap-3">
                   {['1', '2', '3', '4'].map((opt) => {
                     const letter = String.fromCharCode(64 + parseInt(opt, 10)); // 1->A, 2->B, etc.
-                    const isSelected =
-                      currentQuestion?.answerOptions === opt ||
-                      currentQuestion?.answerOptions === letter;
+                    const isSelected = isMcqOptionSelected(opt);
                     return (
                       <button
                         key={opt}
                         onClick={() =>
                           updateQuestion(
                             currentQuestion!.id,
-                            { answerOptions: isSelected ? '' : opt },
+                            {
+                              answerOptions: isSelected ? '' : opt,
+                              correctAnswer: isSelected ? '' : letter,
+                            },
                             `Toggle Answer ${letter}`
                           )
                         }
@@ -885,10 +1004,7 @@ export const QuestionEditor: React.FC = () => {
                   <div className="flex flex-wrap items-center gap-3">
                     {['1', '2', '3', '4'].map((opt) => {
                       const letter = String.fromCharCode(64 + parseInt(opt, 10));
-                      const list = currentQuestion?.answerOptions
-                        ? currentQuestion.answerOptions.split(',').map((s) => s.trim())
-                        : [];
-                      const isSelected = list.includes(opt) || list.includes(letter);
+                      const isSelected = isMsqOptionSelected(opt);
                       return (
                         <button
                           key={opt}
@@ -914,7 +1030,7 @@ export const QuestionEditor: React.FC = () => {
                   <div className="text-[11px] text-slate-400">
                     Selected Correct Options:{' '}
                     <span className="font-mono font-bold text-purple-300">
-                      {currentQuestion.answerOptions || 'None selected (Unkeyed)'}
+                      {currentQuestion.answerOptions || currentQuestion.correctAnswer || 'None selected (Unkeyed)'}
                     </span>
                   </div>
                 </div>

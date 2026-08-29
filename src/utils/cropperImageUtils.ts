@@ -237,6 +237,81 @@ export async function stitchBlobsVertically(
 }
 
 /**
+ * Magnetically snaps box ymin and ymax to clean horizontal whitespace valleys (local ink minima)
+ * within a search radius of +/- searchRadiusPx to prevent cutting through math formulas or text.
+ */
+export function snapBoxToHorizontalWhitespaceValleys(
+  canvas: HTMLCanvasElement,
+  box: BoxCoord,
+  searchRadiusPx: number = 18,
+  inkThreshold: number = 220
+): BoxCoord {
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return box;
+
+  const w = canvas.width;
+  const h = canvas.height;
+
+  const pxXmin = Math.max(0, Math.floor(box.xmin * w));
+  const pxXmax = Math.min(w, Math.ceil(box.xmax * w));
+  const colWidth = Math.max(10, pxXmax - pxXmin);
+
+  const initialYminPx = Math.floor(box.ymin * h);
+  const initialYmaxPx = Math.floor(box.ymax * h);
+
+  // Helper to compute horizontal line ink score (number of dark pixels along horizontal slice)
+  const getLineInk = (yPx: number): number => {
+    if (yPx < 0 || yPx >= h) return 99999;
+    try {
+      const lineData = ctx.getImageData(pxXmin, yPx, colWidth, 1).data;
+      let darkCount = 0;
+      for (let i = 0; i < lineData.length; i += 4) {
+        const lum = 0.299 * lineData[i] + 0.587 * lineData[i + 1] + 0.114 * lineData[i + 2];
+        if (lum < inkThreshold) darkCount++;
+      }
+      return darkCount;
+    } catch {
+      return 0;
+    }
+  };
+
+  // Find best whitespace valley near ymin
+  let bestYminPx = initialYminPx;
+  let minInkTop = getLineInk(initialYminPx);
+
+  for (let dy = -searchRadiusPx; dy <= searchRadiusPx; dy++) {
+    const testY = initialYminPx + dy;
+    const ink = getLineInk(testY);
+    if (ink < minInkTop) {
+      minInkTop = ink;
+      bestYminPx = testY;
+      if (ink === 0) break; // Perfect clean whitespace
+    }
+  }
+
+  // Find best whitespace valley near ymax
+  let bestYmaxPx = initialYmaxPx;
+  let minInkBottom = getLineInk(initialYmaxPx);
+
+  for (let dy = -searchRadiusPx; dy <= searchRadiusPx + 10; dy++) {
+    const testY = initialYmaxPx + dy;
+    const ink = getLineInk(testY);
+    if (ink < minInkBottom) {
+      minInkBottom = ink;
+      bestYmaxPx = testY;
+      if (ink === 0) break; // Perfect clean whitespace
+    }
+  }
+
+  return {
+    xmin: box.xmin,
+    xmax: box.xmax,
+    ymin: Math.max(0, Math.min(0.98, bestYminPx / h)),
+    ymax: Math.min(1.0, Math.max(box.ymin + 0.02, bestYmaxPx / h)),
+  };
+}
+
+/**
  * Extracts raw text within a normalized BoxCoord from a PDF.js page.
  */
 export async function getTextInBoxFromPdfPage(pdfPage: any, box: BoxCoord): Promise<string> {

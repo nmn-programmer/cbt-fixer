@@ -117,7 +117,7 @@ export async function parseZipArchive(
         const qNumber = typeof qVal.que === 'number' ? qVal.que : parseInt(qKey, 10) || 1;
         const qType: QuestionType = normalizeQuestionType(qVal.type);
         const marks: MarksScheme = normalizeMarksScheme(qVal.marks, qType);
-        const answerOptions: string = normalizeAnswerOptions(qVal.answerOptions);
+        const { answerOptions, correctAnswer } = extractAnswerAndOptions(qVal, qType);
 
         const pdfDataParts: PdfDataPart[] = Array.isArray(qVal.pdfData)
           ? qVal.pdfData.map((part: any, idx: number) => {
@@ -286,7 +286,7 @@ async function parseUltimateNestedZip(
             const qNumber = typeof qVal.que === 'number' ? qVal.que : parseInt(qKey, 10) || 1;
             const qType = normalizeQuestionType(qVal.type);
             const marks = normalizeMarksScheme(qVal.marks, qType);
-            const answerOptions = normalizeAnswerOptions(qVal.answerOptions);
+            const { answerOptions, correctAnswer } = extractAnswerAndOptions(qVal, qType);
 
             const pdfDataParts: PdfDataPart[] = Array.isArray(qVal.pdfData)
               ? qVal.pdfData.map((part: any, idx: number) => {
@@ -337,6 +337,7 @@ async function parseUltimateNestedZip(
               type: qType,
               marks,
               answerOptions,
+              correctAnswer,
               pdfData: pdfDataParts,
               images,
               notes: qVal.notes || '',
@@ -595,4 +596,75 @@ function normalizeAnswerOptions(ans: any): string {
   if (typeof ans === 'string') return ans.trim();
   if (Array.isArray(ans)) return ans.join(',');
   return String(ans).trim();
+}
+
+export function extractAnswerAndOptions(
+  qVal: any,
+  qType: QuestionType
+): { answerOptions: string; correctAnswer?: string } {
+  if (!qVal || typeof qVal !== 'object') {
+    return { answerOptions: '', correctAnswer: undefined };
+  }
+
+  const explicitAns =
+    qVal.correctAnswer ??
+    qVal.correctOption ??
+    qVal.answer ??
+    qVal.ans ??
+    qVal.correct_answer ??
+    qVal.correct_option ??
+    qVal.solution;
+
+  let parsedAns = '';
+  if (explicitAns !== undefined && explicitAns !== null) {
+    if (Array.isArray(explicitAns)) {
+      parsedAns = explicitAns.join(',').trim();
+    } else {
+      parsedAns = String(explicitAns).trim();
+    }
+  }
+
+  const rawOptions = qVal.answerOptions ?? qVal.options ?? qVal.opts;
+  let parsedOptions = '';
+  if (rawOptions !== undefined && rawOptions !== null) {
+    if (Array.isArray(rawOptions)) {
+      parsedOptions = rawOptions.join(',').trim();
+    } else {
+      parsedOptions = String(rawOptions).trim();
+    }
+  }
+
+  // If explicit answer was provided, use it
+  if (parsedAns) {
+    return {
+      answerOptions: parsedAns,
+      correctAnswer: parsedAns,
+    };
+  }
+
+  // If only answerOptions was provided
+  if (parsedOptions) {
+    // Check if it's a generic choices list like "A, B, C, D" or "1, 2, 3, 4" for MCQ
+    const isChoicesHeader =
+      (/^([A-D][,\s]*)+$/i.test(parsedOptions) || /^([1-4][,\s]*)+$/.test(parsedOptions)) &&
+      parsedOptions.includes(',');
+
+    if (isChoicesHeader && qType === 'mcq') {
+      // It's a choices header rather than a single chosen answer
+      return {
+        answerOptions: '',
+        correctAnswer: undefined,
+      };
+    }
+
+    return {
+      answerOptions: parsedOptions,
+      correctAnswer: parsedOptions,
+    };
+  }
+
+  return {
+    answerOptions: '',
+    correctAnswer: undefined,
+  };
 }

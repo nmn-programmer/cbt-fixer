@@ -784,8 +784,8 @@ export function getOrchestratedKeyPool(): OrchestratedPoolResult {
     }
   });
 
-  // Limit to up to 5 keys
-  const limitedList = rawList.slice(0, 5);
+  // Support all configured keys in pool (up to 32 keys for 6+ Google account swarms)
+  const limitedList = rawList.slice(0, 32);
 
   if (limitedList.length === 0) {
     const dummyKey: OrchestratedKey = {
