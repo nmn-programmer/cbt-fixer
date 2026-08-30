@@ -223,6 +223,7 @@ CRITICAL BOUNDING BOX & COLUMN PROTOCOL (3-LINE STRUCTURAL & Q_n -> Q_n+1 PAIRIN
    - Y_MIN: Upper bound MUST start immediately before the start of Question Q_n label (e.g. "Q.15", "15.").
    - Y_MAX: Lower bound MUST extend down to immediately before the start of the next question label Q_(n+1) in the same column/page.
    - For the LAST question in a column/page, Y_MAX extends down to the column bottom margin line before the page footer.
+   - CRITICAL BOUNDING DIRECTIVE: A question's bounding box MUST encompass the question number, complete text prompt, any attached diagrams/tables/figures, and all associated multiple-choice options until the exact start of the next question.
 
 3. DYNAMIC COLUMN OVERFLOW & MULTI-PAGE SPLIT EXCEPTION:
    - If Question Q_n ends before listing all options (or Q_(n+1) is in a different column or next page):
@@ -242,8 +243,56 @@ ${hasAnswerKey ? 'Extract printed answer key table if present on these pages.' :
     contents,
     schema: responseSchema,
     temperature: 0.1,
-    label: 'Client Direct Extract PDF Structure'
+    label: 'Client Direct Extract PDF Structure (Pass 1)'
   });
+
+  // PASS 2 GAP-FILL & SEQUENCE AUDIT RESCAN (NON-DESTRUCTIVE)
+  if (enableDoublePass !== false && parsed.questions && parsed.questions.length > 0) {
+    try {
+      const detectedQNums = parsed.questions.map((q: any) => q.qNo).filter(Boolean);
+      const rescanPrompt = `PASS 2 AUDIT & GAP-FILL RESCAN:
+Pass 1 detected questions: [${detectedQNums.join(', ')}].
+
+AUDIT TASKS:
+1. SEQUENCE CHECK: Verify if any printed question was skipped in this page batch (e.g. Q1, Q2, Q4 were found but Q3 was missed). If any question was missed, output that missing question with its exact bounding box [ymin, xmin, ymax, xmax] and metadata.
+2. SPLIT/CONTINUATION VERIFICATION: If any question was incomplete (missing options C/D or split across columns/pages), verify and provide its complete splitParts.
+3. ORPHAN OPTIONS RECOVERY: If any options at the top of a column were missed or detached, connect them to the preceding question.
+Return the complete audited list including any recovered missing questions.`;
+
+      const audited = await executeGeminiWithFallback(ai, {
+        contents: [...contents, { text: rescanPrompt }],
+        schema: responseSchema,
+        temperature: 0.0,
+        label: 'Client Direct Pass 2 Audit'
+      });
+
+      if (audited && audited.questions && Array.isArray(audited.questions)) {
+        const pass1Map = new Map<number, any>();
+        parsed.questions.forEach((q: any) => {
+          if (q.qNo != null) pass1Map.set(q.qNo, q);
+        });
+
+        audited.questions.forEach((auditedQ: any) => {
+          if (!auditedQ || auditedQ.qNo == null) return;
+          const existing = pass1Map.get(auditedQ.qNo);
+          if (!existing) {
+            pass1Map.set(auditedQ.qNo, auditedQ);
+          } else {
+            if (auditedQ.splitParts && Array.isArray(auditedQ.splitParts) && auditedQ.splitParts.length > 0) {
+              existing.splitParts = auditedQ.splitParts;
+              existing.isSplit = true;
+            }
+            if (auditedQ.completeness && auditedQ.completeness !== 'missing_options') {
+              existing.completeness = auditedQ.completeness;
+            }
+          }
+        });
+        parsed.questions = Array.from(pass1Map.values()).sort((a, b) => a.qNo - b.qNo);
+      }
+    } catch (e) {
+      console.warn('Client Pass 2 pdf structure audit skipped:', e);
+    }
+  }
 
   // Adjust pageIndex by pageOffset (for both main question and splitParts)
   if (parsed.questions && Array.isArray(parsed.questions)) {
@@ -282,6 +331,7 @@ async function handleDetectQuestionBox(ai: GoogleGenAI, body: any) {
   };
 
   const prompt = `Find the precise normalized bounding box [ymin, xmin, ymax, xmax] (0.0 to 1.0) enclosing Question ${qNo || ''} on this page.
+CRITICAL: A question's bounding box MUST encompass the question number, complete text prompt, any attached diagrams/tables/figures, and all associated multiple-choice options until the exact start of the next question.
 Text context: "${questionText ? questionText.slice(0, 150) : ''}"`;
 
   return executeGeminiWithFallback(ai, {
@@ -421,13 +471,70 @@ ${context?.totalQuestions ? `Expected Question Count: ${context.totalQuestions}.
 
   contents.push({ text: prompt });
 
-  return executeGeminiWithFallback(ai, {
+  let resultData = await executeGeminiWithFallback(ai, {
     contents,
     schema: keySchema,
     temperature: 0.1,
     preferredModel: requestedModel,
     label: 'Client Direct Extract Answer Key PDF'
   });
+
+  // PASS 2: CLIENT DOUBLE-PASS VERIFICATION AUDIT
+  if (body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
+    try {
+      const pass1Summary = resultData.answers.map((a: any) => `Q${a.qNo}:${a.answer}`).join(', ');
+      const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
+Below is the initial raw answer key extracted from Pass 1:
+${pass1Summary}
+
+CRITICAL VERIFICATION TASKS FOR PASS 2:
+1. MISSING QUESTION DETECTIVE: Scan the image/text to ensure NO question numbers were skipped in the sequence (e.g. Q1 to Q100). If any question number is missing, locate it and add it.
+2. OPTION & TYPE AUDIT:
+   - MCQ: Normalize A->1, B->2, C->3, D->4
+   - MSQ: Ensure multi-option keys (e.g. A,C -> 1,3) are accurate and comma-separated.
+   - NAT: Ensure exact integers, decimals, or numeric range strings (e.g. '5.20 to 5.40').
+   - MSM: Ensure column/matrix mappings are retained.
+3. FIX OCR TYPOS: Correct common OCR confusion: 'O'->'0', 'I'->'1', 'B'->'8', 'S'->'5', 'BD'->'B,D'.
+Return the complete, audited and verified answer key mapping.`;
+
+      const auditContents = [
+        ...contents.filter((c: any) => c.inlineData || c.text?.startsWith('Raw Answer Key Text')),
+        { text: auditPrompt }
+      ];
+
+      const audited = await executeGeminiWithFallback(ai, {
+        contents: auditContents,
+        schema: keySchema,
+        temperature: 0.0,
+        preferredModel: requestedModel,
+        label: 'Client Pass 2 Answer Key Audit'
+      });
+
+      if (audited && audited.answers && Array.isArray(audited.answers)) {
+        const pass1Map = new Map<number, any>();
+        resultData.answers.forEach((a: any) => {
+          if (a && a.qNo != null) pass1Map.set(a.qNo, a);
+        });
+        audited.answers.forEach((auditedA: any) => {
+          if (!auditedA || auditedA.qNo == null) return;
+          const existing = pass1Map.get(auditedA.qNo);
+          if (!existing) {
+            pass1Map.set(auditedA.qNo, auditedA);
+          } else {
+            if (auditedA.answer && auditedA.answer.trim()) existing.answer = auditedA.answer;
+            if (auditedA.inferredType) existing.inferredType = auditedA.inferredType;
+            if (auditedA.normalizedAnswer) existing.normalizedAnswer = auditedA.normalizedAnswer;
+            if (auditedA.subject && !existing.subject) existing.subject = auditedA.subject;
+          }
+        });
+        resultData.answers = Array.from(pass1Map.values()).sort((a, b) => a.qNo - b.qNo);
+      }
+    } catch (e) {
+      console.warn('Client Pass 2 answer key verification pass skipped:', e);
+    }
+  }
+
+  return resultData;
 }
 
 async function handleExtractAnswerKeyPage(ai: GoogleGenAI, body: any) {
@@ -461,12 +568,53 @@ async function handleExtractAnswerKeyPage(ai: GoogleGenAI, body: any) {
 
   const prompt = `Extract all answers from this answer key table page image.`;
 
-  return executeGeminiWithFallback(ai, {
+  let resultData = await executeGeminiWithFallback(ai, {
     contents: [{ inlineData }, { text: prompt }],
     schema: keySchema,
     temperature: 0.1,
     label: 'Extract Answer Key Page'
   });
+
+  // PASS 2: CLIENT DOUBLE-PASS VERIFICATION AUDIT
+  if (body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
+    try {
+      const pass1Summary = resultData.answers.map((a: any) => `Q${a.qNo}:${a.answer}`).join(', ');
+      const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT:
+Below is the initial answer key extracted from Pass 1:
+${pass1Summary}
+
+Verify that NO question numbers are missing, fix OCR typos, and return the audited, complete answer key table.`;
+
+      const audited = await executeGeminiWithFallback(ai, {
+        contents: [{ inlineData }, { text: auditPrompt }],
+        schema: keySchema,
+        temperature: 0.0,
+        label: 'Client Pass 2 Answer Key Page Audit'
+      });
+
+      if (audited && audited.answers && Array.isArray(audited.answers)) {
+        const pass1Map = new Map<number, any>();
+        resultData.answers.forEach((a: any) => {
+          if (a && a.qNo != null) pass1Map.set(a.qNo, a);
+        });
+        audited.answers.forEach((auditedA: any) => {
+          if (!auditedA || auditedA.qNo == null) return;
+          const existing = pass1Map.get(auditedA.qNo);
+          if (!existing) {
+            pass1Map.set(auditedA.qNo, auditedA);
+          } else {
+            if (auditedA.answer && auditedA.answer.trim()) existing.answer = auditedA.answer;
+            if (auditedA.subject && !existing.subject) existing.subject = auditedA.subject;
+          }
+        });
+        resultData.answers = Array.from(pass1Map.values()).sort((a, b) => a.qNo - b.qNo);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  return resultData;
 }
 
 async function handleExtractQuestionsPass1(ai: GoogleGenAI, body: any) {
@@ -577,6 +725,7 @@ CRITICAL BOUNDING BOX & COLUMN PROTOCOL (3-LINE STRUCTURAL & Q_n -> Q_n+1 PAIRIN
    - Y_MIN: Upper bound MUST start immediately before the start of Question Q_n label (e.g. "Q.15", "15.").
    - Y_MAX: Lower bound MUST extend down to immediately before the start of the next question label Q_(n+1) in the same column/page.
    - For the LAST question in a column/page, Y_MAX extends down to the column bottom margin line before the page footer.
+   - CRITICAL BOUNDING DIRECTIVE: A question's bounding box MUST encompass the question number, complete text prompt, any attached diagrams/tables/figures, and all associated multiple-choice options until the exact start of the next question.
 
 3. DYNAMIC COLUMN OVERFLOW & MULTI-PAGE SPLIT EXCEPTION:
    - If Question Q_n ends before listing all options (or Q_(n+1) is in a different column or next page):

@@ -1,4 +1,5 @@
 import { BlueprintSectionRange, QuestionData, QuestionType } from '../types/cbt';
+import { reconcileQuestionTypeAndAnswer } from './answerKeyManager';
 
 export interface QuestionDetection {
   pageIndex: number;
@@ -148,25 +149,31 @@ export function reconcileGroundTruthKeys(
     if (ak) {
       report.matchedKeysCount++;
 
-      // Check for type match with blueprint / answer key
-      if (ak.type && qCopy.type && ak.type.toLowerCase() !== qCopy.type.toLowerCase()) {
+      // Reconcile Type and Numerical Attributes through shared engine
+      const rec = reconcileQuestionTypeAndAnswer(ak.answer, {
+        existingQuestionType: qCopy.type,
+        explicitType: ak.type,
+        natValue: ak.natValue,
+        hasOptions: Array.isArray(qCopy.optionsFound) && qCopy.optionsFound.length > 0,
+        numOptions: qCopy.optionsFound?.length ?? 0,
+      });
+
+      if (rec.reconciledType !== qCopy.type) {
         report.discrepancies.push({
           qNo: qCopy.qNo,
           issueType: 'type_mismatch',
-          details: `Visual scan categorized Q${qCopy.qNo} as [${qCopy.type}], but Answer Key indicates [${ak.type}]. Corrected to [${ak.type}].`,
+          details: `Visual scan categorized Q${qCopy.qNo} as [${qCopy.type}], but Answer Key indicates [${rec.reconciledType}]. Corrected to [${rec.reconciledType}].`,
         });
-        qCopy.type = ak.type.toLowerCase();
+        qCopy.type = rec.reconciledType;
       }
 
-      // Check NAT numerical values
-      if (ak.natValue != null || (ak.answer && !isNaN(Number(ak.answer.trim())))) {
-        const val = ak.natValue != null ? ak.natValue : Number(ak.answer.trim());
+      if (rec.isNat) {
         report.natValidatedCount++;
         qCopy.type = 'nat';
         report.discrepancies.push({
           qNo: qCopy.qNo,
           issueType: 'nat_value_attached',
-          details: `Q${qCopy.qNo} verified as Numerical/NAT with ground-truth value = ${val}`,
+          details: `Q${qCopy.qNo} verified as Numerical/NAT with ground-truth value = ${rec.natNumericValue ?? ak.answer}`,
         });
       }
     }

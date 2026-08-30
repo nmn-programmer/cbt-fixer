@@ -17,10 +17,10 @@ export interface GeminiModelInfo {
 /**
  * Supported Google AI Studio Free Tier Gemini models:
  * 1. gemini-3.5-flash (Flash: Fast & Reasoning)
- * 2. gemini-3.5-flash-lite (Flash: Subagent & High Throughput)
- * 3. gemini-3.1-flash-lite (Flash: Lightweight Tasks)
- * 4. gemini-2.5-flash (Flash: Standard Low Latency)
- * 5. gemini-2.5-pro (Pro: Complex Reasoning & STEM)
+ * 2. gemini-3.6-flash (Flash: Advanced Multimodal Vision & OCR)
+ * 3. gemini-3.5-flash-lite (Flash: Subagent & High Throughput)
+ * 4. gemini-3.1-flash-lite (Flash: Lightweight Tasks with Separate Quota Headroom)
+ * 5. gemini-3.1-pro-preview (Pro: Complex Reasoning & STEM)
  */
 export const GEMINI_MODELS_DESCENDING: GeminiModelInfo[] = [
   {
@@ -34,6 +34,16 @@ export const GEMINI_MODELS_DESCENDING: GeminiModelInfo[] = [
     rank: 1,
   },
   {
+    id: 'gemini-3.6-flash',
+    name: 'Gemini 3.6 Flash',
+    category: 'Flash (Vision & Precision)',
+    badge: 'Advanced Vision',
+    badgeColor: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+    description: 'Next-generation multimodal model with state-of-the-art bounding box coordinate extraction and complex formula reading.',
+    isFreeTierCompatible: true,
+    rank: 2,
+  },
+  {
     id: 'gemini-3.5-flash-lite',
     name: 'Gemini 3.5 Flash-Lite',
     category: 'Flash (Subagent & High Throughput)',
@@ -41,31 +51,21 @@ export const GEMINI_MODELS_DESCENDING: GeminiModelInfo[] = [
     badgeColor: 'bg-sky-500/15 text-sky-300 border-sky-500/30',
     description: 'Subagent-optimized high throughput model designed for parallel swarm extraction and low-latency OCR.',
     isFreeTierCompatible: true,
-    rank: 2,
+    rank: 3,
   },
   {
     id: 'gemini-3.1-flash-lite',
     name: 'Gemini 3.1 Flash-Lite',
     category: 'Flash (Lightweight Tasks)',
-    badge: 'Lightweight Tasks',
+    badge: 'Separate Quota Headroom',
     badgeColor: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30',
-    description: 'Fast lightweight engine with separate quota headroom for quick structure and layout parsing.',
-    isFreeTierCompatible: true,
-    rank: 3,
-  },
-  {
-    id: 'gemini-2.5-flash',
-    name: 'Gemini 2.5 Flash',
-    category: 'Flash (Standard Low Latency)',
-    badge: 'Standard Low Latency',
-    badgeColor: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
-    description: 'Reliable standard multimodal vision model with high document OCR accuracy and robust bounding box detection.',
+    description: 'Fast lightweight engine with independent quota headroom for quick structure, answer-key, and layout parsing.',
     isFreeTierCompatible: true,
     rank: 4,
   },
   {
-    id: 'gemini-2.5-pro',
-    name: 'Gemini 2.5 Pro',
+    id: 'gemini-3.1-pro-preview',
+    name: 'Gemini 3.1 Pro',
     category: 'Pro (Complex Reasoning & STEM)',
     badge: 'Pro Reasoning & STEM',
     badgeColor: 'bg-purple-500/15 text-purple-300 border-purple-500/30',
@@ -95,7 +95,7 @@ export function setStoredSelectedModel(modelId: string): void {
 }
 
 export function getStoredFallbackModelQueue(): string[] {
-  const defaultQueue = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro'];
+  const defaultQueue = ['gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.1-pro-preview'];
   if (typeof window === 'undefined') return defaultQueue;
   try {
     const raw = localStorage.getItem(FALLBACK_MODEL_QUEUE_STORAGE_KEY);
@@ -166,6 +166,23 @@ export function isTransientError(err: any): boolean {
     msg.includes('high demand') ||
     msg.includes('unavailable') ||
     msg.includes('overloaded')
+  );
+}
+
+/**
+ * Detects whether a specific model's per-user/daily quota or free tier limit has been exhausted
+ * so the engine can immediately skip to an alternate model family instead of retrying the exhausted model.
+ */
+export function isModelQuotaExhausted(err: any): boolean {
+  if (!err) return false;
+  const msg = String(err?.message || '').toLowerCase();
+  return (
+    msg.includes('tokens_per_model_per_user') ||
+    msg.includes('requests_per_model_per_user') ||
+    msg.includes('generate_content_tokens_per_model') ||
+    msg.includes('generate_content_free_tier') ||
+    msg.includes('limit: 25000000') ||
+    msg.includes('limit: 0')
   );
 }
 
@@ -291,6 +308,12 @@ export async function executeGeminiWithFallback<T = any>(
         if (is404) {
           console.warn(`[AI Engine] ${label} - Model ${model} returned 404/Not Found. Trying fallback model in chain...`);
           break; // move to next model in chain
+        }
+
+        // Check if per-model token quota or free tier limit is exhausted (e.g. 25M daily limit on gemini-3-flash)
+        if (isModelQuotaExhausted(err)) {
+          console.warn(`[AI Engine] ${label} - Model ${model} quota reached (${err.message?.slice(0, 120)}...). Immediately auto-switching to next model in queue...`);
+          break; // Do not waste retries on an exhausted model; failover immediately to next model family
         }
 
         const isTransient = isTransientError(err);

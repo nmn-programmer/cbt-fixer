@@ -725,6 +725,13 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
         });
       });
 
+      // Ensure valid sequential que numbering on all questions if missing or zero
+      allQuestions.forEach((q, idx) => {
+        if (!q.que || q.que <= 0) {
+          q.que = idx + 1;
+        }
+      });
+
       // Sort questions by their sequence number `que`
       allQuestions.sort((a, b) => (a.que || 0) - (b.que || 0));
 
@@ -732,7 +739,22 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
       const subjectMap = new Map<string, SubjectData>();
       const allocatedQuestionIds = new Set<string>();
 
-      ranges.forEach((range) => {
+      // Deep copy and sort ranges chronologically by start question number to ensure deterministic allocation
+      const sortedRanges = ranges.map((r) => ({ ...r })).sort((a, b) => a.fromQNo - b.fromQNo);
+
+      // Sanitize overlapping ranges: e.g. [1, 10] and [10, 20] -> [1, 10] and [11, 20]
+      for (let i = 0; i < sortedRanges.length - 1; i++) {
+        const curr = sortedRanges[i];
+        const next = sortedRanges[i + 1];
+        if (next.fromQNo <= curr.toQNo) {
+          console.warn(
+            `[Blueprint] Auto-adjusting overlapping range [${next.fromQNo}-${next.toQNo}] after [${curr.fromQNo}-${curr.toQNo}] to [${curr.toQNo + 1}-${next.toQNo}]`
+          );
+          next.fromQNo = Math.min(next.toQNo, curr.toQNo + 1);
+        }
+      }
+
+      sortedRanges.forEach((range) => {
         const subjName = range.subjectName.trim() || 'General';
         let subject = subjectMap.get(subjName);
         if (!subject) {
@@ -755,9 +777,9 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           subject.sections.push(section);
         }
 
-        // Find questions matching range [fromQNo, toQNo]
+        // Find questions matching range [fromQNo, toQNo] that haven't been assigned yet (prevent overlap duplication)
         const matchedQs = allQuestions.filter(
-          (q) => (q.que || 0) >= range.fromQNo && (q.que || 0) <= range.toQNo
+          (q) => !allocatedQuestionIds.has(q.id) && (q.que || 0) >= range.fromQNo && (q.que || 0) <= range.toQNo
         );
 
         matchedQs.forEach((q) => {

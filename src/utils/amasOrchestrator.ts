@@ -6,6 +6,7 @@ export type AgentRole = 'layout_worker' | 'diagram_auditor' | 'answer_linker' | 
 
 export interface SwarmAgent {
   id: string;
+  keyId?: string;
   key: string;
   label: string;
   role: AgentRole;
@@ -333,6 +334,18 @@ export function allocateSwarmFleet(
     availableKeys.push(dummyKey);
   }
 
+  // 1. Build list of usable keys, filtering out Invalid keys and active cooldowns
+  const now = Date.now();
+  let usableKeys = availableKeys.filter(
+    (k) => k.status !== 'Invalid' && (!snapshot.fallbackKeys.find((f) => f.id === k.id)?.exhaustedUntil || now >= (snapshot.fallbackKeys.find((f) => f.id === k.id)?.exhaustedUntil || 0))
+  );
+  if (usableKeys.length === 0) {
+    usableKeys = availableKeys.filter((k) => k.status !== 'Invalid');
+    if (usableKeys.length === 0) {
+      usableKeys = availableKeys;
+    }
+  }
+
   // Determine target role counts based on strategy & triage
   let targetWorkers = 1;
   let targetAuditors = 0;
@@ -349,20 +362,21 @@ export function allocateSwarmFleet(
     ratePacingMs = 1200; // Pacing for quota preservation
     batchSize = 2;
   } else if (strategy === 'balanced') {
-    const maxPoss = Math.max(1, availableKeys.length - 1);
+    const maxPoss = Math.max(1, usableKeys.length - 1);
     targetWorkers = Math.min(maxPoss, totalPagesToExtract);
-    if (totalPagesToExtract > 4 && availableKeys.length > 5) {
+    if (totalPagesToExtract > 4 && usableKeys.length > 5) {
       targetWorkers = Math.min(4, targetWorkers);
     }
-    targetAuditors = availableKeys.length >= 4 ? 1 : 0;
+    targetAuditors = usableKeys.length >= 4 ? 1 : 0;
     targetLinkers = 0;
     ratePacingMs = 600;
     batchSize = 2;
   } else if (strategy === 'turbo') {
-    const maxPoss = availableKeys.length; // Use all keys in turbo mode
+    // In turbo mode, distribute workers across usable keys while reserving a distinct manager if possible
+    const maxPoss = usableKeys.length > 1 ? usableKeys.length - 1 : 1;
     targetWorkers = Math.min(maxPoss, totalPagesToExtract);
-    targetAuditors = availableKeys.length >= 4 ? 1 : 0;
-    targetLinkers = availableKeys.length >= 5 ? 1 : 0;
+    targetAuditors = usableKeys.length >= 4 ? 1 : 0;
+    targetLinkers = usableKeys.length >= 5 ? 1 : 0;
     ratePacingMs = 250;
     batchSize = 2;
   } else if (strategy === 'autopilot' && triage) {
@@ -372,21 +386,21 @@ export function allocateSwarmFleet(
       targetLinkers = 0;
       ratePacingMs = 1000;
     } else if (triage.complexityScore >= 8) {
-      const maxPoss = Math.max(1, availableKeys.length - 1);
+      const maxPoss = Math.max(1, usableKeys.length - 1);
       targetWorkers = Math.min(maxPoss, totalPagesToExtract);
-      if (totalPagesToExtract > 6 && availableKeys.length > 7) {
+      if (totalPagesToExtract > 6 && usableKeys.length > 7) {
         targetWorkers = Math.min(6, targetWorkers);
       }
-      targetAuditors = availableKeys.length >= 3 ? 1 : 0;
-      targetLinkers = availableKeys.length >= 4 ? 1 : 0;
+      targetAuditors = usableKeys.length >= 3 ? 1 : 0;
+      targetLinkers = usableKeys.length >= 4 ? 1 : 0;
       ratePacingMs = 400;
     } else {
-      const maxPoss = Math.max(1, availableKeys.length - 1);
+      const maxPoss = Math.max(1, usableKeys.length - 1);
       targetWorkers = Math.min(maxPoss, totalPagesToExtract);
-      if (totalPagesToExtract > 4 && availableKeys.length > 5) {
+      if (totalPagesToExtract > 4 && usableKeys.length > 5) {
         targetWorkers = Math.min(4, targetWorkers);
       }
-      targetAuditors = availableKeys.length >= 4 ? 1 : 0;
+      targetAuditors = usableKeys.length >= 4 ? 1 : 0;
       targetLinkers = 0;
       ratePacingMs = 600;
     }
@@ -396,19 +410,39 @@ export function allocateSwarmFleet(
     targetLinkers = 0;
   }
 
-  // Allocate roles across available keys
+  // Multi-Agent Swarm Allocation with Non-Overlapping Key Balancing:
+  // If we have 2+ usable keys, isolate the Consensus Manager on the last key so merges never collide with worker OCR
+  const managerKeyItem = usableKeys.length > 1 ? usableKeys[usableKeys.length - 1] : usableKeys[0];
+  const rolePool = usableKeys.length > 1 ? usableKeys.slice(0, usableKeys.length - 1) : usableKeys;
+
+  // Track role assignments per key to balance load and eliminate modulo collisions
+  const keyAssignmentCounts: Record<string, number> = {};
+  const getNextRoleKey = () => {
+    let bestKey = rolePool[0];
+    let lowestScore = Infinity;
+    for (const k of rolePool) {
+      const assigned = keyAssignmentCounts[k.id] || 0;
+      const score = assigned * 20 + k.rpm;
+      if (score < lowestScore) {
+        lowestScore = score;
+        bestKey = k;
+      }
+    }
+    keyAssignmentCounts[bestKey.id] = (keyAssignmentCounts[bestKey.id] || 0) + 1;
+    return bestKey;
+  };
+
   const agents: SwarmAgent[] = [];
   const workers: SwarmAgent[] = [];
   const auditors: SwarmAgent[] = [];
   const linkers: SwarmAgent[] = [];
 
-  let keyIndex = 0;
-
-  // 1. Assign Workers
+  // 1. Assign Workers with balanced keys
   for (let w = 0; w < targetWorkers; w++) {
-    const keyItem = availableKeys[keyIndex % availableKeys.length];
+    const keyItem = getNextRoleKey();
     const agent: SwarmAgent = {
-      id: keyItem.id,
+      id: `worker_${w + 1}_${keyItem.id}`,
+      keyId: keyItem.id,
       key: keyItem.key,
       label: keyItem.label,
       role: 'layout_worker',
@@ -422,14 +456,14 @@ export function allocateSwarmFleet(
     };
     workers.push(agent);
     agents.push(agent);
-    keyIndex++;
   }
 
-  // 2. Assign Diagram Auditor if requested and keys available
-  if (targetAuditors > 0 && availableKeys.length > 2) {
-    const keyItem = availableKeys[keyIndex % availableKeys.length];
+  // 2. Assign Diagram Auditor with separate key if requested
+  if (targetAuditors > 0 && rolePool.length > 1) {
+    const keyItem = getNextRoleKey();
     const agent: SwarmAgent = {
-      id: keyItem.id,
+      id: `auditor_1_${keyItem.id}`,
+      keyId: keyItem.id,
       key: keyItem.key,
       label: keyItem.label,
       role: 'diagram_auditor',
@@ -442,14 +476,14 @@ export function allocateSwarmFleet(
     };
     auditors.push(agent);
     agents.push(agent);
-    keyIndex++;
   }
 
-  // 3. Assign Answer Linker if requested and keys available
-  if (targetLinkers > 0 && availableKeys.length > 3) {
-    const keyItem = availableKeys[keyIndex % availableKeys.length];
+  // 3. Assign Answer Linker with separate key if requested
+  if (targetLinkers > 0 && rolePool.length > 2) {
+    const keyItem = getNextRoleKey();
     const agent: SwarmAgent = {
-      id: keyItem.id,
+      id: `linker_1_${keyItem.id}`,
+      keyId: keyItem.id,
       key: keyItem.key,
       label: keyItem.label,
       role: 'answer_linker',
@@ -462,14 +496,12 @@ export function allocateSwarmFleet(
     };
     linkers.push(agent);
     agents.push(agent);
-    keyIndex++;
   }
 
   // 4. Assign Dedicated Consensus & Compilation Manager (Merger)
-  // Always reserve the highest/last distinct key or fallback to key 0
-  const managerKeyItem = availableKeys.length > 1 ? availableKeys[availableKeys.length - 1] : availableKeys[0];
   const managerAgent: SwarmAgent = {
-    id: managerKeyItem.id,
+    id: `manager_1_${managerKeyItem.id}`,
+    keyId: managerKeyItem.id,
     key: managerKeyItem.key,
     label: managerKeyItem.label,
     role: 'consensus_manager',
@@ -483,7 +515,7 @@ export function allocateSwarmFleet(
   agents.push(managerAgent);
 
   // Compute estimated performance and quota metrics
-  const totalKeysAssigned = new Set(agents.map((a) => a.id)).size;
+  const totalKeysAssigned = new Set(agents.map((a) => a.keyId || a.key)).size;
   const estimatedRpm = Math.min(60, Math.round((60000 / ratePacingMs) * (workers.length > 1 ? 0.75 : 0.5)));
   const estimatedDurationSec = Math.max(10, Math.round(45 / Math.max(1, workers.length)));
   const quotaSavingsPercent = strategy === 'eco' ? 70 : strategy === 'balanced' ? 40 : strategy === 'turbo' ? 10 : 45;

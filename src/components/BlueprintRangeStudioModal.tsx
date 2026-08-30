@@ -418,29 +418,35 @@ export const BlueprintRangeStudioModal: React.FC = () => {
       setIsScanningAi(true);
       setAiScanStatus('Reading instruction content...');
 
-      let base64Image = '';
+      let base64Images: string[] = [];
       if (imageFile) {
         if (imageFile.type.includes('pdf') || imageFile.name.endsWith('.pdf')) {
           const pdfjsLib = await getPdfjsLib();
           const arrayBuffer = await imageFile.arrayBuffer();
           const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-          const page = await pdfDoc.getPage(1);
-          const viewport = page.getViewport({ scale: 2.0 });
-          const canvas = document.createElement('canvas');
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) throw new Error('Canvas context error');
-
-          await page.render({ canvasContext: ctx, viewport, canvas: canvas as any }).promise;
-          base64Image = canvas.toDataURL('image/jpeg', 0.9);
+          const pagesToScan = Math.min(pdfDoc.numPages, 5);
+          for (let p = 1; p <= pagesToScan; p++) {
+            const page = await pdfDoc.getPage(p);
+            const viewport = page.getViewport({ scale: 1.8 });
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.fillStyle = '#ffffff';
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              await page.render({ canvasContext: ctx, viewport } as any).promise;
+              base64Images.push(canvas.toDataURL('image/jpeg', 0.85));
+            }
+          }
         } else {
-          base64Image = await new Promise<string>((resolve, reject) => {
+          const singleImg = await new Promise<string>((resolve, reject) => {
             const reader = new FileReader();
             reader.onload = () => resolve(reader.result as string);
             reader.onerror = reject;
             reader.readAsDataURL(imageFile);
           });
+          base64Images.push(singleImg);
         }
       }
 
@@ -452,7 +458,8 @@ export const BlueprintRangeStudioModal: React.FC = () => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            image: base64Image || undefined,
+            image: base64Images[0] || undefined,
+            images: base64Images,
             text: rawInstructionsText.trim() || undefined,
           }),
         },

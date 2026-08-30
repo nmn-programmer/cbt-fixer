@@ -307,7 +307,7 @@ export const AnswerKeyStudioModal: React.FC = () => {
         const arrayBuffer = await file.arrayBuffer();
         const pdfjsLib = await getPdfjsLib();
         const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-        const numPages = Math.min(pdfDoc.numPages, 10);
+        const numPages = Math.min(pdfDoc.numPages, 50);
 
         for (let i = 1; i <= numPages; i++) {
           const page = await pdfDoc.getPage(i);

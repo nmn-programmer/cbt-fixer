@@ -330,6 +330,121 @@ function parseCsvAnswerKey(csvText: string): AnswerKeyParseResult {
   };
 }
 
+export interface QuestionTypeContext {
+  sectionName?: string;
+  existingQuestionType?: string;
+  hasOptions?: boolean;
+  numOptions?: number;
+  explicitType?: string;
+  natValue?: number | null;
+}
+
+export interface ReconciledAnswerResult {
+  reconciledType: 'mcq' | 'msq' | 'nat' | 'msm';
+  normalizedAnswer: string;
+  letterAnswer: string;
+  isNat: boolean;
+  natNumericValue?: number;
+}
+
+/**
+ * Authoritative Question Type & Answer Reconciliation Engine (Audit 6.1 / 6.5 / 8.2 / 8.3)
+ * Centralizes type inference so 5-choice MCQs, letter answers, and numerical questions
+ * are consistently resolved without silent corruption.
+ */
+export function reconcileQuestionTypeAndAnswer(
+  rawAnswerInput: string | number,
+  context: QuestionTypeContext = {}
+): ReconciledAnswerResult {
+  const rawAnswer = String(rawAnswerInput ?? '').trim();
+  const secName = (context.sectionName || '').toLowerCase();
+  const existingType = (context.existingQuestionType || '').toLowerCase();
+  const explicitType = (context.explicitType || '').toLowerCase();
+
+  // 1. Check explicit type signal
+  let inferred: 'mcq' | 'msq' | 'nat' | 'msm' = 'mcq';
+  if (['mcq', 'msq', 'nat', 'msm'].includes(explicitType)) {
+    inferred = explicitType as any;
+  } else if (['mcq', 'msq', 'nat', 'msm'].includes(existingType)) {
+    inferred = existingType as any;
+  }
+
+  // 2. Section name context clues
+  const isNatSection = (
+    secName.includes('numerical') ||
+    secName.includes('integer') ||
+    secName.includes('nat') ||
+    secName.includes('value type') ||
+    secName.includes('section b') ||
+    secName.includes('part b') ||
+    secName.includes('non-mcq')
+  ) && !secName.includes('mcq') && !secName.includes('single') && !secName.includes('multiple choice');
+
+  const isMcqSection = (
+    secName.includes('single correct') ||
+    secName.includes('multiple choice') ||
+    secName.includes('one correct') ||
+    secName.includes('mcq') ||
+    secName.includes('section a') ||
+    secName.includes('part a')
+  );
+
+  const isMsqSection = secName.includes('multiple correct') || secName.includes('one or more') || secName.includes('msq');
+  const isMsmSection = secName.includes('matrix') || secName.includes('matching') || secName.includes('column match');
+
+  // 3. Inspect rawAnswer format
+  const hasCommaOrSemi = rawAnswer.includes(',') || rawAnswer.includes(';');
+  const isMultiLetter = rawAnswer.length > 1 && /^[A-H]{2,}$/i.test(rawAnswer);
+  const isMatrixMatch = rawAnswer.includes('->') || rawAnswer.includes('=') || /^[P-S]->/i.test(rawAnswer);
+
+  const isPureNumber = rawAnswer !== '' && !isNaN(Number(rawAnswer));
+  const numVal = isPureNumber ? Number(rawAnswer) : undefined;
+  const isDecimal = isPureNumber && rawAnswer.includes('.');
+  const isNegative = isPureNumber && Number(rawAnswer) < 0;
+  // Option digits 1-8 (supports 4, 5, 6, and 8 option exams without false NAT corruption)
+  const isOptionDigit = ['1', '2', '3', '4', '5', '6', '7', '8'].includes(rawAnswer);
+
+  if (isMatrixMatch || isMsmSection) {
+    inferred = 'msm';
+  } else if (hasCommaOrSemi || isMultiLetter || isMsqSection) {
+    inferred = 'msq';
+  } else if (context.natValue != null || isDecimal || isNegative || (isPureNumber && !isOptionDigit)) {
+    // Definite NAT: decimal (3.14), negative (-4), or integer > 8 (e.g. 24, 150)
+    inferred = 'nat';
+  } else if (isPureNumber && isOptionDigit) {
+    // Ambiguous single digit ("1"-"8")
+    if (explicitType === 'nat' || (isNatSection && !context.hasOptions)) {
+      inferred = 'nat';
+    } else {
+      // Default: It is an MCQ single-choice option index!
+      inferred = 'mcq';
+    }
+  } else if (/^[A-H]$/i.test(rawAnswer)) {
+    // Single letter A-H is definitely MCQ
+    inferred = 'mcq';
+  }
+
+  // Format Letter vs Index
+  let letterAnswer = rawAnswer;
+  let normalizedAnswer = rawAnswer;
+
+  if (inferred === 'mcq') {
+    letterAnswer = optionIndexToLetter(rawAnswer);
+    normalizedAnswer = letterToOptionIndex(rawAnswer);
+  } else if (inferred === 'msq') {
+    letterAnswer = optionIndicesToLetters(rawAnswer);
+    normalizedAnswer = letterListToOptionIndices(rawAnswer);
+  }
+
+  return {
+    reconciledType: inferred,
+    normalizedAnswer,
+    letterAnswer,
+    isNat: inferred === 'nat',
+    natNumericValue: inferred === 'nat' && isPureNumber ? numVal : (context.natValue ?? undefined),
+  };
+}
+
 /**
  * Extracts and normalizes question answer, letters, and inferred question type from raw object/string.
  */
@@ -340,24 +455,22 @@ function extractAnswerFromVal(
   val: any
 ): NormalizedAnswerItem {
   let rawAnswer = '';
-  let normalizedAnswer = '';
-  let letterAnswer = '';
-  let inferredType: QuestionType = 'mcq';
+  let explicitType: string | undefined;
 
   if (typeof val === 'string' || typeof val === 'number') {
     rawAnswer = String(val).trim();
   } else if (val && typeof val === 'object') {
     if (val.correctOption !== undefined) {
       rawAnswer = String(val.correctOption).trim();
-      inferredType = 'mcq';
+      explicitType = 'mcq';
     } else if (val.correctOptions !== undefined) {
       rawAnswer = Array.isArray(val.correctOptions)
         ? val.correctOptions.join(',')
         : String(val.correctOptions).trim();
-      inferredType = 'msq';
+      explicitType = 'msq';
     } else if (val.correctAnswer !== undefined) {
       rawAnswer = String(val.correctAnswer).trim();
-      inferredType = 'nat';
+      explicitType = 'nat';
     } else if (val.answer !== undefined) {
       rawAnswer = String(val.answer).trim();
     } else if (val.opt !== undefined) {
@@ -365,37 +478,19 @@ function extractAnswerFromVal(
     }
   }
 
-  // Determine Inferred Type if not explicitly tagged
-  if (inferredType === 'mcq' && val && typeof val === 'object' && val.correctOption === undefined) {
-    if (rawAnswer.includes(',') || rawAnswer.includes(';') || rawAnswer.length > 1 && /^[A-D]{2,}$/i.test(rawAnswer)) {
-      inferredType = 'msq';
-    } else if (/^-?\d+(\.\d+)?$/.test(rawAnswer) && parseInt(rawAnswer, 10) > 4) {
-      inferredType = 'nat';
-    } else if (rawAnswer.includes('->') || rawAnswer.includes('=')) {
-      inferredType = 'msm';
-    }
-  }
-
-  // Format Letter vs Index
-  if (inferredType === 'mcq') {
-    letterAnswer = optionIndexToLetter(rawAnswer);
-    normalizedAnswer = letterToOptionIndex(rawAnswer);
-  } else if (inferredType === 'msq') {
-    letterAnswer = optionIndicesToLetters(rawAnswer);
-    normalizedAnswer = letterListToOptionIndices(rawAnswer);
-  } else {
-    letterAnswer = rawAnswer;
-    normalizedAnswer = rawAnswer;
-  }
+  const rec = reconcileQuestionTypeAndAnswer(rawAnswer, {
+    sectionName,
+    explicitType,
+  });
 
   return {
     sectionName,
     questionNumber,
     questionKey,
     rawAnswer,
-    normalizedAnswer,
-    letterAnswer,
-    inferredType,
+    normalizedAnswer: rec.normalizedAnswer,
+    letterAnswer: rec.letterAnswer,
+    inferredType: rec.reconciledType,
     rawEntry: val,
   };
 }

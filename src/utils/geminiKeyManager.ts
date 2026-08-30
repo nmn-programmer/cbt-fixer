@@ -871,6 +871,13 @@ export function getOrchestratedKeyPool(): OrchestratedPoolResult {
   };
 }
 
+// In-flight concurrency load tracking to prevent TOCTOU race under real parallelism
+const inFlightRequestsMap = new Map<string, number>();
+
+export function getInFlightRequestCount(keyId: string): number {
+  return inFlightRequestsMap.get(keyId) || 0;
+}
+
 let currentKeyRotationIndex = 0;
 
 /**
@@ -1052,18 +1059,27 @@ export async function fetchWithGeminiFallback(
     }
   }
 
-  // Smart Pre-emptive Load Balancer:
-  // Sort usable candidates by lowest current RPM usage first, so keys nearing 15 RPM (>= 12 RPM) are routed away from!
-  usableCandidates.sort((a, b) => a.rpmCount - b.rpmCount);
+  // Multi-Key Round-Robin with 15 RPM ceiling protection & in-flight load balancing (TOCTOU protection):
+  const getCandidateLoad = (c: KeyCandidate) => c.rpmCount + (inFlightRequestsMap.get(c.id) || 0) * 3;
 
-  // Rotate tie-breakers with equal RPMs
-  if (usableCandidates.length > 1 && usableCandidates[0].rpmCount === usableCandidates[1].rpmCount) {
-    const startIdx = currentKeyRotationIndex % usableCandidates.length;
+  // 1. Separate candidates nearing quota limit (>= 13 RPM equivalent load)
+  const safeCandidates = usableCandidates.filter((c) => getCandidateLoad(c) < 13);
+  const nearLimitCandidates = usableCandidates.filter((c) => getCandidateLoad(c) >= 13);
+
+  // 2. Perform True Round-Robin across safe candidates
+  if (safeCandidates.length > 1) {
+    const rotIdx = currentKeyRotationIndex % safeCandidates.length;
     currentKeyRotationIndex++;
     usableCandidates = [
-      ...usableCandidates.slice(startIdx),
-      ...usableCandidates.slice(0, startIdx),
+      ...safeCandidates.slice(rotIdx),
+      ...safeCandidates.slice(0, rotIdx),
+      ...nearLimitCandidates,
     ];
+  } else if (safeCandidates.length === 1) {
+    usableCandidates = [...safeCandidates, ...nearLimitCandidates];
+  } else {
+    // If all are near limit, sort by lowest effective load
+    usableCandidates.sort((a, b) => getCandidateLoad(a) - getCandidateLoad(b));
   }
 
   // Prioritize preferred key if specified
@@ -1075,6 +1091,11 @@ export async function fetchWithGeminiFallback(
       const preferredCand = usableCandidates[preferredCandIdx];
       usableCandidates.splice(preferredCandIdx, 1);
       usableCandidates.unshift(preferredCand);
+    } else {
+      const foundInAll = allConfiguredCandidates.find((c) => c.key.trim() === preferredKey?.trim());
+      if (foundInAll) {
+        console.warn(`[Load Balancer] Preferred key "${foundInAll.label}" is currently in cooldown/rate-limited. Routing through active pool.`);
+      }
     }
   }
 
@@ -1084,34 +1105,38 @@ export async function fetchWithGeminiFallback(
     const candidate = usableCandidates[cIdx];
     const isLastCandidate = cIdx === usableCandidates.length - 1;
 
-    // Record usage for metrics tracking
-    recordRequestUsage(candidate.id);
-    onStateUpdate?.();
+    // Track active in-flight request to prevent race conditions during concurrent worker sweeps
+    inFlightRequestsMap.set(candidate.id, (inFlightRequestsMap.get(candidate.id) || 0) + 1);
 
-    const headers = new Headers(modifiedOptions.headers || {});
-    headers.set('Authorization', `Bearer ${candidate.key}`);
+    try {
+      // Record usage for metrics tracking
+      recordRequestUsage(candidate.id);
+      onStateUpdate?.();
 
-    let res: Response | null = null;
-    const maxAttempts = 2;
-    const reqStart = Date.now();
+      const headers = new Headers(modifiedOptions.headers || {});
+      headers.set('Authorization', `Bearer ${candidate.key}`);
 
-    // Attempt request with exponential backoff for 500/503 errors
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        res = await fetch(url, { ...modifiedOptions, headers });
+      let res: Response | null = null;
+      const maxAttempts = 2;
+      const reqStart = Date.now();
 
-        if ((res.status === 500 || res.status === 503 || res.status === 502) && attempt < maxAttempts) {
-          await sleep(attempt * 500);
-          continue;
-        }
-        break;
-      } catch (err: any) {
-        lastError = err;
-        if (attempt < maxAttempts) {
-          await sleep(attempt * 500);
+      // Attempt request with exponential backoff and randomized jitter for 500/503 errors
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          res = await fetch(url, { ...modifiedOptions, headers });
+
+          if ((res.status === 500 || res.status === 503 || res.status === 502) && attempt < maxAttempts) {
+            await sleep(calculateExponentialBackoffWithJitter(attempt));
+            continue;
+          }
+          break;
+        } catch (err: any) {
+          lastError = err;
+          if (attempt < maxAttempts) {
+            await sleep(calculateExponentialBackoffWithJitter(attempt));
+          }
         }
       }
-    }
 
     const latencyMs = Date.now() - reqStart;
     if (res) {
@@ -1259,7 +1284,145 @@ export async function fetchWithGeminiFallback(
 
     // Success response or final handled response
     return res;
+    } finally {
+      const currInFlight = inFlightRequestsMap.get(candidate.id) || 1;
+      inFlightRequestsMap.set(candidate.id, Math.max(0, currInFlight - 1));
+    }
   }
 
   throw new Error('All API key fallback attempts failed.');
+}
+
+/**
+ * Count configured, active, non-invalid API keys
+ */
+export function getActiveKeysCount(): number {
+  const primary = getStoredPrimaryApiKey();
+  const primaryInfo = getStoredPrimaryStatus();
+  const now = Date.now();
+
+  let count = 0;
+  if (primary && primaryInfo.status !== 'Invalid' && (!primaryInfo.exhaustedUntil || now >= primaryInfo.exhaustedUntil)) {
+    count++;
+  }
+
+  const fallbacks = getStoredFallbackKeys();
+  for (const fb of fallbacks) {
+    if (fb.key.trim() && fb.status !== 'Invalid' && (!fb.exhaustedUntil || now >= fb.exhaustedUntil)) {
+      count++;
+    }
+  }
+
+  return Math.max(1, count);
+}
+
+/**
+ * Returns remaining cooldown seconds for a given key ID, or 0 if not cooling down
+ */
+export function getKeyCooldownSecondsRemaining(keyId: string): number {
+  const now = Date.now();
+  if (keyId === 'primary') {
+    const primaryInfo = getStoredPrimaryStatus();
+    if (primaryInfo.exhaustedUntil && primaryInfo.exhaustedUntil > now) {
+      return Math.ceil((primaryInfo.exhaustedUntil - now) / 1000);
+    }
+    return 0;
+  }
+
+  const fallbacks = getStoredFallbackKeys();
+  const fb = fallbacks.find((f) => f.id === keyId);
+  if (fb?.exhaustedUntil && fb.exhaustedUntil > now) {
+    return Math.ceil((fb.exhaustedUntil - now) / 1000);
+  }
+  return 0;
+}
+
+/**
+ * Calculates adaptive jitter pacing delay in milliseconds.
+ * Designed specifically for Free Tier Gemini Keys (15 RPM hard quota per key).
+ * Delays scale inversely with the active pool size:
+ * 1 Key: ~4000ms - 4600ms (keeps safely under 15 RPM)
+ * 2 Keys: ~2000ms - 2600ms
+ * 3 Keys: ~1400ms - 1900ms
+ */
+export function calculateAdaptiveJitterDelay(activeKeysCount?: number): number {
+  const poolSize = activeKeysCount !== undefined ? activeKeysCount : getActiveKeysCount();
+  // Base pacing for 14 RPM safe ceiling (leaving 1 RPM buffer for bursts)
+  const baseMs = Math.max(800, Math.floor(60000 / (Math.max(1, poolSize) * 14)));
+  // Intelligent random jitter (150ms to 550ms) to desynchronize burst spikes
+  const jitterMs = Math.floor(Math.random() * 400) + 150;
+  return baseMs + jitterMs;
+}
+
+/**
+ * Applies adaptive jitter rate pacing before making a Gemini API call.
+ * Returns the actual millisecond delay that was waited.
+ */
+export async function applyAdaptiveJitterRatePacing(activeKeysCount?: number): Promise<number> {
+  const delayMs = calculateAdaptiveJitterDelay(activeKeysCount);
+  await sleep(delayMs);
+  return delayMs;
+}
+
+/**
+ * Get next key in round-robin order without firing a network request
+ */
+export function getNextRotatedKey(): {
+  id: string;
+  key: string;
+  label: string;
+  status: ApiKeyStatus;
+  isCooldown: boolean;
+  cooldownRemainingSec: number;
+} | null {
+  const primary = getStoredPrimaryApiKey();
+  const candidates: Array<{
+    id: string;
+    key: string;
+    label: string;
+    status: ApiKeyStatus;
+    isCooldown: boolean;
+    cooldownRemainingSec: number;
+  }> = [];
+  const now = Date.now();
+
+  if (primary) {
+    const primaryInfo = getStoredPrimaryStatus();
+    const isCooldown = Boolean(primaryInfo.exhaustedUntil && now < primaryInfo.exhaustedUntil);
+    const cooldownRemainingSec = isCooldown ? Math.ceil((primaryInfo.exhaustedUntil! - now) / 1000) : 0;
+    candidates.push({
+      id: 'primary',
+      key: primary,
+      label: 'Primary Key',
+      status: primaryInfo.status,
+      isCooldown,
+      cooldownRemainingSec,
+    });
+  }
+
+  const fallbacks = getStoredFallbackKeys();
+  fallbacks.forEach((fb, idx) => {
+    if (fb.key.trim()) {
+      const isCooldown = Boolean(fb.exhaustedUntil && now < fb.exhaustedUntil);
+      const cooldownRemainingSec = isCooldown ? Math.ceil((fb.exhaustedUntil! - now) / 1000) : 0;
+      candidates.push({
+        id: fb.id,
+        key: fb.key,
+        label: fb.label || `Fallback Key ${idx + 1}`,
+        status: fb.status,
+        isCooldown,
+        cooldownRemainingSec,
+      });
+    }
+  });
+
+  const nonInvalid = candidates.filter((c) => c.status !== 'Invalid');
+  if (nonInvalid.length === 0) return null;
+
+  // Filter non-cooldown candidates first
+  const active = nonInvalid.filter((c) => !c.isCooldown);
+  const pool = active.length > 0 ? active : nonInvalid;
+
+  const selected = pool[currentKeyRotationIndex % pool.length];
+  return selected;
 }

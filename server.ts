@@ -395,6 +395,7 @@ CRITICAL BOUNDING BOX & COLUMN PROTOCOL (3-LINE STRUCTURAL & Q_n -> Q_n+1 PAIRIN
    - Y_MIN: Upper bound MUST start immediately before the start of Question Q_n label (e.g. "Q.15", "15.").
    - Y_MAX: Lower bound MUST extend down to immediately before the start of the next question label Q_(n+1) in the same column/page.
    - For the LAST question in a column/page, Y_MAX extends down to the column bottom margin line before the page footer.
+   - CRITICAL BOUNDING DIRECTIVE: A question's bounding box MUST encompass the question number, complete text prompt, any attached diagrams/tables/figures, and all associated multiple-choice options until the exact start of the next question.
 
 3. DYNAMIC COLUMN OVERFLOW & MULTI-PAGE SPLIT EXCEPTION:
    - If Question Q_n ends before listing all options (or Q_(n+1) is in a different column or next page):
@@ -515,6 +516,7 @@ app.post('/api/extract-questions-pass1', async (req, res) => {
       expectedQuestions,
       targetQNos,
       options = {},
+      columnContext,
       model: requestedModel
     } = req.body;
 
@@ -604,10 +606,14 @@ app.post('/api/extract-questions-pass1', async (req, res) => {
       required: ["questions"]
     };
 
-    const prompt = `You are a world-class exam layout & question detection specialist for JEE / NEET / CBSE test papers.
-Analyze Page ${pageIndex} of ${documentName || 'the document'}.
-
-CRITICAL BOUNDING BOX & COLUMN PROTOCOL (3-LINE STRUCTURAL & Q_n -> Q_n+1 PAIRING):
+    const isSingleColumnSlice = Boolean(columnContext?.isColumn);
+    const layoutDirective = isSingleColumnSlice
+      ? `PRE-PROCESSED SINGLE-COLUMN SLICE DIRECTIVE (${columnContext.columnLabel || 'Column ' + (columnContext.columnIndex || 1)} of Page ${pageIndex}):
+- This input image has already been cropped to a clean SINGLE vertical column.
+- All questions flow strictly vertically down this single column.
+- The horizontal bounds for every question should encompass the entire column width (xmin ~ 0.01-0.04 to xmax ~ 0.96-0.99).
+- Do NOT search for a central divider line inside this image; the page gutter has already been separated.`
+      : `CRITICAL BOUNDING BOX & COLUMN PROTOCOL (3-LINE STRUCTURAL & Q_n -> Q_n+1 PAIRING):
 
 1. 3-LINE STRUCTURAL BOUNDARY LOCK (X-Axis Zero Clipping):
    - Locate the 3 vertical boundary lines across the page: Left Margin Line (~0.035), Central Column Divider Line (~0.500), and Right Margin Line (~0.965).
@@ -618,18 +624,32 @@ CRITICAL BOUNDING BOX & COLUMN PROTOCOL (3-LINE STRUCTURAL & Q_n -> Q_n+1 PAIRIN
      * xmin MUST start PRECISELY past the Central Column Divider (xmin >= 0.510).
      * xmax MUST extend to the Right Margin Line (xmax >= 0.965).
    - Full-Width Banners / Spanning Diagrams:
-     * If a question, table, or physics/chemistry diagram spans across the central divider, set xmin <= 0.035 and xmax >= 0.965 (full page width).
+     * If a question, table, or physics/chemistry diagram spans across the central divider, set xmin <= 0.035 and xmax >= 0.965 (full page width).`;
+
+    const prompt = `You are a world-class exam layout & question detection specialist for JEE / NEET / CBSE test papers.
+Analyze ${isSingleColumnSlice ? `${columnContext.columnLabel || 'Column ' + columnContext.columnIndex} of Page ${pageIndex}` : `Page ${pageIndex}`} of ${documentName || 'the document'}.
+
+${layoutDirective}
 
 2. VERTICAL QUESTION-PAIR PAIRING (Y-Axis Q_n to Q_n+1 Protocol):
    - Y_MIN: Upper bound MUST start immediately before the start of Question Q_n label (e.g. "Q.15", "15.").
    - Y_MAX: Lower bound MUST extend down to immediately before the start of the next question label Q_(n+1) in the same column/page.
    - For the LAST question in a column/page, Y_MAX extends down to the column bottom margin line before the page footer.
+   - CRITICAL BOUNDING DIRECTIVE: A question's bounding box MUST encompass the question number, complete text prompt, any attached diagrams/tables/figures, and all associated multiple-choice options until the exact start of the next question.
 
-3. DYNAMIC COLUMN OVERFLOW & MULTI-PAGE SPLIT EXCEPTION:
-   - If Question Q_n ends before listing all options (or Q_(n+1) is in a different column or next page):
-     * Mark "isSplit": true, "completeness": "split".
-     * Set Part 1 Y_MAX to the bottom line of the current column.
-   - If the top of a column starts with orphaned options without a new Q-number, mark "isOrphanContinuation": true and "continuationForQNo" to preceding Q-number.
+3. INTELLIGENT SPLIT & PAGE/COLUMN TRANSITION PROTOCOL:
+   - Bottom-of-Slice/Page Cutoff (Question spills over):
+     * If a question stem, formula, or options (e.g. only A & B present) is cut off at the bottom because the rest continues on the next column or next page:
+       - Set "isSplit": true, "completeness": "split".
+       - Set Part 1 bounding box to enclose all visible text/diagram down to the bottom margin line.
+   - Top-of-Slice/Page Continuation (Orphaned options / formulas from previous question):
+     * If this image begins at the top with options (e.g. "(c)", "(d)", "(3)", "(4)") or an unfinished sentence continuing from the previous question WITHOUT a new question number:
+       - Set "isOrphanContinuation": true.
+       - Set "continuationForQNo" to the preceding question number.
+       - Set "completeness": "continuation_only".
+       - Set bounding box [ymin, xmin, ymax, xmax] around these continuation options from top margin down to the start of the next question.
+   - Diagram & Formula Enclosure:
+     * A question's bounding box MUST encompass the question number, complete text prompt, any attached diagrams/tables/figures, and all associated multiple-choice options until the exact start of the next question.
 
 ${pageAssignmentsSummary ? `DOCUMENT CONTEXT & PAGE ROLES:
 ${pageAssignmentsSummary}` : ''}
@@ -986,9 +1006,10 @@ ${context?.subjects ? `Expected Subjects: ${JSON.stringify(context.subjects)}.` 
     // PASS 2: VERIFICATION RESCAN AUDIT PASS FOR HIGH ACCURACY
     if (req.body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
       try {
+        const pass1Summary = resultData.answers.map((a: any) => `Q${a.qNo}:${a.answer}`).join(', ');
         const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
 Below is the initial raw answer key extracted from Pass 1:
-${JSON.stringify(resultData.answers.slice(0, 150))}
+${pass1Summary}
 
 CRITICAL VERIFICATION TASKS FOR PASS 2:
 1. MISSING QUESTION DETECTIVE: Scan the image/text to ensure NO question numbers were skipped in the sequence (e.g. Q1 to Q100). If any question number is missing, locate it in adjacent columns/tables and add it.
@@ -1013,8 +1034,24 @@ Return the complete, audited and verified answer key mapping.`;
           label: 'Server Pass 2 Answer Key Audit'
         });
 
-        if (audited && audited.answers && audited.answers.length >= resultData.answers.length) {
-          resultData = audited;
+        if (audited && audited.answers && Array.isArray(audited.answers)) {
+          const pass1Map = new Map<number, any>();
+          resultData.answers.forEach((a: any) => {
+            if (a && a.qNo != null) pass1Map.set(a.qNo, a);
+          });
+          audited.answers.forEach((auditedA: any) => {
+            if (!auditedA || auditedA.qNo == null) return;
+            const existing = pass1Map.get(auditedA.qNo);
+            if (!existing) {
+              pass1Map.set(auditedA.qNo, auditedA);
+            } else {
+              if (auditedA.answer && auditedA.answer.trim()) existing.answer = auditedA.answer;
+              if (auditedA.inferredType) existing.inferredType = auditedA.inferredType;
+              if (auditedA.normalizedAnswer) existing.normalizedAnswer = auditedA.normalizedAnswer;
+              if (auditedA.subject && !existing.subject) existing.subject = auditedA.subject;
+            }
+          });
+          resultData.answers = Array.from(pass1Map.values()).sort((a, b) => a.qNo - b.qNo);
         }
       } catch (e) {
         console.warn('Pass 2 answer key verification pass skipped due to error:', e);
@@ -1091,9 +1128,10 @@ Support multi-column tables, grids, and matrix match keys. Output complete and a
     // PASS 2: VERIFICATION AUDIT RESCAN
     if (req.body.options?.enableDoublePass !== false && resultData.answers && resultData.answers.length > 0) {
       try {
+        const pass1Summary = resultData.answers.map((a: any) => `Q${a.qNo}:${a.answer}`).join(', ');
         const auditPrompt = `PASS 2 VERIFICATION & RESCAN AUDIT FOR MAXIMUM ACCURACY:
 Below is the initial answer key extracted from Pass 1:
-${JSON.stringify(resultData.answers.slice(0, 150))}
+${pass1Summary}
 
 Verify that NO question numbers are missing, fix OCR typos, and return the audited, complete answer key table.`;
 
@@ -1105,8 +1143,22 @@ Verify that NO question numbers are missing, fix OCR typos, and return the audit
           label: 'Server Pass 2 Answer Key Page Audit'
         });
 
-        if (audited && audited.answers && audited.answers.length >= resultData.answers.length) {
-          resultData = audited;
+        if (audited && audited.answers && Array.isArray(audited.answers)) {
+          const pass1Map = new Map<number, any>();
+          resultData.answers.forEach((a: any) => {
+            if (a && a.qNo != null) pass1Map.set(a.qNo, a);
+          });
+          audited.answers.forEach((auditedA: any) => {
+            if (!auditedA || auditedA.qNo == null) return;
+            const existing = pass1Map.get(auditedA.qNo);
+            if (!existing) {
+              pass1Map.set(auditedA.qNo, auditedA);
+            } else {
+              if (auditedA.answer && auditedA.answer.trim()) existing.answer = auditedA.answer;
+              if (auditedA.subject && !existing.subject) existing.subject = auditedA.subject;
+            }
+          });
+          resultData.answers = Array.from(pass1Map.values()).sort((a, b) => a.qNo - b.qNo);
         }
       } catch (e) {
         // ignore
