@@ -70,6 +70,9 @@ import {
   AiProcessingMonitorModal,
   emitWorkerLog,
   PagePartitionState,
+  subscribeWorkerLogs,
+  getGlobalWorkerLogs,
+  WorkerActivityLog,
 } from './AiProcessingMonitorModal';
 import {
   saveConversionCheckpoint,
@@ -99,6 +102,7 @@ import {
   analyzePageLayoutAndSpans,
   cropBoxWithSpanAwareness,
   rectifyQuestionBoundingBoxes,
+  rectifyAndEstimatePageBoxes,
   determineDocumentLayoutConsensus,
   detectAndInheritPassageStems,
   PageLayoutAnalysis,
@@ -210,7 +214,24 @@ export const UnifiedAiIngestionModal: React.FC = () => {
   const activeArchive = archives.find((a) => a.id === activeArchiveId);
 
   // Tab State
-  const [activeTab, setActiveTab] = useState<'documents' | 'blueprint' | 'amas_swarm' | 'extraction'>('documents');
+  const [activeTab, setActiveTab] = useState<'documents' | 'blueprint' | 'extraction' | 'live_progress'>('documents');
+
+  // Live progress activity logs
+  const [liveLogs, setLiveLogs] = useState<WorkerActivityLog[]>(() => getGlobalWorkerLogs());
+
+  useEffect(() => {
+    const unsub = subscribeWorkerLogs((newLog) => {
+      if (newLog.id === 'clear') {
+        setLiveLogs([]);
+      } else {
+        setLiveLogs((prev) => {
+          const next = [...prev, newLog];
+          return next.slice(-150); // limit local history
+        });
+      }
+    });
+    return unsub;
+  }, []);
 
   // Document Registry
   const [documents, setDocuments] = useState<MultiDocumentIngestionItem[]>([]);
@@ -1200,7 +1221,7 @@ export const UnifiedAiIngestionModal: React.FC = () => {
 
     try {
       setIsProcessingAi(true);
-      setActiveTab('extraction');
+      setActiveTab('live_progress');
       setStatus('Initializing AMAS Swarm Fleet & Multi-Worker Pipeline...');
       setPercent(5);
       setLiveDetectedCount(0);
@@ -1423,7 +1444,9 @@ export const UnifiedAiIngestionModal: React.FC = () => {
             }
 
             const data = await res.json();
-            const detections: QuestionDetection[] = data.questions || [];
+            const rawDetections: any[] = data.questions || [];
+            // Run high-precision bounding box validation, rectification, and dynamic fallback vertical-partition estimation
+            const detections = rectifyAndEstimatePageBoxes(rawDetections, pageNum) as QuestionDetection[];
 
             // Perform high-res cropping for each detected bounding box
             for (const det of detections) {
@@ -1807,18 +1830,6 @@ export const UnifiedAiIngestionModal: React.FC = () => {
           </button>
 
           <button
-            onClick={() => setActiveTab('amas_swarm')}
-            className={`px-3.5 py-1.5 rounded-lg font-bold transition-all flex items-center gap-1.5 ${
-              activeTab === 'amas_swarm'
-                ? 'bg-emerald-600 text-white shadow-md'
-                : 'text-slate-400 hover:text-white hover:bg-slate-800'
-            }`}
-          >
-            <Cpu className="w-3.5 h-3.5" />
-            <span>AMAS Swarm Fleet ({allocatedFleet.workers.length} Workers)</span>
-          </button>
-
-          <button
             onClick={() => setActiveTab('extraction')}
             className={`px-3.5 py-1.5 rounded-lg font-bold transition-all flex items-center gap-1.5 ${
               activeTab === 'extraction'
@@ -1826,8 +1837,20 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                 : 'text-slate-400 hover:text-white hover:bg-slate-800'
             }`}
           >
-            <Zap className="w-3.5 h-3.5" />
-            <span>Execution Deck & Live Stream</span>
+            <Cpu className="w-3.5 h-3.5" />
+            <span>AI Extraction Setup & Modes</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('live_progress')}
+            className={`px-3.5 py-1.5 rounded-lg font-bold transition-all flex items-center gap-1.5 ${
+              activeTab === 'live_progress'
+                ? 'bg-emerald-600 text-white shadow-md'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5 animate-pulse text-emerald-400" />
+            <span>Live Progress & Logs Stream</span>
           </button>
         </div>
 
@@ -2816,273 +2839,306 @@ export const UnifiedAiIngestionModal: React.FC = () => {
             </div>
           )}
 
-          {/* TAB 3: AMAS SWARM FLEET & SETTINGS */}
-          {activeTab === 'amas_swarm' && (
-            <div className="flex-1 overflow-y-auto p-5 space-y-5 bg-slate-950">
-              <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-                <div>
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <Cpu className="w-4 h-4 text-emerald-400" />
-                    <span>AMAS Swarm Fleet Strategy & Execution Parameters</span>
-                  </h3>
-                  <p className="text-xs text-slate-400">
-                    Configure parallel worker count, verification auditor pass, and deduplication task cache
-                  </p>
-                </div>
-              </div>
-
-              {/* Fleet Strategy Selector Cards */}
-              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                {[
-                  { id: 'autopilot', name: 'Autopilot', desc: 'Dynamic AMAS allocation based on page count', icon: Cpu, color: 'text-indigo-400' },
-                  { id: 'quality_first', name: 'Quality First', desc: 'Maximum validation & auditor double-pass', icon: ShieldCheck, color: 'text-emerald-400' },
-                  { id: 'speed_priority', name: 'Speed Priority', desc: 'Max parallel workers for fast turnaround', icon: Zap, color: 'text-amber-400' },
-                  { id: 'custom', name: 'Custom Swarm', desc: 'Manually specify worker & auditor counts', icon: Sliders, color: 'text-purple-400' },
-                ].map((strat) => {
-                  const Icon = strat.icon;
-                  const isSelected = fleetStrategy === strat.id;
-
-                  return (
-                    <div
-                      key={strat.id}
-                      onClick={() => setFleetStrategy(strat.id as FleetStrategy)}
-                      className={`p-4 rounded-xl border cursor-pointer transition-all flex flex-col justify-between ${
-                        isSelected
-                          ? 'bg-indigo-950/40 border-indigo-500 shadow-lg shadow-indigo-950/50 ring-1 ring-indigo-500'
-                          : 'bg-slate-900 border-slate-800 hover:border-slate-700'
-                      }`}
-                    >
-                      <div>
-                        <div className="flex items-center justify-between mb-2">
-                          <Icon className={`w-5 h-5 ${strat.color}`} />
-                          {isSelected && <Check className="w-4 h-4 text-indigo-400" />}
-                        </div>
-                        <div className="font-bold text-xs text-white">{strat.name}</div>
-                        <div className="text-[11px] text-slate-400 mt-1">{strat.desc}</div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-
-              {/* Active Fleet Allocation Details */}
-              <div className="p-4 bg-slate-900 rounded-xl border border-slate-800 space-y-3">
-                <div className="text-xs font-bold text-slate-200 uppercase tracking-wider">
-                  Active Fleet Capacity ({allocatedFleet.workers.length} Workers • {allocatedFleet.auditors.length} Auditors)
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
-                  <div className="p-3 bg-slate-950 rounded-lg border border-slate-800 flex items-center justify-between">
-                    <span className="text-slate-400 font-medium">Parallel Extractor Workers:</span>
-                    <span className="font-bold font-mono text-emerald-400">{allocatedFleet.workers.length}</span>
-                  </div>
-                  <div className="p-3 bg-slate-950 rounded-lg border border-slate-800 flex items-center justify-between">
-                    <span className="text-slate-400 font-medium">Validation Auditors:</span>
-                    <span className="font-bold font-mono text-purple-400">{allocatedFleet.auditors.length}</span>
-                  </div>
-                  <div className="p-3 bg-slate-950 rounded-lg border border-slate-800 flex items-center justify-between">
-                    <span className="text-slate-400 font-medium">Orchestrator Managers:</span>
-                    <span className="font-bold font-mono text-indigo-400">{allocatedFleet.manager ? 1 : 0}</span>
-                  </div>
-                </div>
-
-                {fleetStrategy === 'custom' && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-3 border-t border-slate-800">
-                    <div>
-                      <label className="text-xs font-semibold text-slate-300 block mb-1">
-                        Worker Count: {customWorkers}
-                      </label>
-                      <input
-                        type="range"
-                        min={1}
-                        max={6}
-                        value={customWorkers}
-                        onChange={(e) => setCustomWorkers(Number(e.target.value))}
-                        className="w-full accent-emerald-500"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-xs font-semibold text-slate-300 block mb-1">
-                        Auditor Count: {customAuditors}
-                      </label>
-                      <input
-                        type="range"
-                        min={1}
-                        max={3}
-                        value={customAuditors}
-                        onChange={(e) => setCustomAuditors(Number(e.target.value))}
-                        className="w-full accent-purple-500"
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Checkpoint Restoration Banner */}
-              {existingCheckpoint && (
-                <div className="p-4 bg-amber-950/40 border border-amber-500/40 rounded-xl flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-2.5">
-                    <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
-                    <div>
-                      <div className="font-bold text-amber-200">
-                        Conversion Checkpoint Available ({existingCheckpoint.completedPages.length} Pages Done)
-                      </div>
-                      <div className="text-[11px] text-amber-300/80 mt-0.5">
-                        Resume from where you left off or start fresh from page 1.
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={handleResumeFromCheckpoint}
-                      className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold rounded-lg transition-colors"
-                    >
-                      Resume Progress
-                    </button>
-                    <button
-                      onClick={handleDiscardCheckpoint}
-                      className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-colors"
-                    >
-                      Discard
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* TAB 4: EXECUTION DECK & LIVE STREAM */}
+          {/* TAB 3: AI EXTRACTION SETUP & MODES */}
           {activeTab === 'extraction' && (
             <div className="flex-1 overflow-y-auto p-5 space-y-5 bg-slate-950 flex flex-col justify-between">
-              <div className="space-y-4">
+              <div className="space-y-6">
+                
+                {/* Header */}
                 <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-800">
                   <div>
                     <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                      <Zap className="w-4 h-4 text-amber-400" />
-                      <span>Automatic AI Extraction Modes & Live Progress Deck</span>
+                      <Cpu className="w-4 h-4 text-amber-400" />
+                      <span>AI Extraction Setup & Modes</span>
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Select your desired AI extraction execution mode and monitor real-time multimodal vision OCR
+                      Configure your extraction strategy, choose an execution mode optimized for Free-Tier Gemini keys, and launch the extractor.
                     </p>
                   </div>
-
-                  <button
-                    onClick={() => setIsMonitorModalOpen(true)}
-                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-750 text-slate-300 hover:text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors border border-slate-700/60"
-                  >
-                    <Activity className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Open AMAS Swarm Monitor</span>
-                  </button>
                 </div>
 
-                {/* Extraction Mode Selector Cards */}
-                <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-                  {[
-                    {
-                      id: 'parallel',
-                      name: 'Parallel Swarm',
-                      desc: 'Multi-worker concurrent page scanning at maximum throughput',
-                      icon: Zap,
-                      badge: '⚡ High Speed',
-                      badgeColor: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
-                    },
-                    {
-                      id: 'sequential',
-                      name: 'Sequential Eco',
-                      desc: 'Safe page-by-page scanning with rate-limit jitter protection',
-                      icon: ShieldCheck,
-                      badge: '🐢 Safe Pacing',
-                      badgeColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
-                    },
-                    {
-                      id: 'double_pass',
-                      name: 'Double-Pass Audit',
-                      desc: 'Pass 1 extraction followed by gap-healing rescan for skipped questions',
-                      icon: RefreshCw,
-                      badge: '🛡️ Zero-Gap',
-                      badgeColor: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
-                    },
-                    {
-                      id: 'blueprint_guided',
-                      name: 'Blueprint-Guided',
-                      desc: 'Strictly bounded by configured subjects, sections, and marking rules',
-                      icon: BookOpen,
-                      badge: '🎯 High Accuracy',
-                      badgeColor: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30',
-                    },
-                  ].map((mode) => {
-                    const Icon = mode.icon;
-                    const isSelected = extractionMode === mode.id;
+                {/* Grid Layout: Left Column = Mode Options, Right Column = Fleet Strategy & Summary */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                  
+                  {/* Left: Extraction Modes (7 Cols) */}
+                  <div className="lg:col-span-7 space-y-4">
+                    <div className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+                      1. Select Free-Tier Optimized Extraction Mode
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      {[
+                        {
+                          id: 'parallel',
+                          name: 'Parallel Swarm',
+                          desc: 'Concurrently processes multiple pages by spreading requests across your key fleet. Uses safe concurrency (max 3 workers) to prevent hitches.',
+                          icon: Zap,
+                          badge: '⚡ High Speed',
+                          badgeColor: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
+                        },
+                        {
+                          id: 'sequential',
+                          name: 'Sequential Eco',
+                          desc: 'Processes pages one-by-one with a steady 1.2s delay. Perfect for standard 1-key accounts (15 RPM limits), ensuring zero rate-limit errors.',
+                          icon: ShieldCheck,
+                          badge: '🐢 Safe Pacing',
+                          badgeColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
+                        },
+                        {
+                          id: 'double_pass',
+                          name: 'Double-Pass Audit',
+                          desc: 'Performs a primary pass followed by a meticulous gap-healing rescan. Fully adapted to minimize token consumption on free-tier keys.',
+                          icon: RefreshCw,
+                          badge: '🛡️ Zero-Gap',
+                          badgeColor: 'bg-purple-500/20 text-purple-300 border-purple-500/30',
+                        },
+                        {
+                          id: 'blueprint_guided',
+                          name: 'Blueprint-Guided',
+                          desc: 'Restricts the AI scanner strictly to your configured subjects and question ranges. Results in faster scans, higher accuracy, and low cost.',
+                          icon: BookOpen,
+                          badge: '🎯 High Accuracy',
+                          badgeColor: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/30',
+                        },
+                      ].map((mode) => {
+                        const Icon = mode.icon;
+                        const isSelected = extractionMode === mode.id;
 
-                    return (
-                      <div
-                        key={mode.id}
-                        onClick={() => !isProcessingAi && setExtractionMode(mode.id as any)}
-                        className={`p-3.5 rounded-xl border transition-all flex flex-col justify-between ${
-                          isProcessingAi ? 'cursor-not-allowed opacity-75' : 'cursor-pointer'
-                        } ${
-                          isSelected
-                            ? 'bg-indigo-950/40 border-indigo-500 shadow-md ring-1 ring-indigo-500'
-                            : 'bg-slate-900/80 border-slate-800 hover:border-slate-700'
-                        }`}
-                      >
-                        <div>
-                          <div className="flex items-center justify-between mb-1.5">
-                            <Icon className={`w-4 h-4 ${isSelected ? 'text-indigo-400' : 'text-slate-400'}`} />
-                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${mode.badgeColor}`}>
-                              {mode.badge}
-                            </span>
+                        return (
+                          <div
+                            key={mode.id}
+                            onClick={() => !isProcessingAi && setExtractionMode(mode.id as any)}
+                            className={`p-3.5 rounded-xl border transition-all flex flex-col justify-between ${
+                              isProcessingAi ? 'cursor-not-allowed opacity-75' : 'cursor-pointer'
+                            } ${
+                              isSelected
+                                ? 'bg-indigo-950/40 border-indigo-500 shadow-md ring-1 ring-indigo-500'
+                                : 'bg-slate-900/80 border-slate-800 hover:border-slate-700'
+                            }`}
+                          >
+                            <div>
+                              <div className="flex items-center justify-between mb-1.5">
+                                <Icon className={`w-4 h-4 ${isSelected ? 'text-indigo-400' : 'text-slate-400'}`} />
+                                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${mode.badgeColor}`}>
+                                  {mode.badge}
+                                </span>
+                              </div>
+                              <div className="font-bold text-xs text-white flex items-center gap-1.5">
+                                <span>{mode.name}</span>
+                                {isSelected && <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0" />}
+                              </div>
+                              <div className="text-[11px] text-slate-400 mt-1 leading-snug">{mode.desc}</div>
+                            </div>
                           </div>
-                          <div className="font-bold text-xs text-white flex items-center gap-1.5">
-                            <span>{mode.name}</span>
-                            {isSelected && <Check className="w-3.5 h-3.5 text-indigo-400 shrink-0" />}
-                          </div>
-                          <div className="text-[11px] text-slate-400 mt-1 leading-snug">{mode.desc}</div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-
-                {/* Parallel Workers Config (when parallel mode selected) */}
-                {extractionMode === 'parallel' && (
-                  <div className="p-3.5 bg-slate-900/70 border border-slate-800 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
-                    <div className="flex items-center gap-2 text-slate-300">
-                      <Cpu className="w-4 h-4 text-amber-400" />
-                      <span className="font-semibold">Parallel Concurrency Workers:</span>
-                      <span className="font-bold font-mono text-amber-300 px-2 py-0.5 bg-amber-950/40 border border-amber-500/30 rounded">
-                        {maxParallelWorkers} Active Workers
-                      </span>
+                        );
+                      })}
                     </div>
 
-                    <div className="flex items-center gap-3 w-full sm:w-64">
-                      <span className="text-[10px] text-slate-500">2</span>
-                      <input
-                        type="range"
-                        min={2}
-                        max={6}
+                    {/* Mode Specific Configurations */}
+                    {extractionMode === 'parallel' && (
+                      <div className="p-3.5 bg-slate-900/70 border border-slate-800 rounded-xl space-y-2 text-xs">
+                        <div className="flex items-center justify-between text-slate-300">
+                          <div className="flex items-center gap-2">
+                            <Cpu className="w-4 h-4 text-amber-400" />
+                            <span className="font-semibold">Parallel Concurrency Workers:</span>
+                          </div>
+                          <span className="font-bold font-mono text-amber-300 px-2 py-0.5 bg-amber-950/40 border border-amber-500/30 rounded">
+                            {maxParallelWorkers} Active Workers
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-slate-400 mb-1 leading-normal">
+                          Spreading tasks among parallel workers gets the job done faster. Keep this at 2-3 for free tier to prevent 429 quota exhaustion.
+                        </p>
+                        <div className="flex items-center gap-3 pt-1">
+                          <span className="text-[10px] text-slate-500 font-mono">2</span>
+                          <input
+                            type="range"
+                            min={2}
+                            max={6}
+                            disabled={isProcessingAi}
+                            value={maxParallelWorkers}
+                            onChange={(e) => setMaxParallelWorkers(Number(e.target.value))}
+                            className="w-full accent-amber-500 disabled:opacity-50"
+                          />
+                          <span className="text-[10px] text-slate-500 font-mono">6</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Right: Fleet Settings & Strategy (5 Cols) */}
+                  <div className="lg:col-span-5 space-y-4">
+                    <div className="text-xs font-bold text-slate-300 uppercase tracking-wider">
+                      2. Fleet Strategy & API Keys
+                    </div>
+
+                    {/* Compact Fleet Strategy Selector */}
+                    <div className="p-3.5 bg-slate-900 border border-slate-850 rounded-xl space-y-3">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-bold text-slate-200">Allocation Model</span>
+                        <span className="text-[10px] font-mono text-indigo-400 uppercase font-bold">
+                          {fleetStrategy}
+                        </span>
+                      </div>
+                      <select
+                        value={fleetStrategy}
+                        onChange={(e) => setFleetStrategy(e.target.value as FleetStrategy)}
                         disabled={isProcessingAi}
-                        value={maxParallelWorkers}
-                        onChange={(e) => setMaxParallelWorkers(Number(e.target.value))}
-                        className="w-full accent-amber-500 disabled:opacity-50"
-                      />
-                      <span className="text-[10px] text-slate-500">6</span>
+                        className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                      >
+                        <option value="autopilot">⚙️ Autopilot (Dynamic Fleet allocation)</option>
+                        <option value="quality_first">🛡️ Quality First (Validation Auditors)</option>
+                        <option value="speed_priority">⚡ Speed Priority (Maximum Concurrency)</option>
+                        <option value="custom">🛠️ Custom Swarm (Manually set counts)</option>
+                      </select>
+
+                      {fleetStrategy === 'custom' && (
+                        <div className="space-y-3 pt-3 border-t border-slate-800/80">
+                          <div>
+                            <div className="flex justify-between text-[11px] mb-1">
+                              <span className="text-slate-400 font-medium">Worker Count:</span>
+                              <span className="font-bold text-emerald-400 font-mono">{customWorkers}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={1}
+                              max={6}
+                              value={customWorkers}
+                              onChange={(e) => setCustomWorkers(Number(e.target.value))}
+                              className="w-full accent-emerald-500"
+                            />
+                          </div>
+                          <div>
+                            <div className="flex justify-between text-[11px] mb-1">
+                              <span className="text-slate-400 font-medium">Auditor Count:</span>
+                              <span className="font-bold text-purple-400 font-mono">{customAuditors}</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={1}
+                              max={3}
+                              value={customAuditors}
+                              onChange={(e) => setCustomAuditors(Number(e.target.value))}
+                              className="w-full accent-purple-500"
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Active Capacity Summary Badge */}
+                      <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800 flex flex-wrap gap-2 text-[10px] justify-between">
+                        <div className="flex items-center gap-1.5 text-slate-400">
+                          <Check className="w-3 h-3 text-emerald-400" />
+                          <span>Workers: <strong className="text-white font-mono">{allocatedFleet.workers.length}</strong></span>
+                        </div>
+                        <div className="flex items-center gap-1.5 text-slate-400">
+                          <Check className="w-3 h-3 text-purple-400" />
+                          <span>Auditors: <strong className="text-white font-mono">{allocatedFleet.auditors.length}</strong></span>
+                        </div>
+                        <div className="flex items-center gap-1.5 text-slate-400">
+                          <Check className="w-3 h-3 text-indigo-400" />
+                          <span>Manager: <strong className="text-white font-mono">{allocatedFleet.manager ? 1 : 0}</strong></span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Verification Status Card */}
+                    <div className="p-3.5 bg-slate-900 border border-slate-850 rounded-xl space-y-2 text-xs">
+                      <div className="flex items-center gap-1.5 text-slate-300 font-bold mb-1">
+                        <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                        <span>High-Precision Safety Controls</span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 leading-normal">
+                        <strong>Intelligent Page-Partitioning</strong> is fully active. If the model fails to detect coordinates or skips any questions, fallback bounds are automatically calculated vertically relative to neighboring questions. Zero blank question crops.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Checkpoint Banner */}
+                {existingCheckpoint && (
+                  <div className="p-4 bg-amber-950/40 border border-amber-500/40 rounded-xl flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-2.5">
+                      <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
+                      <div>
+                        <div className="font-bold text-amber-200">
+                          Conversion Checkpoint Available ({existingCheckpoint.completedPages.length} Pages Done)
+                        </div>
+                        <div className="text-[11px] text-amber-300/80 mt-0.5">
+                          Resume from where you left off or start fresh from page 1.
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleResumeFromCheckpoint}
+                        className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-slate-950 font-bold rounded-lg transition-colors"
+                      >
+                        Resume Progress
+                      </button>
+                      <button
+                        onClick={handleDiscardCheckpoint}
+                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-colors"
+                      >
+                        Discard
+                      </button>
                     </div>
                   </div>
                 )}
+              </div>
 
-                {/* Progress Deck */}
-                {isProcessingAi ? (
-                  <div className="p-5 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
+              {/* Action Buttons */}
+              <div className="pt-4 border-t border-slate-800 flex items-center justify-between gap-3 mt-4 shrink-0">
+                <div className="text-xs text-slate-400">
+                  <span>Pages Target: </span>
+                  <span className="font-bold text-white font-mono">{aggregateStats.questionCount} Pages</span>
+                </div>
+
+                <button
+                  onClick={handleRunFullQuestionExtraction}
+                  disabled={isProcessingAi || aggregateStats.questionCount === 0}
+                  className="px-6 py-3 bg-gradient-to-r from-indigo-600 via-purple-600 to-amber-500 hover:from-indigo-500 hover:to-amber-400 text-white font-bold text-xs rounded-xl shadow-xl shadow-indigo-950 flex items-center gap-2 disabled:opacity-50 transition-all"
+                >
+                  <Sparkles className="w-4 h-4 text-amber-200" />
+                  <span>Launch Question Extractor & Create CBT Paper</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 4: LIVE PROGRESS & LOGS STREAM */}
+          {activeTab === 'live_progress' && (
+            <div className="flex-1 overflow-y-auto p-5 space-y-5 bg-slate-950 flex flex-col justify-between">
+              
+              {/* If no processing and no completions, show waiting state */}
+              {!isProcessingAi && pagePartitions.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center p-8 border-2 border-dashed border-slate-800 rounded-2xl text-center bg-slate-900/40 my-auto">
+                  <Activity className="w-10 h-10 text-slate-600 mx-auto mb-3" />
+                  <h4 className="text-sm font-bold text-white">No Active Extraction Stream</h4>
+                  <p className="text-xs text-slate-400 max-w-sm mx-auto mt-1 leading-relaxed">
+                    The real-time log terminal is ready. Head over to the <span className="text-indigo-400 font-bold">AI Extraction Setup</span> tab, configure your parameters, and launch the extractor to view live progress.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-4 flex-1 flex flex-col justify-between">
+                  
+                  {/* Top Progress Info Row */}
+                  <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl space-y-4">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-amber-500 flex items-center justify-center shadow-lg shadow-indigo-950">
-                          <Loader2 className="w-5 h-5 text-white animate-spin" />
+                          {isProcessingAi ? (
+                            <Loader2 className="w-5 h-5 text-white animate-spin" />
+                          ) : (
+                            <Check className="w-5 h-5 text-white" />
+                          )}
                         </div>
                         <div>
-                          <h4 className="text-sm font-bold text-white">{status || 'Processing Question Pages...'}</h4>
+                          <h4 className="text-sm font-bold text-white">
+                            {isProcessingAi ? (status || 'Extracting Question Pages...') : 'Extraction Session Finished'}
+                          </h4>
                           <p className="text-[11px] text-slate-400 font-mono">
-                            Mode: {extractionMode.toUpperCase()} • Mode Workers: {extractionMode === 'sequential' ? 1 : maxParallelWorkers}
+                            Strategy: {extractionMode.toUpperCase()} • Active Workers: {extractionMode === 'sequential' ? 1 : maxParallelWorkers}
                           </p>
                         </div>
                       </div>
@@ -3123,14 +3179,14 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                       </div>
                     </div>
 
-                    {/* Page Partitions Visual Grid */}
+                    {/* Page Partitions Grid */}
                     {pagePartitions.length > 0 && (
-                      <div className="space-y-1.5 pt-2">
+                      <div className="space-y-1.5 pt-2 border-t border-slate-800/80">
                         <div className="text-[11px] font-semibold text-slate-400 flex items-center justify-between">
                           <span>Live Page Worker Partitions ({pagePartitions.length} Pages):</span>
                           <span className="text-[10px] text-slate-500">Green = Done • Yellow/Purple = Scanning • Gray = Pending</span>
                         </div>
-                        <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto p-2 bg-slate-950 rounded-lg border border-slate-800">
+                        <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto p-2 bg-slate-950 rounded-lg border border-slate-800">
                           {pagePartitions.map((p, pIdx) => {
                             let badgeStyle = 'bg-slate-900 border-slate-800 text-slate-500';
                             if (p.status === 'done') badgeStyle = 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300 font-bold';
@@ -3156,38 +3212,46 @@ export const UnifiedAiIngestionModal: React.FC = () => {
                       </div>
                     )}
                   </div>
-                ) : (
-                  <div className="p-8 border-2 border-dashed border-slate-800 rounded-2xl text-center bg-slate-900/40">
-                    <Sparkles className="w-10 h-10 text-indigo-400 mx-auto mb-3" />
-                    <h4 className="text-sm font-bold text-white">Ready for Question Extraction</h4>
-                    <p className="text-xs text-slate-400 max-w-md mx-auto mt-1">
-                      Ready to process {aggregateStats.questionCount} question pages across {documents.length} document(s) using{' '}
-                      <span className="text-indigo-300 font-semibold">{extractionMode.replace('_', ' ').toUpperCase()}</span> mode.
-                    </p>
+
+                  {/* Real-time Logs Terminal Stream Console */}
+                  <div className="flex-1 flex flex-col min-h-60 max-h-96 rounded-2xl bg-slate-950 border border-slate-800 p-4 font-mono text-xs overflow-hidden">
+                    <div className="flex items-center justify-between pb-2 border-b border-slate-800 mb-2.5 flex-shrink-0">
+                      <div className="flex items-center gap-2 text-slate-300 font-bold">
+                        <Activity className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>Live Worker Output Console</span>
+                      </div>
+                      <button
+                        onClick={() => setIsMonitorModalOpen(true)}
+                        className="px-2.5 py-1 bg-slate-900 hover:bg-slate-850 border border-slate-800 text-slate-400 hover:text-white rounded-lg text-[10px] font-bold transition-all flex items-center gap-1"
+                      >
+                        <Sliders className="w-3 h-3" />
+                        <span>Open Fleet Balance Dashboard</span>
+                      </button>
+                    </div>
+
+                    <div className="flex-1 overflow-y-auto space-y-1.5 scrollbar-thin scrollbar-thumb-slate-800 pr-1 select-text">
+                      {liveLogs.length === 0 ? (
+                        <div className="text-slate-600 italic">Listening for incoming worker logs...</div>
+                      ) : (
+                        liveLogs.map((log) => {
+                          let color = 'text-slate-400';
+                          if (log.level === 'success') color = 'text-emerald-400 font-bold';
+                          else if (log.level === 'warning') color = 'text-amber-400 font-bold';
+                          else if (log.level === 'error') color = 'text-rose-400 font-bold';
+
+                          return (
+                            <div key={log.id} className="leading-relaxed break-words flex items-start gap-1">
+                              <span className="text-slate-600 shrink-0 select-none">[{new Date(log.timestamp).toLocaleTimeString()}]</span>
+                              <span className="text-indigo-400 shrink-0 select-none">{log.workerLabel}:</span>
+                              <span className={color}>{log.message}</span>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
                   </div>
-                )}
-              </div>
-
-              {/* Action Buttons */}
-              <div className="pt-4 border-t border-slate-800 flex items-center justify-between gap-3">
-                <div className="text-xs text-slate-400">
-                  <span>Questions Target: </span>
-                  <span className="font-bold text-white">{aggregateStats.questionCount} Pages</span>
                 </div>
-
-                <button
-                  onClick={handleRunFullQuestionExtraction}
-                  disabled={isProcessingAi || aggregateStats.questionCount === 0}
-                  className="px-6 py-3 bg-gradient-to-r from-indigo-600 via-purple-600 to-amber-500 hover:from-indigo-500 hover:to-amber-400 text-white font-bold text-xs rounded-xl shadow-xl shadow-indigo-950 flex items-center gap-2 disabled:opacity-50"
-                >
-                  {isProcessingAi ? (
-                    <Loader2 className="w-4 h-4 animate-spin text-white" />
-                  ) : (
-                    <Sparkles className="w-4 h-4 text-amber-200" />
-                  )}
-                  <span>Launch Question Extractor & Create CBT Paper</span>
-                </button>
-              </div>
+              )}
             </div>
           )}
         </div>
