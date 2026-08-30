@@ -38,7 +38,6 @@ import { useCbtStore } from '../store/useCbtStore';
 import { QuestionData, QuestionType, SubjectData, SectionData } from '../types/cbt';
 import { MARKING_PRESETS, parseImageFileName } from '../utils/constants';
 import { QuestionHoverTrigger } from './QuestionHoverTrigger';
-import { QuestionPageContextViewer } from './QuestionPageContextViewer';
 
 export const QuestionEditor: React.FC = () => {
   const {
@@ -64,12 +63,11 @@ export const QuestionEditor: React.FC = () => {
     jumpToDiagnostic,
     setAnswerKeyModalOpen,
     openPdfRecrop,
-    openBoundaryOverlay,
     openAiRepair,
     addToast,
   } = useCbtStore();
 
-  const [activeTab, setActiveTab] = useState<'editor' | 'context' | 'json'>('editor');
+  const [activeTab, setActiveTab] = useState<'editor' | 'json'>('editor');
   const [activePartIndex, setActivePartIndex] = useState<number>(1);
   const [viewMode, setViewMode] = useState<'single' | 'stacked'>('single');
   const [zoomLevel, setZoomLevel] = useState<number>(100);
@@ -154,81 +152,19 @@ export const QuestionEditor: React.FC = () => {
   };
 
   // Helper for MSQ Option Selection
-  const toggleMsqOption = (optNumberOrLetter: string) => {
+  const toggleMsqOption = (optNumber: string) => {
     if (!currentQuestion) return;
-    const isNum = /^[1-4]$/.test(optNumberOrLetter);
-    const letter = isNum ? String.fromCharCode(64 + parseInt(optNumberOrLetter, 10)) : optNumberOrLetter.toUpperCase();
-    const num = isNum ? optNumberOrLetter : String(optNumberOrLetter.charCodeAt(0) - 64);
-
-    const rawStr = currentQuestion.answerOptions || currentQuestion.correctAnswer || '';
-    const currentList = rawStr
-      .split(/[,\s;/]+/)
-      .map((s) => s.trim().toUpperCase())
-      .filter(Boolean);
-
-    const isCurrentlyPresent = currentList.includes(optNumberOrLetter.toUpperCase()) || 
-                               currentList.includes(letter) || 
-                               currentList.includes(num);
+    const currentList = currentQuestion.answerOptions
+      ? currentQuestion.answerOptions.split(',').map((s) => s.trim()).filter(Boolean)
+      : [];
 
     let updatedList: string[];
-    if (isCurrentlyPresent) {
-      updatedList = currentList.filter(
-        (item) => item !== optNumberOrLetter.toUpperCase() && item !== letter && item !== num
-      );
+    if (currentList.includes(optNumber)) {
+      updatedList = currentList.filter((item) => item !== optNumber);
     } else {
-      updatedList = [...currentList, letter].sort();
+      updatedList = [...currentList, optNumber].sort();
     }
-    const joined = updatedList.join(',');
-    updateQuestion(
-      currentQuestion.id,
-      { answerOptions: joined, correctAnswer: joined },
-      'Update MSQ Options'
-    );
-  };
-
-  const isMcqOptionSelected = (opt: string) => {
-    if (!currentQuestion) return false;
-    const letter = String.fromCharCode(64 + parseInt(opt, 10)); // 1->A, 2->B, etc.
-    const candidates = [
-      currentQuestion.answerOptions,
-      currentQuestion.correctAnswer,
-    ].filter(Boolean) as string[];
-
-    for (const raw of candidates) {
-      const trimmed = raw.trim().toUpperCase();
-      if (trimmed === opt || trimmed === letter) return true;
-      if (trimmed === `OPTION ${opt}` || trimmed === `OPTION ${letter}`) return true;
-      if (trimmed === `OPT ${opt}` || trimmed === `OPT ${letter}`) return true;
-      if (trimmed === `${opt}.` || trimmed === `${letter}.`) return true;
-      if (trimmed === `(${opt})` || trimmed === `(${letter})`) return true;
-    }
-    return false;
-  };
-
-  const isMsqOptionSelected = (opt: string) => {
-    if (!currentQuestion) return false;
-    const letter = String.fromCharCode(64 + parseInt(opt, 10));
-    const rawStrings = [
-      currentQuestion.answerOptions,
-      currentQuestion.correctAnswer,
-    ].filter(Boolean) as string[];
-
-    const tokens: string[] = [];
-    for (const s of rawStrings) {
-      s.split(/[,\s;/]+/).forEach((t) => {
-        const trimmed = t.trim().toUpperCase();
-        if (trimmed) tokens.push(trimmed);
-      });
-    }
-
-    return (
-      tokens.includes(opt) ||
-      tokens.includes(letter) ||
-      tokens.includes(`OPTION ${opt}`) ||
-      tokens.includes(`OPTION ${letter}`) ||
-      tokens.includes(`${letter}.`) ||
-      tokens.includes(`${opt}.`)
-    );
+    updateQuestion(currentQuestion.id, { answerOptions: updatedList.join(',') }, 'Update MSQ Options');
   };
 
   // Helper for MSM (Matrix Match) toggle
@@ -386,16 +322,6 @@ export const QuestionEditor: React.FC = () => {
               Visual
             </button>
             <button
-              onClick={() => setActiveTab('context')}
-              className={`px-2 py-0.5 text-xs rounded flex items-center gap-1 transition-colors ${
-                activeTab === 'context' ? 'bg-indigo-600 text-white font-medium shadow-xs' : 'text-slate-400 hover:text-slate-200'
-              }`}
-              title="Full PDF page spatial context"
-            >
-              <Layers className="w-3 h-3" />
-              <span>Context</span>
-            </button>
-            <button
               onClick={() => setActiveTab('json')}
               className={`px-2 py-0.5 text-xs rounded flex items-center gap-1 transition-colors ${
                 activeTab === 'json' ? 'bg-slate-700 text-white font-medium' : 'text-slate-400 hover:text-slate-200'
@@ -481,42 +407,7 @@ export const QuestionEditor: React.FC = () => {
           </div>
         )}
 
-        {activeTab === 'context' ? (
-          /* Full PDF Page Spatial Context Tab */
-          <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 space-y-3">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-800 text-xs">
-              <div className="flex items-center gap-2">
-                <Layers className="w-4 h-4 text-indigo-400" />
-                <span className="font-semibold text-slate-200">
-                  Full PDF Page Context • Question {currentQuestion.que}
-                </span>
-              </div>
-              <span className="text-slate-400 text-[11px]">
-                Showing question crop bounding box in original PDF vector page
-              </span>
-            </div>
-            <QuestionPageContextViewer
-              question={currentQuestion}
-              partIndex={activePartIndex}
-              rawFiles={activeArchive.rawFiles}
-              onOpenOverlay={(pageNum) => {
-                openBoundaryOverlay({
-                  pageNumber: pageNum || (currentQuestion.pdfData?.[0]?.pageNumber ?? 1),
-                  questionId: currentQuestion.id,
-                  partIndex: activePartIndex,
-                });
-              }}
-              onOpenRecrop={(pageNum) => {
-                openPdfRecrop({
-                  questionId: currentQuestion.id,
-                  partIndex: activePartIndex,
-                  pageNumber: pageNum || (currentQuestion.pdfData?.[0]?.pageNumber ?? 1),
-                  mode: 'replace_part',
-                });
-              }}
-            />
-          </div>
-        ) : activeTab === 'json' ? (
+        {activeTab === 'json' ? (
           /* JSON Raw Inspector Tab */
           <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 font-mono text-xs text-slate-300">
             <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-800 text-slate-400">
@@ -591,7 +482,14 @@ export const QuestionEditor: React.FC = () => {
                         onClick={() => {
                           const defaultMarks =
                             t.id === 'msq'
-                              ? { cm: 4, im: -2, pm: 1, max: 4 }
+                              ? {
+                                  cm: 4,
+                                  im: -2,
+                                  pm: 1,
+                                  max: 4,
+                                  partialTiers: { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 },
+                                  schemeType: 'jee_adv_msq' as const,
+                                }
                               : t.id === 'msm'
                               ? { cm: 3, im: -1, pm: 1, max: 12 }
                               : { cm: 4, im: -1, pm: 0, max: 4 };
@@ -805,6 +703,101 @@ export const QuestionEditor: React.FC = () => {
                   />
                 </div>
               </div>
+
+              {/* JEE Advanced MSQ Tiered Partial Marking Detail Panel */}
+              {currentQuestion.type === 'msq' && (
+                <div className="bg-slate-950/80 p-3 rounded-lg border border-purple-500/30 space-y-2 mt-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-purple-300 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                      <span>JEE Advanced MSQ Tiered Partial Marking Rules</span>
+                    </span>
+                    <span className="text-[10px] text-slate-400">Evaluates dynamically based on chosen count</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 text-[11px]">3 of 4 Correct:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-emerald-400 font-mono font-bold">+</span>
+                        <input
+                          type="number"
+                          value={currentQuestion.marks.partialTiers?.threeCorrect ?? 3}
+                          onChange={(e) =>
+                            updateQuestion(
+                              currentQuestion!.id,
+                              {
+                                marks: {
+                                  ...currentQuestion!.marks,
+                                  partialTiers: {
+                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
+                                    threeCorrect: parseFloat(e.target.value) || 0,
+                                  },
+                                },
+                              },
+                              'Update 3-correct partial tier'
+                            )
+                          }
+                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 text-[11px]">2 of 3/4 Correct:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-emerald-400 font-mono font-bold">+</span>
+                        <input
+                          type="number"
+                          value={currentQuestion.marks.partialTiers?.twoCorrect ?? 2}
+                          onChange={(e) =>
+                            updateQuestion(
+                              currentQuestion!.id,
+                              {
+                                marks: {
+                                  ...currentQuestion!.marks,
+                                  partialTiers: {
+                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
+                                    twoCorrect: parseFloat(e.target.value) || 0,
+                                  },
+                                },
+                              },
+                              'Update 2-correct partial tier'
+                            )
+                          }
+                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="bg-slate-900/90 p-2 rounded border border-slate-800 flex items-center justify-between">
+                      <span className="text-slate-400 text-[11px]">1 of 2/3/4 Correct:</span>
+                      <div className="flex items-center gap-1">
+                        <span className="text-emerald-400 font-mono font-bold">+</span>
+                        <input
+                          type="number"
+                          value={currentQuestion.marks.partialTiers?.oneCorrect ?? 1}
+                          onChange={(e) =>
+                            updateQuestion(
+                              currentQuestion!.id,
+                              {
+                                marks: {
+                                  ...currentQuestion!.marks,
+                                  partialTiers: {
+                                    ...(currentQuestion!.marks.partialTiers || { threeCorrect: 3, twoCorrect: 2, oneCorrect: 1 }),
+                                    oneCorrect: parseFloat(e.target.value) || 0,
+                                  },
+                                },
+                              },
+                              'Update 1-correct partial tier'
+                            )
+                          }
+                          className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-white font-mono text-center"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Row 3: Answer Key & Option Responses */}
@@ -853,17 +846,16 @@ export const QuestionEditor: React.FC = () => {
                 <div className="flex flex-wrap items-center gap-3">
                   {['1', '2', '3', '4'].map((opt) => {
                     const letter = String.fromCharCode(64 + parseInt(opt, 10)); // 1->A, 2->B, etc.
-                    const isSelected = isMcqOptionSelected(opt);
+                    const isSelected =
+                      currentQuestion?.answerOptions === opt ||
+                      currentQuestion?.answerOptions === letter;
                     return (
                       <button
                         key={opt}
                         onClick={() =>
                           updateQuestion(
                             currentQuestion!.id,
-                            {
-                              answerOptions: isSelected ? '' : opt,
-                              correctAnswer: isSelected ? '' : letter,
-                            },
+                            { answerOptions: isSelected ? '' : opt },
                             `Toggle Answer ${letter}`
                           )
                         }
@@ -893,7 +885,10 @@ export const QuestionEditor: React.FC = () => {
                   <div className="flex flex-wrap items-center gap-3">
                     {['1', '2', '3', '4'].map((opt) => {
                       const letter = String.fromCharCode(64 + parseInt(opt, 10));
-                      const isSelected = isMsqOptionSelected(opt);
+                      const list = currentQuestion?.answerOptions
+                        ? currentQuestion.answerOptions.split(',').map((s) => s.trim())
+                        : [];
+                      const isSelected = list.includes(opt) || list.includes(letter);
                       return (
                         <button
                           key={opt}
@@ -919,7 +914,7 @@ export const QuestionEditor: React.FC = () => {
                   <div className="text-[11px] text-slate-400">
                     Selected Correct Options:{' '}
                     <span className="font-mono font-bold text-purple-300">
-                      {currentQuestion.answerOptions || currentQuestion.correctAnswer || 'None selected (Unkeyed)'}
+                      {currentQuestion.answerOptions || 'None selected (Unkeyed)'}
                     </span>
                   </div>
                 </div>

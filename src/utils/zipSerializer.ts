@@ -234,7 +234,7 @@ export function serializeDataJson(
       additionalData: archive.metadata.additionalData || {},
     },
     pdfCropperData,
-    appVersion: archive.metadata.appVersion || '2.6.0',
+    appVersion: archive.metadata.appVersion || '2.5.0',
     generatedBy: 'pdfCropperPage',
   };
 
@@ -247,11 +247,11 @@ export function serializeDataJson(
 
 function serializeQuestion(
   q: QuestionData,
-  sectionName: string,
-  sanitizeFilenames: boolean
+  _sectionName: string,
+  _sanitizeFilenames: boolean
 ): any {
-  // Build pdfData with exact requested coordinates structure: page, x1, x2, y1, y2 & filename
-  const pdfData = q.pdfData.map((part, idx) => {
+  // Build pdfData with exact requested coordinates structure: page, x1, x2, y1, y2
+  const pdfData = q.pdfData.map((part) => {
     const pPage = part.page ?? part.pageNumber ?? 1;
     const x1 = part.x1 ?? (part.xmin !== undefined ? Math.round(part.xmin * 1000) : 0);
     const y1 = part.y1 ?? (part.ymin !== undefined ? Math.round(part.ymin * 1000) : 0);
@@ -262,12 +262,6 @@ function serializeQuestion(
     const ymin = part.ymin !== undefined ? part.ymin : y1 / 1000;
     const xmax = part.xmax !== undefined ? part.xmax : x2 / 1000;
     const ymax = part.ymax !== undefined ? part.ymax : y2 / 1000;
-
-    const partIdx = idx + 1;
-    const ext = part.filename ? (getFileExtension(part.filename) || 'png') : 'png';
-    const filename = sanitizeFilenames
-      ? buildImageFileName(sectionName, q.que, partIdx, ext)
-      : (part.filename || buildImageFileName(sectionName, q.que, partIdx, ext));
 
     return {
       page: pPage,
@@ -281,28 +275,11 @@ function serializeQuestion(
       ymax,
       xmax,
       bounds: part.bounds || [xmin, ymin, Math.max(0.01, xmax - xmin), Math.max(0.01, ymax - ymin)],
-      filename,
-    };
-  });
-
-  const images = q.images.map((img, idx) => {
-    const partIdx = idx + 1;
-    const ext = getFileExtension(img.fileName) || 'png';
-    const fileName = sanitizeFilenames
-      ? buildImageFileName(sectionName, q.que, partIdx, ext)
-      : img.fileName;
-
-    return {
-      id: img.id || `img-q${q.que}-${partIdx}`,
-      fileName,
-      resolvedUrl: img.blobUrl || '',
-      sizeBytes: img.sizeBytes || 0,
     };
   });
 
   const questionObj: Record<string, any> = {
     que: q.que,
-    key: q.key || `q${q.que}`,
     type: q.type,
     marks: {
       cm: q.marks.cm,
@@ -311,16 +288,10 @@ function serializeQuestion(
       ...(q.marks.max !== undefined ? { max: q.marks.max } : {}),
     },
     pdfData,
-    images,
   };
 
   if (q.answerOptions && q.answerOptions.trim() !== '') {
     questionObj.answerOptions = q.answerOptions.trim();
-  }
-  if (q.correctAnswer && q.correctAnswer.trim() !== '') {
-    questionObj.correctAnswer = q.correctAnswer.trim();
-  } else if (q.answerOptions && q.answerOptions.trim() !== '') {
-    questionObj.correctAnswer = q.answerOptions.trim();
   }
 
   return questionObj;

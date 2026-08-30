@@ -2,110 +2,111 @@ import React, { useEffect, useRef } from 'react';
 
 interface PrecisionLoupeProps {
   visible: boolean;
-  pos: { x: number; y: number };
-  canvasRef: React.RefObject<HTMLCanvasElement | null>;
-  zoomLevel?: number;
+  sourceCanvas: HTMLCanvasElement | null;
+  cursorX: number; // relative to canvas container (0..containerWidth)
+  cursorY: number; // relative to canvas container (0..containerHeight)
+  containerWidth: number;
+  containerHeight: number;
+  zoom?: number;
+  diameter?: number;
   label?: string;
-  loupeSize?: number;
 }
 
 export const PrecisionLoupe: React.FC<PrecisionLoupeProps> = ({
   visible,
-  pos,
-  canvasRef,
-  zoomLevel = 2.5,
-  label = '2.5x Magnifier',
-  loupeSize = 160,
+  sourceCanvas,
+  cursorX,
+  cursorY,
+  containerWidth,
+  containerHeight,
+  zoom = 2.5,
+  diameter = 130,
+  label,
 }) => {
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    if (!visible || !canvasRef.current || !loupeCanvasRef.current) return;
+    if (!visible || !sourceCanvas || !loupeCanvasRef.current) return;
 
-    const sourceCanvas = canvasRef.current;
     const loupeCanvas = loupeCanvasRef.current;
     const ctx = loupeCanvas.getContext('2d');
     if (!ctx) return;
 
-    const rect = sourceCanvas.getBoundingClientRect();
-    if (!rect || rect.width === 0 || rect.height === 0) return;
-    const sourceX = pos.x - rect.left;
-    const sourceY = pos.y - rect.top;
+    const canvasW = sourceCanvas.width;
+    const canvasH = sourceCanvas.height;
 
-    // Convert mouse screen coordinates to source canvas pixel scale
-    const scaleX = sourceCanvas.width / rect.width;
-    const scaleY = sourceCanvas.height / rect.height;
+    // Normalized coordinates
+    const normX = Math.max(0, Math.min(1, cursorX / (containerWidth || 1)));
+    const normY = Math.max(0, Math.min(1, cursorY / (containerHeight || 1)));
 
-    const canvasCenterX = sourceX * scaleX;
-    const canvasCenterY = sourceY * scaleY;
+    const srcX = normX * canvasW;
+    const srcY = normY * canvasH;
 
-    const sw = (loupeSize / zoomLevel) * scaleX;
-    const sh = (loupeSize / zoomLevel) * scaleY;
-    const sx = canvasCenterX - sw / 2;
-    const sy = canvasCenterY - sh / 2;
+    const sampleW = diameter / zoom;
+    const sampleH = diameter / zoom;
+    const srcLeft = srcX - sampleW / 2;
+    const srcTop = srcY - sampleH / 2;
 
-    ctx.clearRect(0, 0, loupeSize, loupeSize);
+    ctx.clearRect(0, 0, diameter, diameter);
 
-    // Save context for circular clip
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(loupeSize / 2, loupeSize / 2, loupeSize / 2, 0, Math.PI * 2);
-    ctx.clip();
+    // Fill neutral background
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, diameter, diameter);
 
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, loupeSize, loupeSize);
+    // Draw magnified snippet
+    ctx.imageSmoothingEnabled = false; // keep crisp pixels
+    ctx.drawImage(sourceCanvas, srcLeft, srcTop, sampleW, sampleH, 0, 0, diameter, diameter);
 
-    try {
-      ctx.drawImage(
-        sourceCanvas,
-        Math.max(0, sx),
-        Math.max(0, sy),
-        sw,
-        sh,
-        0,
-        0,
-        loupeSize,
-        loupeSize
-      );
-    } catch (e) {
-      // Ignore out of bounds copy errors
-    }
-
-    // Crosshair target in center
-    ctx.strokeStyle = '#6366f1';
+    // Draw Crosshairs
+    const center = diameter / 2;
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.85)'; // Red crosshair
     ctx.lineWidth = 1.5;
+
     ctx.beginPath();
-    ctx.moveTo(loupeSize / 2 - 10, loupeSize / 2);
-    ctx.lineTo(loupeSize / 2 + 10, loupeSize / 2);
-    ctx.moveTo(loupeSize / 2, loupeSize / 2 - 10);
-    ctx.lineTo(loupeSize / 2, loupeSize / 2 + 10);
+    // Horizontal line
+    ctx.moveTo(0, center);
+    ctx.lineTo(center - 6, center);
+    ctx.moveTo(center + 6, center);
+    ctx.lineTo(diameter, center);
+
+    // Vertical line
+    ctx.moveTo(center, 0);
+    ctx.lineTo(center, center - 6);
+    ctx.moveTo(center, center + 6);
+    ctx.lineTo(center, diameter);
     ctx.stroke();
 
-    ctx.restore();
-  }, [visible, pos, canvasRef, zoomLevel, loupeSize]);
+    // Center targeting ring
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.9)';
+    ctx.beginPath();
+    ctx.arc(center, center, 5, 0, Math.PI * 2);
+    ctx.stroke();
+  }, [visible, sourceCanvas, cursorX, cursorY, containerWidth, containerHeight, zoom, diameter]);
 
-  if (!visible) return null;
+  if (!visible || !sourceCanvas) return null;
+
+  // Position loupe offset from cursor so it doesn't obstruct finger/cursor
+  const isRightSide = cursorX < containerWidth / 2;
+  const isBottomSide = cursorY < containerHeight / 2;
+
+  const posX = isRightSide ? cursorX + 24 : cursorX - diameter - 24;
+  const posY = isBottomSide ? cursorY + 24 : cursorY - diameter - 24;
 
   return (
     <div
-      className="fixed z-50 pointer-events-none -translate-x-1/2 -translate-y-1/2 shadow-2xl rounded-full border-2 border-indigo-500 bg-slate-900 overflow-hidden"
+      className="pointer-events-none absolute z-50 rounded-full shadow-2xl border-2 border-indigo-400 bg-slate-950 overflow-hidden flex flex-col items-center justify-center animate-in fade-in zoom-in-95 duration-100 ring-4 ring-black/40"
       style={{
-        left: `${pos.x}px`,
-        top: `${pos.y - 100}px`,
-        width: `${loupeSize}px`,
-        height: `${loupeSize}px`,
+        width: diameter,
+        height: diameter,
+        left: Math.max(10, Math.min(containerWidth - diameter - 10, posX)),
+        top: Math.max(10, Math.min(containerHeight - diameter - 10, posY)),
       }}
     >
-      <canvas
-        ref={loupeCanvasRef}
-        width={loupeSize}
-        height={loupeSize}
-        className="block rounded-full"
-      />
+      <canvas ref={loupeCanvasRef} width={diameter} height={diameter} className="w-full h-full block" />
       {label && (
-        <span className="absolute bottom-1.5 left-1/2 -translate-x-1/2 text-[9px] font-bold text-white bg-slate-950/80 px-1.5 py-0.5 rounded-full border border-indigo-500/40 uppercase tracking-widest whitespace-nowrap">
+        <div className="absolute bottom-1 bg-black/80 text-[9px] text-white font-mono px-1.5 py-0.2 rounded-full border border-slate-700">
           {label}
-        </span>
+        </div>
       )}
     </div>
   );

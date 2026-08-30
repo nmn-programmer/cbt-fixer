@@ -11,9 +11,9 @@ import { ExportModal } from './components/ExportModal';
 import { CbtPreviewModal } from './components/CbtPreviewModal';
 import { AnswerKeyStudioModal } from './components/AnswerKeyStudioModal';
 import { FloatingQuestionPreview } from './components/FloatingQuestionPreview';
+import { AutoPdfConverterModal } from './components/AutoPdfConverterModal';
 import { BlueprintRangeStudioModal } from './components/BlueprintRangeStudioModal';
-import { UnifiedPdfStudioModal } from './components/UnifiedPdfStudioModal';
-import { UnifiedAiIngestionModal } from './components/UnifiedAiIngestionModal';
+import { PdfRecropModal } from './components/PdfRecropModal';
 import { AiQuestionRepairModal } from './components/AiQuestionRepairModal';
 import { AiProcessingMonitorModal } from './components/AiProcessingMonitorModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -119,9 +119,9 @@ export default function App() {
       <ExportModal />
       <CbtPreviewModal />
       <AnswerKeyStudioModal />
+      <AutoPdfConverterModal />
       <BlueprintRangeStudioModal />
-      <UnifiedPdfStudioModal />
-      <UnifiedAiIngestionModal />
+      <PdfRecropModal />
       <AiQuestionRepairModal />
       <AiProcessingMonitorModal isOpen={isAiMonitorOpen} onClose={() => setIsAiMonitorOpen(false)} />
       <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />

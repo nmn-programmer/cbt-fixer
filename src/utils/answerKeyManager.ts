@@ -1000,34 +1000,24 @@ export function inferTypeFromAnswerString(ansStr: string): QuestionType {
 
 /**
  * Renders an Answer Key PDF File and extracts answer keys via AI.
- * Supports optional selectedPages (1-indexed array of page numbers).
  */
 export async function extractAnswerKeyFromPdfFile(
-  file: File | Blob,
+  file: File,
   geminiApiKey?: string,
   onProgress?: (msg: string, percent: number) => void,
-  context?: { totalQuestions?: number; subjects?: string[]; selectedPages?: number[] }
+  context?: { totalQuestions?: number; subjects?: string[] }
 ): Promise<{ parseResult: AnswerKeyParseResult; rawResponse: any; pageImages: string[] }> {
   onProgress?.('Rendering Answer Key PDF pages...', 20);
 
   const arrayBuffer = await file.arrayBuffer();
   const pdfjsLib = await getPdfjsLib();
   const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  
-  let targetPages: number[] = [];
-  if (context?.selectedPages && context.selectedPages.length > 0) {
-    targetPages = context.selectedPages.filter((p) => p >= 1 && p <= pdfDoc.numPages);
-  }
-  if (targetPages.length === 0) {
-    const numPages = Math.min(pdfDoc.numPages, 10);
-    targetPages = Array.from({ length: numPages }, (_, i) => i + 1);
-  }
+  const numPages = Math.min(pdfDoc.numPages, 10); // Process up to 10 pages of answer key
 
   const pageImages: string[] = [];
-  for (let idx = 0; idx < targetPages.length; idx++) {
-    const pageNum = targetPages[idx];
-    onProgress?.(`Rendering page ${pageNum} (${idx + 1}/${targetPages.length})...`, 20 + Math.round(((idx + 1) / targetPages.length) * 35));
-    const page = await pdfDoc.getPage(pageNum);
+  for (let i = 1; i <= numPages; i++) {
+    onProgress?.(`Rendering Answer Key page ${i} of ${numPages}...`, 20 + Math.round((i / numPages) * 30));
+    const page = await pdfDoc.getPage(i);
     const viewport = page.getViewport({ scale: 2.0 });
     const canvas = document.createElement('canvas');
     canvas.width = viewport.width;
@@ -1049,71 +1039,6 @@ export async function extractAnswerKeyFromPdfFile(
     parseResult: result.parseResult,
     rawResponse: result.rawResponse,
     pageImages,
-  };
-}
-
-export interface MultiPdfSourceTarget {
-  id: string;
-  name: string;
-  blobOrFile: Blob | File;
-  pages: number[];
-  role: 'blueprint' | 'questions' | 'answer_key' | 'solution';
-}
-
-/**
- * Extracts Answer Key from multiple PDF sources with arbitrary page-specific ranges.
- */
-export async function extractAnswerKeyFromMultiPdfSources(
-  sources: MultiPdfSourceTarget[],
-  geminiApiKey?: string,
-  onProgress?: (msg: string, percent: number) => void,
-  context?: { totalQuestions?: number; subjects?: string[] }
-): Promise<{ parseResult: AnswerKeyParseResult; rawResponse: any; pageImages: string[] }> {
-  const answerKeySources = sources.filter((s) => s.role === 'answer_key' && s.pages.length > 0);
-  if (answerKeySources.length === 0) {
-    throw new Error('No answer key pages assigned across the uploaded documents.');
-  }
-
-  const pdfjsLib = await getPdfjsLib();
-  const allPageImages: string[] = [];
-  let currentStep = 0;
-  const totalPagesToRender = answerKeySources.reduce((acc, s) => acc + s.pages.length, 0);
-
-  for (const src of answerKeySources) {
-    const arrayBuffer = await src.blobOrFile.arrayBuffer();
-    const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-
-    for (const pageNum of src.pages) {
-      if (pageNum < 1 || pageNum > pdfDoc.numPages) continue;
-      currentStep++;
-      onProgress?.(
-        `Rendering [${src.name}] Page ${pageNum} (${currentStep}/${totalPagesToRender})...`,
-        15 + Math.round((currentStep / totalPagesToRender) * 45)
-      );
-
-      const page = await pdfDoc.getPage(pageNum);
-      const viewport = page.getViewport({ scale: 2.0 });
-      const canvas = document.createElement('canvas');
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        await page.render({ canvasContext: ctx, viewport } as any).promise;
-        allPageImages.push(canvas.toDataURL('image/jpeg', 0.85));
-      }
-    }
-  }
-
-  onProgress?.('AI analyzing answer tables across all selected pages...', 70);
-  const result = await extractAnswerKeyFromPdfImages(allPageImages, geminiApiKey, context);
-  onProgress?.(`Successfully extracted ${result.parseResult.items.length} answer keys!`, 100);
-
-  return {
-    parseResult: result.parseResult,
-    rawResponse: result.rawResponse,
-    pageImages: allPageImages,
   };
 }
 

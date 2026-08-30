@@ -13,7 +13,6 @@ import {
   SubjectData,
   TestPaperBlueprint,
 } from '../types/cbt';
-import { BoxCoord } from '../types/manualCropper';
 import {
   buildImageFileName,
   generateId,
@@ -97,28 +96,7 @@ interface CbtStoreState {
   filterType: string; // 'all' | 'errors' | 'warnings' | 'mcq' | 'msq' | 'nat' | 'msm' | 'flagged'
 
   // Modals & Panels
-  isUnifiedAiIngestionModalOpen: boolean;
-  unifiedAiIngestionInitialTab: 'all' | 'answer_key' | 'blueprint' | 'questions';
-  setUnifiedAiIngestionModalOpen: (open: boolean, tab?: 'all' | 'answer_key' | 'blueprint' | 'questions') => void;
   isPdfConverterModalOpen: boolean;
-  isPdfStudioOpen: boolean;
-  pdfStudioTarget: {
-    mode: 'layout' | 'precision';
-    pageNumber?: number;
-    questionId?: string;
-    partIndex?: number;
-    cropMode?: 'replace_part' | 'add_part' | 'new_question' | 'stitch';
-    sectionId?: string;
-    subjectId?: string;
-    defaultQNo?: number;
-    initialBox?: BoxCoord;
-  } | null;
-  isBoundaryOverlayOpen: boolean;
-  boundaryOverlayTarget: {
-    pageNumber?: number;
-    questionId?: string;
-    partIndex?: number;
-  } | null;
   isPdfRecropModalOpen: boolean;
   recropTarget: {
     questionId?: string;
@@ -191,21 +169,7 @@ interface CbtStoreState {
   createNewPaper: (title?: string) => void;
   loadSample: (type: 'flawed' | 'clean' | 'chemistry_adv') => void;
 
-  // PDF Unified Precision Studio, Re-Cropping & Repair
-  openPdfStudio: (target?: {
-    mode?: 'layout' | 'precision';
-    pageNumber?: number;
-    questionId?: string;
-    partIndex?: number;
-    cropMode?: 'replace_part' | 'add_part' | 'new_question' | 'stitch';
-    sectionId?: string;
-    subjectId?: string;
-    defaultQNo?: number;
-    initialBox?: BoxCoord;
-  }) => void;
-  closePdfStudio: () => void;
-  openBoundaryOverlay: (target?: { pageNumber?: number; questionId?: string; partIndex?: number }) => void;
-  closeBoundaryOverlay: () => void;
+  // PDF Re-Cropping & Repair
   openPdfRecrop: (target?: {
     questionId?: string;
     partIndex?: number;
@@ -288,17 +252,6 @@ interface CbtStoreState {
   fixInstructedMarkings: () => void;
   fixModernizeFormat: () => void;
   bulkApplyMarkingScheme: (sectionIds: string[], presetId: string) => void;
-  applyMarkingSchemeWithScope: (
-    scheme: MarksScheme,
-    scope: {
-      type: 'current' | 'all' | 'range' | 'subject' | 'section';
-      currentQuestionId?: string;
-      rangeStart?: number;
-      rangeEnd?: number;
-      subjectId?: string;
-      sectionId?: string;
-    }
-  ) => void;
   bulkRenumberPaper: () => void;
 
   // Undo / Redo
@@ -460,7 +413,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
             ...state.activeBackgroundTask,
             isMinimized: true,
           },
-          ...(modalType === 'pdf_converter' ? { isUnifiedAiIngestionModalOpen: false } : {}),
+          ...(modalType === 'pdf_converter' ? { isPdfConverterModalOpen: false } : {}),
           ...(modalType === 'answer_key_studio' ? { isAnswerKeyModalOpen: false } : {}),
           ...(modalType === 'blueprint_studio' ? { isBlueprintModalOpen: false } : {}),
         };
@@ -476,7 +429,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
             ...state.activeBackgroundTask,
             isMinimized: false,
           },
-          ...(modalType === 'pdf_converter' ? { isUnifiedAiIngestionModalOpen: true } : {}),
+          ...(modalType === 'pdf_converter' ? { isPdfConverterModalOpen: true } : {}),
           ...(modalType === 'answer_key_studio' ? { isAnswerKeyModalOpen: true } : {}),
           ...(modalType === 'blueprint_studio' ? { isBlueprintModalOpen: true } : {}),
         };
@@ -611,16 +564,8 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
     removeToast: (id: string) => {
       set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) }));
     },
-    isUnifiedAiIngestionModalOpen: false,
-    unifiedAiIngestionInitialTab: 'all',
-    setUnifiedAiIngestionModalOpen: (open: boolean, tab: 'all' | 'answer_key' | 'blueprint' | 'questions' = 'all') =>
-      set({ isUnifiedAiIngestionModalOpen: open, unifiedAiIngestionInitialTab: tab }),
     isPdfConverterModalOpen: false,
-    isPdfStudioOpen: false,
-    pdfStudioTarget: null,
     isBlueprintModalOpen: false,
-    isBoundaryOverlayOpen: false,
-    boundaryOverlayTarget: null,
     isPdfRecropModalOpen: false,
     recropTarget: null,
     isAiRepairModalOpen: false,
@@ -641,69 +586,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
     past: [],
     future: [],
 
-    setPdfConverterModalOpen: (open: boolean) => set({ isUnifiedAiIngestionModalOpen: open }),
-    openPdfStudio: (target) => {
-      const state = get();
-      const currentActive = state.archives.find((a) => a.id === state.activeArchiveId);
-      const activeQ = state.selectedQuestionId;
-      const targetQId = target?.questionId || activeQ;
-
-      let extractedPageNumber: number | undefined = target?.pageNumber;
-
-      if (!extractedPageNumber && currentActive && targetQId) {
-        for (const sub of currentActive.subjects) {
-          for (const sec of sub.sections) {
-            const q = sec.questions.find((item) => item.id === targetQId);
-            if (q) {
-              if (q.pdfData && q.pdfData.length > 0 && q.pdfData[0].pageNumber) {
-                extractedPageNumber = q.pdfData[0].pageNumber;
-              } else if (q.pdfData && q.pdfData.length > 0 && q.pdfData[0].page) {
-                extractedPageNumber = q.pdfData[0].page;
-              } else if (q.images && q.images.length > 0) {
-                const partIdx = target?.partIndex ? target.partIndex - 1 : 0;
-                const img = q.images[partIdx] || q.images[0];
-                if (img && (img as any).pageNumber) {
-                  extractedPageNumber = (img as any).pageNumber;
-                }
-              }
-              break;
-            }
-          }
-        }
-      }
-
-      set({
-        isPdfStudioOpen: true,
-        pdfStudioTarget: {
-          mode: target?.mode || 'precision',
-          pageNumber: extractedPageNumber || 1,
-          questionId: targetQId || undefined,
-          partIndex: target?.partIndex || 1,
-          cropMode: target?.cropMode || 'replace_part',
-          sectionId: target?.sectionId || state.selectedSectionId || undefined,
-          subjectId: target?.subjectId || state.selectedSubjectId || undefined,
-          defaultQNo: target?.defaultQNo,
-          initialBox: target?.initialBox,
-        },
-        // Also keep legacy flags synchronized for any legacy listeners
-        isBoundaryOverlayOpen: target?.mode === 'layout',
-        isPdfRecropModalOpen: target?.mode !== 'layout',
-      });
-    },
-    closePdfStudio: () => set({ isPdfStudioOpen: false, pdfStudioTarget: null, isBoundaryOverlayOpen: false, isPdfRecropModalOpen: false }),
-    openBoundaryOverlay: (target) => {
-      const state = get();
-      state.openPdfStudio({
-        mode: 'layout',
-        pageNumber: target?.pageNumber,
-        questionId: target?.questionId,
-        partIndex: target?.partIndex,
-      });
-    },
-    closeBoundaryOverlay: () => {
-      const state = get();
-      state.closePdfStudio();
-    },
+    setPdfConverterModalOpen: (open: boolean) => set({ isPdfConverterModalOpen: open }),
     setBlueprintModalOpen: (open: boolean) => set({ isBlueprintModalOpen: open }),
     setAnswerKeyModalOpen: (open: boolean) => set({ isAnswerKeyModalOpen: open }),
 
@@ -816,21 +699,55 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
 
     openPdfRecrop: (target) => {
       const state = get();
-      state.openPdfStudio({
-        mode: 'precision',
-        questionId: target?.questionId,
-        partIndex: target?.partIndex,
-        cropMode: target?.mode,
-        sectionId: target?.sectionId,
-        subjectId: target?.subjectId,
-        defaultQNo: target?.defaultQNo,
-        pageNumber: target?.pageNumber,
+      const currentActive = state.archives.find((a) => a.id === state.activeArchiveId);
+      const activeQ = state.selectedQuestionId;
+      const targetQId = target?.questionId || activeQ;
+
+      let extractedPageNumber: number | undefined = target?.pageNumber;
+
+      if (!extractedPageNumber && currentActive && targetQId) {
+        for (const sub of currentActive.subjects) {
+          for (const sec of sub.sections) {
+            const q = sec.questions.find((item) => item.id === targetQId);
+            if (q) {
+              if (q.pdfData && q.pdfData.length > 0 && q.pdfData[0].pageNumber) {
+                extractedPageNumber = q.pdfData[0].pageNumber;
+              } else if (q.images && q.images.length > 0) {
+                const partIdx = target?.partIndex ? target.partIndex - 1 : 0;
+                const img = q.images[partIdx] || q.images[0];
+                if (img && (img as any).pageNumber) {
+                  extractedPageNumber = (img as any).pageNumber;
+                }
+              }
+              break;
+            }
+          }
+        }
+      }
+      
+      const recropData = target ? {
+        mode: target.mode || ('replace_part' as const),
+        pageNumber: extractedPageNumber,
+        ...target,
+      } : (activeQ ? {
+        questionId: activeQ,
+        partIndex: 1,
+        pageNumber: extractedPageNumber,
+        mode: 'replace_part' as const,
+        sectionId: state.selectedSectionId || undefined,
+        subjectId: state.selectedSubjectId || undefined
+      } : {
+        mode: 'new_question' as const,
+        pageNumber: extractedPageNumber,
+        sectionId: state.selectedSectionId || undefined,
+        subjectId: state.selectedSubjectId || undefined
       });
+
+      set({ isPdfRecropModalOpen: true, recropTarget: recropData });
     },
 
     closePdfRecrop: () => {
-      const state = get();
-      state.closePdfStudio();
+      set({ isPdfRecropModalOpen: false, recropTarget: null });
     },
 
     openAiRepair: (questionId: string) => {
@@ -882,11 +799,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           targetSubj = { id: generateId(), name: payload.subjectId.replace('new:', ''), sections: [] };
           active.subjects.push(targetSubj);
         } else if (payload.subjectId) {
-          targetSubj = active.subjects.find((s) => s.id === payload.subjectId || s.name.toLowerCase() === payload.subjectId.trim().toLowerCase());
-          if (!targetSubj) {
-            targetSubj = { id: generateId(), name: payload.subjectId.trim(), sections: [] };
-            active.subjects.push(targetSubj);
-          }
+          targetSubj = active.subjects.find((s) => s.id === payload.subjectId);
         }
         
         if (!targetSubj) {
@@ -904,11 +817,7 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           targetSec = { id: generateId(), name: payload.sectionId.replace('new:', ''), questions: [] };
           targetSubj.sections.push(targetSec);
         } else if (payload.sectionId) {
-          targetSec = targetSubj.sections.find((s: any) => s.id === payload.sectionId || s.name.toLowerCase() === payload.sectionId.trim().toLowerCase());
-          if (!targetSec) {
-            targetSec = { id: generateId(), name: payload.sectionId.trim(), questions: [] };
-            targetSubj.sections.push(targetSec);
-          }
+          targetSec = targetSubj.sections.find((s: any) => s.id === payload.sectionId);
         }
         
         if (!targetSec) {
@@ -991,7 +900,6 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
           type: payload.newQuestionProps?.type || 'mcq',
           marks: payload.newQuestionProps?.marks || { cm: 4, im: -1, pm: 0, max: 4 },
           answerOptions: payload.newQuestionProps?.answerOptions || '',
-          correctAnswer: payload.newQuestionProps?.correctAnswer || payload.newQuestionProps?.answerOptions || '',
           pdfData: payload.pdfCoords ? [{ ...payload.pdfCoords, filename: imageName }] : [],
           images: [
             {
@@ -2538,53 +2446,6 @@ export const useCbtStore = create<CbtStoreState>((set, get) => {
         { ...active, subjects: updatedSubjects },
         `Bulk Apply Marking Scheme: ${preset.name}`
       );
-    },
-
-    applyMarkingSchemeWithScope: (scheme, scope) => {
-      const state = get();
-      const active = state.archives.find((a) => a.id === state.activeArchiveId);
-      if (!active) return;
-
-      let updatedCount = 0;
-      const updatedSubjects = active.subjects.map((sub) => ({
-        ...sub,
-        sections: sub.sections.map((sec) => ({
-          ...sec,
-          questions: sec.questions.map((q) => {
-            let shouldUpdate = false;
-            if (scope.type === 'current') {
-              shouldUpdate = q.id === scope.currentQuestionId;
-            } else if (scope.type === 'all') {
-              shouldUpdate = true;
-            } else if (scope.type === 'range') {
-              const start = scope.rangeStart || 1;
-              const end = scope.rangeEnd || 999;
-              shouldUpdate = q.que >= start && q.que <= end;
-            } else if (scope.type === 'subject') {
-              shouldUpdate = sub.id === scope.subjectId;
-            } else if (scope.type === 'section') {
-              shouldUpdate = sec.id === scope.sectionId;
-            }
-
-            if (shouldUpdate) {
-              updatedCount++;
-              return { ...q, marks: { ...scheme } };
-            }
-            return q;
-          }),
-        })),
-      }));
-
-      commitArchiveUpdate(
-        { ...active, subjects: updatedSubjects },
-        `Apply Marking Scheme to ${updatedCount} Question(s)`
-      );
-
-      state.addToast({
-        title: 'Marking Scheme Applied',
-        description: `Updated marks (+${scheme.cm}/${scheme.im}) across ${updatedCount} question${updatedCount === 1 ? '' : 's'}`,
-        type: 'success',
-      });
     },
 
     bulkRenumberPaper: () => {

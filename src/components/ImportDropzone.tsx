@@ -67,11 +67,11 @@ export const ImportDropzone: React.FC = () => {
 
     try {
       if (pdfFiles.length > 0) {
-        // PDF dropped: open Automatic AI Extraction Modal
-        useCbtStore.getState().setUnifiedAiIngestionModalOpen(true);
+        // PDF dropped: open Auto PDF Converter Modal
+        useCbtStore.getState().setPdfConverterModalOpen(true);
         addToast({
           title: 'PDF Detected',
-          description: 'Opening Automatic AI Extraction. Select your document to assign page roles and extract questions.',
+          description: 'Opening Auto PDF Converter. Select your file in the modal to begin.',
           type: 'info',
         });
         return;
@@ -221,12 +221,12 @@ export const ImportDropzone: React.FC = () => {
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                useCbtStore.getState().setUnifiedAiIngestionModalOpen(true);
+                useCbtStore.getState().setPdfConverterModalOpen(true);
               }}
               className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-md transition-colors flex items-center gap-2"
             >
-              <Sparkles className="w-4 h-4" />
-              <span>Automatic AI Extraction</span>
+              <Wand2 className="w-4 h-4" />
+              <span>Auto PDF → ZIP (AI)</span>
             </button>
 
             <button

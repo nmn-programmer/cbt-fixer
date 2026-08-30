@@ -1,10 +1,18 @@
 export type QuestionType = 'mcq' | 'msq' | 'nat' | 'msm';
 
+export interface PartialTiersScheme {
+  threeCorrect?: number; // e.g. +3 if all 4 options are correct and 3 are chosen
+  twoCorrect?: number;   // e.g. +2 if 3 or 4 options are correct and 2 are chosen
+  oneCorrect?: number;   // e.g. +1 if 2, 3, or 4 options are correct and 1 is chosen
+}
+
 export interface MarksScheme {
   cm: number;      // Correct Marks (e.g. 3 or 4)
   im: number;      // Incorrect Marks (e.g. -1 or -2)
   pm?: number;     // Partial Marks per option (e.g. 1 for MSQ)
   max?: number;    // Maximum question marks (e.g. 4 or 12 for matrix)
+  partialTiers?: PartialTiersScheme; // JEE Advanced tiered partial marks
+  schemeType?: 'jee_main' | 'jee_adv_msq' | 'jee_adv_single' | 'jee_adv_nat' | 'custom';
 }
 
 export interface PdfDataPart {
@@ -42,7 +50,6 @@ export interface QuestionData {
   type: QuestionType;
   marks: MarksScheme;
   answerOptions: string; // e.g. "4", "1,2,3", "5.25", "A->P,Q; B->R"
-  correctAnswer?: string; // Explicit ground truth answer string (e.g. "A", "1", "42", "A,C")
   isSplitQuestion?: boolean;
   pdfData: PdfDataPart[];
   images: ImageAttachment[];
@@ -66,19 +73,6 @@ export interface SubjectData {
 }
 
 export type ArchiveFormat = 'pdfCropper' | 'ultimate' | 'dpp' | 'quessbank' | 'custom';
-
-export type PageRole = 'blueprint' | 'questions' | 'answer_key' | 'solution' | 'skip';
-
-export interface MultiDocumentIngestionItem {
-  id: string;
-  name: string;
-  size: number;
-  file?: File;
-  blob?: Blob;
-  totalPages: number;
-  pageAssignments: Record<number, PageRole>;
-  isSourceArchiveFile?: boolean;
-}
 
 export interface BlueprintSectionRange {
   id: string;
